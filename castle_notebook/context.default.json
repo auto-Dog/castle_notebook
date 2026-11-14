@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "features": {
+    "instructions": true,
+    "global_goal": true,
+    "global_constraints": true,
+    "previous_inputs": true,
+    "previous_outputs": true,
+    "manual_summaries": true,
+    "variables": true,
+    "expected_output": true,
+    "output_format": true,
+    "compact_history": true
+  },
+  "limits": {
+    "max_characters": 48000,
+    "history_cell_characters": 1900,
+    "variables_characters": 2400
+  },
+  "templates": {
+    "prompt": "# CastleNotebook / project step\n{project}{instructions}{global}{previous_steps}{variables}{current_step}{expected_output}{output_format}",
+    "instructions": "你是面向算法与金融研究者的实时调试助手。只处理当前单元；不要自行推进后续步骤。\n遵循 Global 目的与约束，使用本机 Claude 的现有配置完成当前指令。\n区分已观测结果、推断和未验证假设；按预期输出契约返回最终内容。\n最终回答按照jupyter notebook cell支持的形式（文本、格式文本、图片、widget）写入本次运行目录 `{run_dir}` 的 output.md（相对项目目录的完整路径：`{output_file}`）。注意：此后的每一轮对话，都要按照最初的格式需求更新这个output文件。\n\n",
+    "global": "## Global / revision {revision}\n{goal}{constraints}",
+    "global_goal": "目的：\n{goal}\n",
+    "global_constraints": "\n约束：\n{constraints}\n",
+    "previous_steps": "\n## Previous steps / deterministic compact context\n{steps}",
+    "previous_step": "\n### {id} / {title} / {type} / {state}\n{input}{output}",
+    "previous_input": "输入摘要：\n{source}\n",
+    "previous_output": "输出摘要：\n{output}\n",
+    "variables": "\n## Live Python variables (bounded metadata, not full datasets)\n变量仅为当前内存预览，可能包含上游重跑前的遗留值；不能替代有效执行结果。\n{variables}\n",
+    "current_step": "\n## Current step / {id} / revision {revision}\n标题：{title}\n类型：{type}\n输入：\n{source}\n",
+    "expected_output": "\n预期输出契约：\n{expected_output}\n",
+    "output_format": "输出格式：{output_format}。只返回最终结论内容，JSON 格式时必须是可解析的 JSON。\n",
+    "invocation": "请读取 {prompt_file}，按照文件中的要求完成当前任务并返回最终结果。"
+  }
+}

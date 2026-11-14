@@ -1,0 +1,315 @@
+"""Loopback-only HTTP application, JSON API and resumable server-sent events."""
+from __future__ import annotations
+
+import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import mimetypes
+from pathlib import Path
+import secrets
+import sys
+import time
+from urllib.parse import parse_qs, urlparse
+
+from .core import (Problem, Store, VERSION, ensure_context_config, initialization_notebook,
+                   new_notebook, project_path, read_project_file, scan_project, text_field)
+from .execution import Engine, resolve_claude
+
+STATIC = Path(__file__).with_name("static")
+
+
+class App:
+    def __init__(self, project, data_dir=None, python=None, claude_command=None,
+                 seed=True, code_timeout=60, agent_timeout=240):
+        self.project = Path(project).resolve()
+        if not self.project.is_dir():
+            raise Problem("项目目录不存在。")
+        self.token = secrets.token_urlsafe(32)
+        self.store = Store(data_dir or self.project / ".castle")
+        self.context_config_path = ensure_context_config(self.project)
+        self.engine = Engine(self.store, python, claude_command, code_timeout, agent_timeout)
+        if seed and not self.store.list():
+            self.store.put(new_notebook(self.project, template="quant"))
+
+    def close(self):
+        self.engine.close()
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, app):
+        super().__init__(address, Handler)
+        self.app = app
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "CastleNotebook/0.9"
+
+    @property
+    def app(self):
+        return self.server.app
+
+    def log_message(self, format, *args):
+        # Do not log cell source, context, tokens or local project contents.
+        if len(args) > 1 and str(args[1]).startswith("5"):
+            sys.stderr.write(f"CastleNotebook HTTP {args[1]}\n")
+
+    def security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+
+    def send_bytes(self, data, content_type, status=200, filename=None):
+        self.send_response(status)
+        self.security_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def json(self, data, status=200):
+        self.send_bytes(json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8"), "application/json; charset=utf-8", status)
+
+    def body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise Problem("Content-Length 无效。") from exc
+        if not 0 <= length <= 4500000:
+            self.close_connection = True
+            raise Problem("请求体超过 4.5 MB 限制。", 413)
+        if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+            raise Problem("请求需要 application/json。", 415)
+        try:
+            data = json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise Problem("请求不是有效 JSON。") from exc
+        if not isinstance(data, dict):
+            raise Problem("请求必须是 JSON 对象。")
+        return data
+
+    def guard(self, mutation=False):
+        host = self.headers.get("Host", "")
+        port = self.server.server_address[1]
+        if host not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+            self.close_connection = True
+            raise Problem("服务只接受本机地址。", 403)
+        origin = self.headers.get("Origin")
+        if origin and origin != f"http://{host}":
+            self.close_connection = True
+            raise Problem("拒绝跨站请求。", 403)
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            self.close_connection = True
+            raise Problem("拒绝跨站请求。", 403)
+        if mutation and not secrets.compare_digest(self.headers.get("X-Castle-Token", ""), self.app.token):
+            self.close_connection = True
+            raise Problem("页面会话已过期，请刷新后重试。", 403)
+
+    def do_GET(self):
+        self.dispatch("GET")
+
+    def do_POST(self):
+        self.dispatch("POST")
+
+    def do_PUT(self):
+        self.dispatch("PUT")
+
+    def do_OPTIONS(self):
+        self.json({"error": "不支持跨站访问。"}, 403)
+
+    def dispatch(self, method):
+        try:
+            self.guard(method != "GET")
+            self.route(method)
+        except Problem as exc:
+            self.json({"error": str(exc)}, exc.status)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception:
+            self.json({"error": "本地服务发生异常。请检查终端日志。"}, 500)
+            import traceback
+            traceback.print_exc()
+
+    def route(self, method):
+        parsed = urlparse(self.path)
+        parts = parsed.path.strip("/").split("/")
+        query = parse_qs(parsed.query)
+        if method == "GET" and parts == ["api", "health"]:
+            return self.json({"ok": True, "version": VERSION})
+        if method == "GET" and parts == ["api", "bootstrap"]:
+            return self.json({"token": self.app.token, "version": VERSION,
+                              "project_path": str(self.app.project), "notebooks": self.app.store.list(),
+                              "context_config_path": str(self.app.context_config_path),
+                              "capabilities": {"claude": bool(self.app.engine.claude_command),
+                                               "python": self.app.engine.python,
+                                               "code_timeout": self.app.engine.code_timeout,
+                                               "agent_timeout": self.app.engine.agent_timeout}})
+        if parts == ["api", "notebooks"]:
+            if method == "GET":
+                return self.json(self.app.store.list())
+            if method == "POST":
+                body = self.body()
+                template = body.get("template", "blank")
+                if template not in {"blank", "quant", "algorithm"}:
+                    raise Problem("不支持的模板。")
+                project = project_path(self.app.project, body.get("relative_path", "."))
+                ensure_context_config(project)
+                doc = new_notebook(project, text_field(body.get("title", "未命名 Notebook"), "标题", 200), template)
+                self.app.store.put(doc)
+                return self.json(self.app.engine.document(doc["id"]), 201)
+        if parts == ["api", "project", "scan"] and method == "POST":
+            return self.json(scan_project(self.app.project, self.body().get("relative_path", "."), excluded=(self.app.store.path,)))
+        if parts == ["api", "project", "initialize"] and method == "POST":
+            body = self.body()
+            if body.get("run", True) and not self.app.engine.claude_command:
+                raise Problem("初始化项目需要 Claude CLI。请安装并登录 Claude Code 后重启服务。", 503)
+            scan = scan_project(self.app.project, body.get("relative_path", "."), excluded=(self.app.store.path,))
+            doc = initialization_notebook(scan)
+            self.app.store.put(doc)
+            run = self.app.engine.start(doc["id"], doc["cells"][-1]["id"]) if body.get("run", True) else None
+            return self.json({"notebook": self.app.engine.document(doc["id"]), "run": run}, 201)
+        if len(parts) >= 3 and parts[:2] == ["api", "notebooks"]:
+            nid = parts[2]
+            if len(parts) == 3:
+                if method == "GET":
+                    return self.json(self.app.engine.document(nid))
+                if method == "PUT":
+                    return self.json(self.app.engine.save(nid, self.body()))
+            if parts[3:] == ["project"] and method == "GET":
+                doc = self.app.store.get(nid)
+                return self.json(scan_project(doc["project_path"], excluded=(self.app.store.path,)))
+            if parts[3:] == ["project", "file"] and method == "GET":
+                doc = self.app.store.get(nid)
+                return self.json(read_project_file(doc["project_path"], query.get("path", [""])[0],
+                                                   excluded=(self.app.store.path,)))
+            if len(parts) == 4 and parts[3] == "export" and method == "GET":
+                doc = self.app.store.get(nid)
+                return self.send_bytes(json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"), "application/json; charset=utf-8", filename=f"castle-{doc['id']}.json")
+            if len(parts) == 4 and parts[3] == "global" and method == "PUT":
+                return self.json(self.app.engine.save_global(nid, self.body()))
+            if parts[3:] == ["kernel", "reset"] and method == "POST":
+                self.body()
+                return self.json(self.app.engine.reset(nid))
+            if parts[3:] == ["apply-init"] and method == "POST":
+                return self.json(self.app.engine.apply_init(nid, self.body().get("run_id")))
+            if len(parts) == 6 and parts[3] == "cells":
+                cid = parts[4]
+                if parts[5] == "context" and method == "GET":
+                    return self.json(self.app.engine.context(nid, cid))
+                if parts[5] == "run" and method == "POST":
+                    self.body()
+                    return self.json(self.app.engine.start(nid, cid), 202)
+                if parts[5] == "open-session" and method == "POST":
+                    self.body()
+                    return self.json(self.app.engine.open_session(nid, cid))
+        if len(parts) >= 3 and parts[:2] == ["api", "runs"]:
+            rid = parts[2]
+            if len(parts) == 3 and method == "GET":
+                return self.json(self.app.engine.get_run(rid))
+            if len(parts) == 4:
+                if parts[3] == "cancel" and method == "POST":
+                    self.body()
+                    self.app.engine.cancel(rid)
+                    return self.json({"ok": True})
+                if parts[3] == "events" and method == "GET":
+                    try:
+                        after = max(0, int(self.headers.get("Last-Event-ID") or query.get("after", ["0"])[0]))
+                    except ValueError as exc:
+                        raise Problem("无效的事件游标。") from exc
+                    return self.stream_events(rid, after)
+                if parts[3] == "artifact" and method == "GET":
+                    name = query.get("name", ["output"])[0]
+                    filenames = {"output": "output.md", "context": "context.md", "run": "run.json", "events": "events.jsonl",
+                                 "changes": "changes.json", "project-before": "project-before.json", "project-after": "project-after.json"}
+                    if name not in filenames:
+                        raise Problem("找不到该产物。", 404)
+                    run = self.app.engine.get_run(rid)
+                    path = self.app.store.run_path(run["id"]) / filenames[name]
+                    if not path.is_file():
+                        raise Problem("产物尚未生成。", 404)
+                    return self.send_bytes(path.read_bytes(), "text/plain; charset=utf-8", filename=f"{rid}-{filenames[name]}")
+        if method == "GET" and parsed.path in {"/", "/index.html", "/app.js", "/styles.css", "/logo.svg", "/favicon.ico"}:
+            name = "index.html" if parsed.path == "/" else parsed.path[1:]
+            if name == "favicon.ico":
+                name = "logo.svg"
+            path = STATIC / name
+            if path.is_file():
+                content_type = {".js": "text/javascript", ".css": "text/css", ".html": "text/html", ".svg": "image/svg+xml"}.get(path.suffix, mimetypes.guess_type(str(path))[0])
+                return self.send_bytes(path.read_bytes(), content_type + "; charset=utf-8")
+        raise Problem("未找到该资源。", 404)
+
+    def stream_events(self, rid, after):
+        self.app.engine.get_run(rid)
+        self.send_response(200)
+        self.security_headers()
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        heartbeat = time.monotonic()
+        while True:
+            events = self.app.engine.events(rid, after)
+            for event in events:
+                encoded = f"id: {event['seq']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+                self.wfile.write(encoded)
+                after = event["seq"]
+            if events:
+                self.wfile.flush()
+            if self.app.engine.get_run(rid)["status"] != "running":
+                # Synchronize with the terminal event appended under the engine lock.
+                if not self.app.engine.events(rid, after):
+                    break
+                continue
+            if time.monotonic() - heartbeat > 10:
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                heartbeat = time.monotonic()
+            control = self.app.engine.runs.get(rid)
+            if control:
+                with control["condition"]:
+                    control["condition"].wait(timeout=0.5)
+            else:
+                time.sleep(0.1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="CastleNotebook 0.9 · 本地 AI 辅助实时调试工作台")
+    parser.add_argument("--project", default=".", help="项目根目录，也是执行代码与 Agent 的工作目录")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--data-dir", help="Notebook 与运行证据的存储目录，默认 <project>/.castle")
+    parser.add_argument("--python", default=sys.executable, help="Python 内核解释器，可指定研究环境")
+    parser.add_argument("--claude", help="Claude 可执行文件或 npm cli.js 路径")
+    parser.add_argument("--empty", action="store_true", help="不创建首次启动示例")
+    parser.add_argument("--code-timeout", type=int, default=60)
+    parser.add_argument("--agent-timeout", type=int, default=240)
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535 or not 1 <= args.code_timeout <= 3600 or not 1 <= args.agent_timeout <= 3600:
+        parser.error("端口必须为 1–65535，超时必须为 1–3600 秒。")
+    if args.claude and not resolve_claude(args.claude):
+        parser.error("无法解析 Claude 可执行文件；请直接指定 .exe、Unix executable 或 cli.js。")
+    app = App(args.project, args.data_dir, args.python, resolve_claude(args.claude),
+              not args.empty, args.code_timeout, args.agent_timeout)
+    try:
+        server = Server(("127.0.0.1", args.port), app)
+    except OSError as exc:
+        app.close()
+        parser.exit(1, f"无法启动端口 {args.port}：{exc}\n")
+    print(f"\n  CastleNotebook {VERSION}\n  Local:   http://127.0.0.1:{args.port}\n  Project: {app.project}\n  Python:  {app.engine.python}\n  Claude:  {'available' if app.engine.claude_command else 'not found'}\n", flush=True)
+    try:
+        server.serve_forever(poll_interval=0.3)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.close()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

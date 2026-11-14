@@ -1,0 +1,131 @@
+# CastleNotebook 0.9
+
+面向算法与金融研究者的本地项目交互界面。Notebook 将项目开发过程拆为 Global、独立输入和可检查输出；源码、测试和数据保留在项目目录中，通过显式执行和完整留痕实现过程控制。
+
+界面采用经典 Jupyter 布局：白底、直角卡片、`In / Out` 提示符、代码高亮与紧凑工具栏。上下文、变量、历史记录默认收起。
+
+## 运行
+
+需要 Python 3.10+。Python 内核使用 IPython 执行单元；网页不需要 Node 或前端构建。
+
+```powershell
+cd E:\code\CastleNotebook
+python -m pip install -e .
+python -m castle_notebook
+```
+
+打开 <http://127.0.0.1:8765>。首次启动创建合成数据示例；也可从“文件”菜单新建空白、金融研究或算法验证 Notebook。
+
+指定研究项目和 Python 环境：
+
+```powershell
+python -m castle_notebook --project E:\research\my_model --python E:\conda\envs\research\python.exe
+```
+
+Python 和 Claude 都在指定项目目录运行；Python 内核将该目录加入模块搜索路径，可直接导入项目源码。指定 `--python` 时，该解释器也需要安装 IPython（`"路径/python.exe" -m pip install "ipython>=8.18"`）。NumPy、pandas、Matplotlib 使用该解释器已有的安装；它们是可选依赖。调用 `display(df)` 展示表格，`display_markdown(text)` 展示 Markdown；Matplotlib 图像会在执行完成时自动收集。
+
+Python 单元支持 [IPython 语法](https://ipython.readthedocs.io/en/stable/interactive/reference.html#system-shell-access)：`!命令`、`files = !命令` 捕获输出、`$变量` / `{表达式}` 插值，以及 `%pwd`、`%cd`、`%time`、`%%time`、`%%capture`、`%pip` 等魔法命令。普通 Python 与 `!` 可以混写，字符串和注释中的 `!` 不受影响：
+
+```python
+import sys
+!"{sys.executable}" --version
+files = !dir
+%pwd
+```
+
+命令使用当前系统的 shell（Windows 为 `cmd.exe`，Linux/macOS 为 `/bin/sh`），例如 Windows 使用 `!dir`，Linux/macOS 使用 `!ls`。`!cd` 只改变子 shell 的目录，持续切换内核目录应使用 `%cd`。安装包建议用 `%pip install 包名`，以使用当前内核解释器。命令输出会流式进入 Output；与 IPython 一致，普通 `!` 命令的非零退出码保存在 `_exit_code`，不会单独使 Python 单元失败。停止或超时会结束内核及其命令子进程。当前仍使用 Castle 自己的通信、输出展示与 Notebook 文件格式；不支持 Jupyter widgets、交互式终端输入或完整 Jupyter 协议。
+
+工具栏的项目名称显示当前 Notebook 绑定的目录，点击后可查看项目文件与当前源码预览。新建 Notebook 可选择启动目录下的项目子目录；新建不依赖“从项目初始化”，也不需要复制项目实现到单元中。
+
+## 工作方式
+
+1. 在 **Global** 写目的与约束。默认完整进入每次 AI 调用，可在上下文配置中分别开关。
+2. 添加 **Python / Markdown / Order** 单元。Order 发起项目开发、修复或分析步骤，开发任务直接修改项目源码和测试；Python 单元导入项目模块、提供交互输入并检查结果，共享当前 Notebook 的内核变量。Order 需要明确预期输出。
+3. 选择单元，点击“运行”，或按 `Ctrl+Enter`。`Shift+Enter` 执行并选择下一单元；Markdown 双击编辑、执行后预览。
+4. 点击右上角检查器图标，检查上下文、变量与执行记录。Order 的“上下文”按钮展示即将发送的完整文本；运行历史保存实际发送时的快照。
+
+例如，在项目中已有 `model.py` 时，Order 可以要求“修复 `model.py` 的边界处理，并运行相关测试”；下一 Python 单元用 `from model import predict` 调用实际实现。Output 收集最终回答及执行期间真实新增、修改、删除的项目文件，不将回答中的代码片段视为已落盘的开发成果。失败或停止执行后，已发生的文件修改也会保留并收集。
+
+每次 AI 输入都包含项目目录、有限文件概览与项目工作要求；现有 `.castle/context.json` 的自定义模板也会补入该说明。开发步骤应报告修改路径、已执行验证和未完成事项；只读分析及初始化仍遵循其只读要求。项目文件内容作为数据读取，不替代 Global 和当前任务。
+
+项目模块在持久 Python 内核中遵循普通 Python 导入缓存规则。源码修改后，已导入模块需要显式 `importlib.reload(module)` 或重启内核，再验证新版本。
+
+“单元 → 运行全部”按文档顺序执行，遇到失败或当前结果失效时停止。停止 Python 单元会结束内核并清空共享变量；停止 Claude 不影响 Python 内核。
+
+修改 Global、上游输入、顺序或摘要后，下游旧结果保留并标记失效，不再作为有效 AI 证据。上游重跑也会使下游结果失效。此规则按文档顺序保守传播，不分析 Python 的真实依赖图。
+
+当前执行实际改变项目文件时，本 Notebook 其他已有的 Python / Order 结果也会保留并标记失效，包含当前步骤之前的结果。内核变量保留；验证新源码前需主动重新加载模块或重启内核。外部编辑器的独立修改及其他 Notebook 的结果不作自动依赖追踪。
+
+Global 在执行期间也可编辑并自动保存。当前执行继续使用启动时的输入快照；如果期间 Global 发生变化，返回结果会标记失效。其他单元的输入在执行中锁定，防止意外改动正在运行的代码或指令。
+
+上下文与 harness prompt 位于研究项目的 `.castle/context.json`。`features` 控制 Global、历史输入/输出、变量、输出契约、手写摘要和历史精简等开关；`templates` 可编辑 harness 正文、各段格式、拼接顺序及 Claude 的读取指令；`limits` 设置字符预算。保存后下次预览或运行立即生效，无需重启。详见 [上下文配置说明](docs/context-config.md)。
+
+## Claude
+
+安装并登录本机 [Claude Code](https://code.claude.com/docs/en/setup)，随后重启服务：
+
+```powershell
+claude auth status
+```
+
+每个 Order 将完整输入写入研究项目的 `.castle/prompts/input<运行ID>.md`，再在后台调用本机 Claude，等价于 `claude "请读取 .castle/prompts/input<运行ID>.md，按其中要求完成任务" -n "ID<运行ID>"`。模型、工具、MCP、权限和登录状态均沿用本机配置，不额外指定工具白名单、计划模式、系统提示或轮数上限。旧 Notebook 的 LLM / Agent 字段兼容保留，两者均使用同一种原生调用。
+
+实际命令使用 `claude -p "请读取 .castle/prompts/input<运行ID>.md，按其中要求完成任务" -n "ID<运行ID>" --output-format stream-json --verbose --include-partial-messages`。`-p` 用于后台非交互执行，流式参数用于网页显示进度；命令行只传文件路径和固定读取指令，Claude 自行读取 Markdown。输入文件与运行目录的 `context.md` 内容及 SHA-256 指纹一致，避免完整输入中的引号、换行和长度影响命令行。CLI 会按正常方式保存命名会话。不在网页中存储 API Key，不设置跳过权限检查参数。参考 [Claude CLI 参数文档](https://code.claude.com/docs/en/cli-reference)。
+
+`templates.instructions` 的输出要求段落通过 `{run_dir}`、`{output_file}` 告知 Claude 本次输出位置，默认展开为 `.castle/runs/<运行ID>` 和 `.castle/runs/<运行ID>/output.md`，相对于项目工作目录。预览与执行复用同一运行 ID，输入文件和上下文快照中的路径一致。`templates.invocation` 也支持这些变量，启动指令不自动追加路径。
+
+Windows 下，Order 单元底部显示最近一次执行的 **Session Name**。点击“打开对话”，会在该次运行的项目目录中打开新的 Claude Code 终端，通过运行记录中保存的真实 Session ID 执行 `claude --resume <session-id>`。Claude 会将 `-p` 创建的会话排除在交互式名称搜索之外，因此名称用于展示，恢复使用对应 UUID（见 [Claude 会话文档](https://code.claude.com/docs/en/sessions#loop-p-agent-sdk-and-background-sessions)）。每次重跑都有独立名称，刷新或重启服务后仍可打开；未执行、执行中和未保存会话的历史运行会禁用按钮。终端中的后续对话保存在 Claude 会话中，Notebook 的执行快照与 Output 保留原结果。
+
+最终回答由 harness 写入该次运行的 `output.md`，Output Cell 从同一份规范化结果展示。未完成的工具协议文本、截断回答和失败状态不会被标为成功，原始输出仍保留；启动时会校验旧 Order 的错误成功记录并追加纠正事件。选择 JSON 时执行严格语法校验；项目初始化另做结构校验。自然语言输出契约仍需研究者检查。
+
+从项目初始化：“文件 → 从项目初始化”，可先预览目录。本次指令要求 Claude 只读分析并返回全局定义和单元 JSON；检查后点击“采用拆分结果”。拆分优先引用现有源码入口、导入真实模块，并为后续开发步骤声明目标文件及验证方法。生成代码不会自动执行。界面支持启动目录及其子目录；其他项目使用 `--project` 启动。
+
+## 保存与复现
+
+Notebook 文档和运行证据默认位于启动项目的 `.castle/`，已加入本仓库忽略规则。绑定子项目时，文档仍由当前服务的存储目录管理；子项目自己的 `.castle/` 保存上下文配置和 Claude 输入文件。
+
+```text
+.castle/
+  context.json              # 上下文功能开关、harness 模板与字符预算
+  prompts/input<run-id>.md   # Claude 自行读取的完整输入
+  notebooks/<notebook-id>.json
+  runs/<run-id>/
+    context.md       # 实际输入，SHA-256 指纹
+    output.md        # 最终输出
+    events.jsonl     # 时间戳、流式输出、工具事件、终态
+    project-before.json / project-after.json  # 执行前后项目文件内容指纹
+    changes.json     # 实际新增、修改和删除的文件清单
+    run.json         # 输入版本、配置快照、执行器、耗时、输出校验值、错误等
+```
+
+文档自动保存，使用原子替换与版本冲突检查。“文件 → 下载 Notebook”导出文档与最近输出；独立执行记录可在检查器下载。UTC 时间戳在界面按浏览器本地时区显示。
+
+文件变更通过执行前后的内容指纹比较收集，跳过隐藏文件、依赖、构建、临时目录和运行证据；最多扫描 2000 个文件、20 层目录，单文件读取上限 8 MiB、总计 64 MiB。覆盖不完整会明确显示。清单反映执行期间观测到的变化，同时使用编辑器或其他工具修改的文件也可能计入；它不自动回滚文件，也不等同于源码版本管理。
+
+关闭服务会清空内核内存。重启后历史输出仍可查看，但相关计算结果会标记失效；重新运行上游即可恢复。运行快照用于追踪证据，不等于完整环境、依赖或外部数据的冻结。
+
+## 参数
+
+```text
+--project PATH        项目根目录，默认当前目录
+--port 8765           本机端口
+--python PATH         内核解释器，默认启动服务的 Python
+--claude PATH         Claude 可执行文件或 npm cli.js
+--data-dir PATH       文档与证据目录，默认 <project>/.castle
+--code-timeout 60     Python 执行秒数上限
+--agent-timeout 240   Claude 执行秒数上限
+--empty               不自动创建首次示例
+```
+
+## 验证
+
+```powershell
+python -m unittest discover -s tests -v
+node --check castle_notebook/static/app.js
+```
+
+测试包含真实 Python 子进程、项目模块导入、代理写入实际项目文件、变更回收、共享变量、取消/超时、失效传播、精简上下文、实际 HTTP/SSE 通信、输出契约和初始化。Claude 测试使用子进程协议夹具，不产生模型费用；这与真实 Claude 云端调用的验证不同。
+
+服务仅绑定 `127.0.0.1`，限制 Host / Origin，并使用页面会话令牌保护写操作。Python 拥有当前用户的文件访问权限；Claude 使用本机已有权限配置。0.9 不提供操作系统级沙箱或多人认证，不适合暴露为远程公共服务。
+
+详细范围与设计见 [0.9 开发说明](docs/0.9-plan.md)。

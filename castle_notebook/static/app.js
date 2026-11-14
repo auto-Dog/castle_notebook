@@ -1,0 +1,533 @@
+"use strict";
+
+const $ = (selector, root = document) => root.querySelector(selector);
+const h = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const state = {boot:null, doc:null, selected:null, tab:"context", context:null, contextRequest:0,
+  projectRequest:0,
+  dirty:false, globalDirty:false, documentDirty:false, editSeq:0, savePromise:null, timer:null, live:null, source:null,
+  sequence:false, sequenceStop:false, markdownEditing:new Set(), inspectorOpen:false};
+
+const paths = {
+  plus:'M12 5v14M5 12h14', play:'m8 5 11 7-11 7V5Z', stop:'M6 6h12v12H6z',
+  chevron:'m9 5 7 7-7 7', down:'m5 9 7 7 7-7', up:'m5 15 7-7 7 7',
+  notebook:'M5 3h14v18H5V3Zm4 0v18M12 8h4m-4 4h4',
+  code:'m8 7-5 5 5 5m8-10 5 5-5 5m-3-12-2 14',
+  order:'m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Z',
+  markdown:'M4 6v12M4 6l5 7 5-7v12m3-4 3 4 3-4m-3-8v12',
+  target:'M21 12a9 9 0 1 1-9-9m0 4a5 5 0 1 0 5 5m-5 0 9-9m-4 0h4v4',
+  folder:'M3 7V5h6l2 2h10v13H3V7Z', clock:'M12 8v5l3 2m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0',
+  download:'M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5', refresh:'M20 8a8 8 0 1 0 0 8m0-8V3m0 5h-5',
+  check:'m5 12 4 4L19 6', close:'m6 6 12 12M6 18 18 6', trash:'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7',
+  copy:'M9 8h12v13H9V8ZM5 16H3V3h12v2', eye:'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Zm13 0a3 3 0 1 1-6 0 3 3 0 0 1 6 0',
+  info:'M12 11v6m0-10v.1m9 4.9a9 9 0 1 1-18 0 9 9 0 0 1 18 0',
+  panel:'M3 4h18v16H3V4Zm12 0v16', arrow:'M4 12h16m-5-5 5 5-5 5',
+  terminal:'m5 6 6 6-6 6m8 0h6', spark:'m12 3 2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7',
+  link:'m10 13 4-4m-6 7-2 2a4 4 0 0 1-6-6l5-5a4 4 0 0 1 6 0m2-2 2-2a4 4 0 0 1 6 6l-5 5a4 4 0 0 1-6 0',
+  warning:'m12 3 10 18H2L12 3Zm0 6v5m0 3v.2', menu:'M4 6h16M4 12h16M4 18h16',
+  save:'M4 3h13l4 4v14H3V3h1Zm3 0v6h10V3M7 21v-8h10v8',
+};
+const icon = (name, cls="") => `<svg class="icon ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${paths[name] || paths.info}"/></svg>`;
+const timeText = (value, full=false) => value ? new Date(value).toLocaleString("zh-CN", full ? {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false} : {hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}) : "—";
+const typeLabel = {code:"PYTHON", markdown:"MARKDOWN", order:"ORDER"};
+const statusLabel = {idle:"待执行", running:"执行中", succeeded:"已完成", failed:"执行失败", cancelled:"已停止", interrupted:"已中断"};
+const busy = () => Boolean(state.live || state.doc?.runtime?.active_run_id);
+const currentCell = () => state.doc?.cells.find(c => c.id === state.selected);
+const newId = () => crypto.randomUUID().replaceAll("-", "").slice(0,12);
+
+async function api(path, method="GET", data) {
+  const response = await fetch(path, {method, headers:{...(method !== "GET" ? {"Content-Type":"application/json", "X-Castle-Token":state.boot.token} : {})}, body:data === undefined ? undefined : JSON.stringify(data)});
+  let result;
+  try { result = await response.json(); } catch { throw new Error("服务返回了无法读取的响应，请检查本地服务。"); }
+  if (!response.ok) throw new Error(result.error || `请求失败 (${response.status})`);
+  return result;
+}
+
+let toastTimer;
+function toast(message, error=false) {
+  const el = $("#toast");
+  el.textContent = message;
+  el.className = `visible ${error ? "error" : ""}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = "", error ? 7000 : 3500);
+}
+
+// A deliberately small, escaped Markdown renderer. Raw HTML is never inserted.
+function inline(text) {
+  const code = [];
+  text = h(text).replace(/`([^`]+)`/g, (_,v) => `\u0000${code.push(`<code>${v}</code>`)-1}\u0000`);
+  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
+  return text.replace(/\u0000(\d+)\u0000/g, (_,i) => code[Number(i)]);
+}
+function markdown(source) {
+  const lines = String(source).replaceAll("\r", "").split("\n");
+  let result = "", i=0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim().startsWith("```")) {
+      const language = line.trim().slice(3); const code=[]; i++;
+      while (i < lines.length && !lines[i].trim().startsWith("```")) code.push(lines[i++]);
+      result += `<div class="md-code"><span>${h(language || "code")}</span><pre><code>${h(code.join("\n"))}</code></pre></div>`; i++; continue;
+    }
+    if (/^#{1,6}\s/.test(line)) { const level = line.match(/^#+/)[0].length; result += `<h${level}>${inline(line.replace(/^#+\s/, ""))}</h${level}>`; i++; continue; }
+    if (!line.trim()) { i++; continue; }
+    if (/^\s*>/.test(line)) { result += `<blockquote>${inline(line.replace(/^\s*>\s?/, ""))}</blockquote>`; i++; continue; }
+    if (/^\s*([-*]|\d+\.)\s/.test(line)) {
+      const ordered = /^\s*\d+\./.test(line); const tag=ordered ? "ol" : "ul"; result+=`<${tag}>`;
+      while (i < lines.length && /^\s*([-*]|\d+\.)\s/.test(lines[i])) result += `<li>${inline(lines[i++].replace(/^\s*([-*]|\d+\.)\s/, ""))}</li>`;
+      result += `</${tag}>`; continue;
+    }
+    if (line.includes("|") && i+1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i+1])) {
+      const split = row => row.trim().replace(/^\|/,"").replace(/\|$/,"").split("|");
+      result += `<div class="table-wrap"><table><thead><tr>${split(line).map(v=>`<th>${inline(v.trim())}</th>`).join("")}</tr></thead><tbody>`; i+=2;
+      while(i<lines.length && lines[i].includes("|")) result += `<tr>${split(lines[i++]).map(v=>`<td>${inline(v.trim())}</td>`).join("")}</tr>`;
+      result += "</tbody></table></div>"; continue;
+    }
+    const para = [line]; i++;
+    while (i<lines.length && lines[i].trim() && !/^(#{1,6}\s|```|\s*[-*>]\s|\s*\d+\.\s)/.test(lines[i])) para.push(lines[i++]);
+    result += `<p>${para.map(inline).join("<br>")}</p>`;
+  }
+  return result;
+}
+
+function outputsHTML(outputs) {
+  return outputs.map(output => {
+    if (output.kind === "markdown") return `<div class="markdown rendered-output">${markdown(output.text)}</div>`;
+    if (output.kind === "image" && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(output.data)) return `<img class="plot" src="${output.data}" alt="Python 图像输出">`;
+    if (output.kind === "table") return `<div class="table-wrap"><table><thead><tr>${(output.data?.columns || []).map(v=>`<th>${h(v)}</th>`).join("")}</tr></thead><tbody>${(output.data?.rows || []).map(row=>`<tr>${row.map(v=>`<td>${h(typeof v === "object" && v !== null ? JSON.stringify(v) : v)}</td>`).join("")}</tr>`).join("")}</tbody></table>${output.truncated ? '<p class="muted">仅展示前 100 行、30 列。</p>' : ""}</div>`;
+    return `<pre class="output-text ${output.kind === "error" || output.kind === "stderr" ? "error-text" : ""}">${h(output.text)}</pre>`;
+  }).join("");
+}
+
+function pythonHTML(source) {
+  const pattern = /#[^\n]*|'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|\b(?:import|from|as|def|return|if|else|elif|for|in|while|class|with|try|except|raise|assert|True|False|None|and|or|not|pass|break|continue|lambda|yield)\b|\b\d+(?:\.\d+)?\b/g;
+  let result="", offset=0;
+  for(const match of source.matchAll(pattern)) {
+    result+=h(source.slice(offset,match.index));
+    const token=match[0], kind=token.startsWith("#")?"comment":/^["']/.test(token)?"string":/^\d/.test(token)?"number":"keyword";
+    result+=`<span class="syntax-${kind}">${h(token)}</span>`;offset=match.index+token.length;
+  }
+  return result+h(source.slice(offset))+"\n";
+}
+
+function shell() {
+  $("#app").innerHTML = `<div class="workspace">
+    <header class="topbar"><div class="header-inner"><a class="brand" href="/" aria-label="CastleNotebook 首页"><img src="/logo.svg" alt="" width="29" height="29"><span>CastleNotebook</span></a><input id="document-title" class="notebook-title" data-field="title" aria-label="Notebook 标题" maxlength="200"><span id="save-state" class="save-state">已保存</span><span class="app-version">0.9</span></div></header>
+    <div class="command-area"><nav class="menubar" aria-label="Notebook 菜单"><div class="menu-wrap"><button data-action="file-menu">文件</button><div id="file-menu" class="dropdown" hidden><button data-action="new">新建 Notebook</button><button data-action="init">从项目初始化…</button><a id="export-link" download>下载 Notebook</a><div class="menu-divider"></div><div id="notebook-list"></div></div></div><button data-action="add-default">插入</button><div class="menu-wrap"><button data-action="cell-menu">单元</button><div id="cell-menu" class="dropdown" hidden><button data-action="run-selected">运行当前</button><button data-action="run-all">运行全部</button></div></div><button data-action="reset">内核</button><button data-action="help">帮助</button><span class="menu-spacer"></span><button class="kernel-state" data-action="environment" id="kernel-state">Python 3 <span class="kernel-dot"></span></button></nav>
+    <div class="toolbar" role="toolbar" aria-label="Notebook 工具栏"><div class="tool-group"><button class="tool" data-action="save" title="保存 (Ctrl+S)" aria-label="保存 Notebook">${icon("save")}</button></div><div class="tool-group"><button class="tool" data-action="add-default" title="在当前单元下方插入" aria-label="插入单元">${icon("plus")}</button><button class="tool" data-action="delete-selected" title="删除单元" aria-label="删除所选单元">${icon("trash")}</button><button class="tool" data-action="duplicate-selected" title="复制单元" aria-label="复制所选单元">${icon("copy")}</button></div><div class="tool-group"><button class="tool" data-action="up-selected" title="上移" aria-label="上移所选单元">${icon("up")}</button><button class="tool" data-action="down-selected" title="下移" aria-label="下移所选单元">${icon("down")}</button></div><div class="tool-group"><button class="tool run-selected" data-action="run-selected" title="执行 (Shift+Enter)">${icon("play")}<span>运行</span></button><button class="tool" data-action="stop" title="停止" aria-label="停止执行">${icon("stop")}</button><button class="tool" data-action="reset" title="重启内核" aria-label="重启内核">${icon("refresh")}</button></div><select id="cell-type" aria-label="单元类型"><option value="code">Python</option><option value="markdown">Markdown</option><option value="order">Order</option></select><span class="toolbar-spacer"></span><button class="tool inspector-toggle" data-action="inspector" aria-label="切换检查器" title="上下文 / 变量 / 记录">${icon("panel")}</button></div></div>
+    <div class="work-content"><main id="notebook" class="notebook" aria-label="Notebook 单元"></main><aside class="inspector" id="inspector" aria-label="调试检查面板"></aside></div></div>`;
+  $(".inspector-toggle").insertAdjacentHTML("beforebegin",`<button class="tool project-toggle" data-action="project" id="project-button" title="查看项目文件">${icon("folder")}<span id="project-name">项目</span></button>`);
+  renderAll();
+}
+
+function renderSidebar() {
+  $("#notebook-list").innerHTML = state.boot.notebooks.map(doc=>`<button class="notebook-link ${state.doc?.id===doc.id?"active":""}" data-action="open" data-id="${doc.id}" ${busy()?"disabled":""}>${state.doc?.id===doc.id?"✓ ":""}${h(doc.title)}</button>`).join("");
+  if(state.doc){$("#document-title").value=state.doc.title;$("#export-link").href=`/api/notebooks/${state.doc.id}/export`;}
+  const editing=busy()||state.sequence;
+  document.querySelectorAll('.toolbar [data-action]').forEach(el=>{el.disabled=el.dataset.action==="stop"?!busy():["inspector","save"].includes(el.dataset.action)?false:editing;});
+  $("#cell-type").value=currentCell()?.type||"code";$("#cell-type").disabled=editing||!currentCell();
+  $("#document-title").disabled=editing;
+  const project=state.doc?.project_path||state.boot.project_path;
+  $("#project-name").textContent=project.split(/[\\/]/).filter(Boolean).at(-1)||"项目";
+  $("#project-button").title=`项目目录：${project}`;
+  $("#project-button").disabled=!state.doc;
+  $("#kernel-state").innerHTML=`Python 3 <span class="kernel-dot ${busy()?"busy":""}" title="${busy()?"执行中":state.doc?.runtime?.state==="ready"?"已就绪":"未启动"}"></span>`;
+}
+
+function stampHTML(item) { return `<span title="创建：${h(timeText(item.created_at,true))}">更新 ${h(timeText(item.updated_at))} <span class="dot-separator">·</span> r${item.revision}</span>`; }
+function tagHTML(cell) { const stale=cell.stale&&cell.status!=="running";return `<span class="status-tag ${stale ? "stale" : cell.status}">${cell.status === "running" ? '<i class="spinner"></i>' : stale ? icon("refresh") : cell.status === "succeeded" ? icon("check") : ""}${stale ? "结果已失效" : statusLabel[cell.status] || cell.status}</span>`; }
+
+function projectChangesHTML(changes) {
+  if(!changes)return "";
+  const labels={added:"新增",modified:"修改",deleted:"删除"};
+  return `<details class="project-changes" ${changes.files.length?"open":""}><summary>项目文件变更 · ${changes.files.length}${changes.complete?"":" · 部分核验"}</summary>${changes.files.length?`<ul>${changes.files.map(file=>`<li><span class="change-${h(file.change)}">${labels[file.change]||h(file.change)}</span><code>${h(file.path)}</code></li>`).join("")}</ul>`:'<p class="muted">已核验范围内未检测到文件变更。</p>'}${(changes.warnings||[]).map(warning=>`<p class="error-text">${h(warning)}</p>`).join("")}<p class="muted">${h(changes.policy)}</p></details>`;
+}
+
+function renderNotebook() {
+  const focused=document.activeElement;
+  const globalFocus=focused?.dataset?.global ? {field:focused.dataset.field,start:focused.selectionStart,end:focused.selectionEnd} : null;
+  const doc = state.doc;
+  if (!doc) { $("#notebook").innerHTML=`<div class="empty-workspace">${icon("notebook")}<h1>开始一篇研究笔记</h1><p>定义全局目的，再把问题拆成可验证的步骤。</p><button class="btn primary" data-action="new">${icon("plus")}新建 Notebook</button></div>`; return; }
+  const disabled=busy() || state.sequence ? "disabled" : "";
+  $("#notebook").innerHTML = `<div class="notebook-inner">
+    <section class="global-card" id="global-cell" title="${h(timeText(doc.global.updated_at,true))} · r${doc.global.revision}"><div class="input-prompt global-prompt">Global:</div><div class="global-fields"><label><span>目标</span><textarea data-field="goal" data-global="true" placeholder="项目目标" rows="1" aria-label="项目目标" maxlength="8000">${h(doc.global.goal)}</textarea></label><label><span>约束</span><textarea data-field="constraints" data-global="true" placeholder="全局约束" rows="1" aria-label="全局约束" maxlength="8000">${h(doc.global.constraints)}</textarea></label></div></section>
+    <div id="cells">${doc.cells.map(cellHTML).join("")}</div>
+    <div class="add-cell-bar"><button data-action="add" data-type="code" ${disabled} title="添加 Python 单元">+ Python</button><button data-action="add" data-type="markdown" ${disabled} title="添加 Markdown 单元">+ Markdown</button><button data-action="add" data-type="order" ${disabled} title="添加 AI Order 单元">+ Order</button></div></div>`;
+  autoSize();
+  if(globalFocus){const el=$(`[data-global][data-field="${globalFocus.field}"]`);el?.focus({preventScroll:true});el?.setSelectionRange(globalFocus.start,globalFocus.end);}
+}
+
+function cellHTML(cell,index) {
+  const disabled=busy() || state.sequence ? "disabled" : "";
+  const live=state.live?.cell_id===cell.id;
+  const editing=state.markdownEditing.has(cell.id);
+  let input="";
+  if (cell.type === "code") {
+    input=`<div class="code-editor"><pre class="code-highlight" aria-hidden="true">${pythonHTML(cell.source)}</pre><textarea class="code-input" data-field="source" data-cell="${cell.id}" spellcheck="false" wrap="off" aria-label="Python 代码" rows="4" ${disabled}>${h(cell.source)}</textarea></div>`;
+  } else if (cell.type === "markdown") {
+    input=editing ? `<textarea class="markdown-input" data-field="source" data-cell="${cell.id}" spellcheck="false" aria-label="Markdown 内容" ${disabled}>${h(cell.source)}</textarea>` : `<div class="markdown markdown-preview" data-id="${cell.id}" title="双击编辑 Markdown">${cell.source ? markdown(cell.source) : '<p class="placeholder">Markdown</p>'}</div>`;
+  } else {
+    input=`<div class="order-body"><textarea id="source-${cell.id}" class="order-input" data-field="source" data-cell="${cell.id}" aria-label="AI 指令" rows="2" placeholder="本步 AI 指令…" ${disabled}>${h(cell.source)}</textarea><div class="contract-row"><label for="contract-${cell.id}">预期</label><textarea id="contract-${cell.id}" class="contract-input" data-field="expected_output" data-cell="${cell.id}" placeholder="输出契约" aria-label="预期输出" rows="1" maxlength="8000" ${disabled}>${h(cell.expected_output)}</textarea></div><div class="order-options"><span>Claude</span><select aria-label="输出格式" data-field="output_format" data-cell="${cell.id}" ${disabled}>${["markdown","json","text"].map(v=>`<option value="${v}" ${cell.output_format===v?"selected":""}>${v==="markdown"?"Markdown":v==="json"?"JSON":"Text"}</option>`).join("")}</select><button class="text-button" data-action="context" data-id="${cell.id}">上下文</button></div></div>`;
+  }
+  if (cell.type === "order") {
+    const session=live ? {name:state.live.session_name,available:false,reason:"请等待或停止本次执行后再打开对话。"} : cell.session;
+    const canOpen=session?.available && state.boot.capabilities.claude;
+    const reason=session?.reason || (!state.boot.capabilities.claude ? "请安装并登录 Claude Code 后重启服务。" : "请先运行此 Order 单元，再打开对话。");
+    input+=`<div class="order-session"><span class="session-name" title="${h(session?.name || reason)}">${session?.name?`Session Name <code>${h(session.name)}</code>`:"运行后可打开对话"}</span><button class="text-button" data-action="open-session" data-id="${cell.id}" title="${h(canOpen?"在新终端打开此会话":reason)}" ${canOpen?"":"disabled"}>${icon("terminal")}打开对话</button></div>`;
+  }
+  const count=cell.execution_count||cell.run_ids.length||" ";
+  const hasOutput=live||cell.outputs.length||cell.last_error;
+  return `<article class="cell ${cell.type}-cell ${state.selected===cell.id?"selected":""}" id="cell-${cell.id}" data-cell-card="${cell.id}" tabindex="0" title="${h(cell.title)} · 更新 ${h(timeText(cell.updated_at,true))}">
+    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${disabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${tagHTML(cell)}</span><button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
+    <div class="output-block ${cell.stale?"stale-output":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span></div><div class="output-content" id="output-${cell.id}">${live?outputsHTML(state.live.outputs):outputsHTML(cell.outputs)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
+}
+
+function autoSize() {
+  document.querySelectorAll("#notebook textarea").forEach(el=>{el.style.height="auto";el.style.height=`${Math.min(540, Math.max(el.scrollHeight, el.classList.contains("code-input")?64:28))}px`;});
+}
+
+function inspectorFrame() {
+  const cell=currentCell();
+  const index=state.doc?.cells.findIndex(c=>c.id===state.selected);
+  $("#inspector").innerHTML=`<div class="inspector-heading"><span>调试检查器</span><span class="inspector-symbol">${icon("panel")}</span></div><div class="inspector-tabs" role="tablist" aria-label="检查器面板">${[["project","项目"],["context","上下文"],["variables","变量"],["history","记录"]].map(([key,label])=>`<button role="tab" aria-selected="${state.tab===key}" class="${state.tab===key?"active":""}" data-action="tab" data-tab="${key}">${label}${key==="variables" ? `<span>${state.doc?.runtime?.variables.length || 0}</span>` : ""}</button>`).join("")}</div><div class="inspector-body" id="inspector-body"></div><div class="inspector-footer"><span class="local-dot ${state.doc?.runtime?.state==="cold"?"cold":""}"></span>Python 内核 · ${busy()?"执行中":state.doc?.runtime?.state==="ready"?"已就绪":"尚未启动"}<button class="icon-btn" data-action="environment" aria-label="查看运行环境">${icon("info")}</button></div>`;
+  if(state.tab==="project" && state.doc){renderProject();return;}
+  if (!cell) { $("#inspector-body").innerHTML='<div class="inspector-empty">选择一个单元，检查它的输入、变量和执行记录。</div>'; return; }
+  if(state.tab==="variables") renderVariables();
+  if(state.tab==="history") renderHistoryList();
+  if(state.tab==="context") {
+    $("#inspector-body").innerHTML=`<div class="inspector-selection"><span class="mini-label">当前单元 · r${cell.revision}</span><strong>${String(index+1).padStart(2,"0")} <span>/</span> ${h(cell.title || typeLabel[cell.type])}</strong><small>创建 ${h(timeText(cell.created_at,true))}<br>更新 ${h(timeText(cell.updated_at,true))}</small></div><div id="context-details" class="context-details"><p class="muted">正在准备上下文预览…</p></div><details class="manual-context"><summary>自定义上文摘要</summary><textarea aria-label="精简上下文摘要" data-field="context_note" data-cell="${cell.id}" maxlength="3000" rows="3" ${busy()?"disabled":""}>${h(cell.context_note)}</textarea></details>`;
+    refreshContext();
+  }
+}
+
+async function refreshContext() {
+  if(!state.doc || !currentCell() || state.tab!=="context") return;
+  const target=$("#context-details"); if(!target) return;
+  const request=++state.contextRequest, nid=state.doc.id, cid=state.selected;
+  if(state.dirty) { target.innerHTML='<p class="muted">保存编辑后更新上下文预览。</p>'; return; }
+  try {
+    const result=state.live?.cell_id===cid ? state.live.context : await api(`/api/notebooks/${nid}/cells/${cid}/context`);
+    if(request!==state.contextRequest || cid!==state.selected || state.tab!=="context") return;
+    state.context=result;
+    const features=result.config?.features || {global_goal:true,global_constraints:true,expected_output:true};
+    const globalParts=[features.global_goal?"目的":"",features.global_constraints?"约束":""].filter(Boolean);
+    target.innerHTML=`<div class="context-description">${icon("eye")}每一步的输入，都可以检查。</div>
+      <p class="inspector-copy">${state.live?.cell_id===cid?"以下为本次执行的实际输入快照。":"按项目配置组装上下文，点击完整输入查看实际内容。"}</p>
+      <div class="context-stat"><div><strong>${result.characters.toLocaleString()}</strong><span>输入字符</span></div><div><strong>~${result.estimated_tokens.toLocaleString()}</strong><span>估计 tokens</span></div></div>
+      <div class="budget-bar"><span style="width:${Math.min(100, result.characters/result.budget*100)}%"></span></div>
+      <div class="budget-caption">${Math.round(result.characters/result.budget*100)}% 的字符预算 <span>${result.budget.toLocaleString()}</span></div>
+      <div class="mini-label context-sources-label">上下文构成</div>
+      <div class="context-source"><span class="source-icon">${icon("folder")}</span><div><strong>项目工作区</strong><span>${h(result.project?.project_path||state.doc.project_path)}</span></div></div>
+      ${globalParts.length?`<div class="context-source global-source"><span class="source-icon">${icon("target")}</span><div><strong>Global Cell</strong><span>${globalParts.join("与")} · 完整保留</span></div>${icon("check")}</div>`:""}
+      ${result.sections.map(s=>`<div class="context-source"><span class="source-icon">${icon(state.doc.cells.find(c=>c.id===s.cell_id)?.type||"code")}</span><div><strong>${h(s.title || "未命名单元")}</strong><span>${s.has_valid_output?"包含有效结果":h(s.state)}${s.manually_summarized?" · 手动摘要":""}</span></div><span class="source-valid ${s.has_valid_output?"valid":""}"></span></div>`).join("")}
+      <div class="context-source current-source"><span class="source-icon">${icon("arrow")}</span><div><strong>${features.expected_output?"当前输入与输出契约":"当前输入"}</strong><span>完整保留</span></div></div>
+      <button class="btn outline full" data-action="context" data-id="${cid}">${icon("code")}检查完整输入</button>
+      <div class="fingerprint"><span>SHA-256 指纹</span><code>${h(result.fingerprint.slice(0,16))}…</code></div>
+      <div class="inspector-tip">${icon("info")}${h(result.policy)}</div>`;
+  } catch(error) { if(request===state.contextRequest) target.innerHTML=`<p class="error-text">${h(error.message)}</p>`; }
+}
+
+async function renderProject() {
+  const nid=state.doc.id, request=++state.projectRequest, body=$("#inspector-body");
+  body.innerHTML=`<div class="mini-label">项目工作目录</div><code class="project-root">${h(state.doc.project_path)}</code><p class="inspector-copy">Order 在此目录中开发和修改源码，Python 单元可导入项目模块进行验证。</p><button class="btn outline small" data-action="refresh-project">${icon("refresh")}刷新文件</button><div id="project-files"><p class="muted">读取项目文件…</p></div>`;
+  try {
+    const project=await api(`/api/notebooks/${nid}/project`);
+    if(state.doc?.id!==nid || state.tab!=="project" || request!==state.projectRequest)return;
+    $("#project-files").innerHTML=`<p class="inspector-copy">${project.files.length} 个文件${project.truncated?" · 概览已截断":""}</p><div class="project-file-list">${project.files.map(path=>`<button data-action="project-file" data-path="${h(path)}" title="预览 ${h(path)}">${icon("code")}<code>${h(path)}</code></button>`).join("")||'<p class="muted">项目中还没有可展示的文件。</p>'}</div>${(project.warnings||[]).map(warning=>`<p class="error-text">${h(warning)}</p>`).join("")}<p class="inspector-copy">${h(project.policy)}</p>`;
+  } catch(error) {if(state.doc?.id===nid && state.tab==="project" && request===state.projectRequest)body.textContent=error.message;}
+}
+
+function renderVariables() {
+  const vars=state.doc.runtime.variables;
+  $("#inspector-body").innerHTML=`<div class="mini-label">共享 Python 命名空间</div><p class="inspector-copy">所有 Python 单元共享当前内核的变量。上游重跑后，内存可能仍包含旧变量；重启可从头验证。历史输出会保留。</p>${vars.length?`<div class="variable-list">${vars.map(v=>`<div class="variable"><div><code>${h(v.name)}</code><span>${h(v.type)}</span></div><pre>${h(v.preview)}</pre>${v.shape?`<small>size / shape ${h(v.shape)}</small>`:""}</div>`).join("")}</div>`:`<div class="inspector-empty">${icon("terminal")}<strong>还没有可检查的变量</strong><p>运行 Python 单元后，变量名称、类型和有界预览会显示在这里。</p></div>`}<div class="inspector-tip">${icon("info")}变量预览最多 80 个条目。完整数据保留在本地内核中。</div>`;
+}
+
+async function renderHistoryList() {
+  const cell=currentCell(), body=$("#inspector-body");
+  body.innerHTML=`<div class="mini-label">${h(cell.title)} · ${cell.run_ids.length} 次执行</div><p class="inspector-copy">每次执行都有独立的上下文快照、输出文件与事件记录。</p><div id="history-list">${cell.run_ids.length?'<p class="muted">读取记录…</p>':'<div class="inspector-empty">此单元尚未执行。</div>'}</div>`;
+  const cid=cell.id;
+  try {
+    const runs=await Promise.all(cell.run_ids.slice(-20).reverse().map(id=>api(`/api/runs/${id}`)));
+    if(state.selected!==cid || state.tab!=="history") return;
+    $("#history-list").innerHTML=runs.map((run,i)=>`<button class="history-item" data-action="view-run" data-id="${run.id}"><span class="history-item-head"><strong>执行 #${cell.run_ids.length-i}</strong><span class="status-tag ${run.status}">${statusLabel[run.status]||run.status}</span></span><span>${h(timeText(run.started_at,true))}</span><span class="history-item-foot"><code>${h(run.id)}</code><span>${run.duration_ms===null?"执行中":(run.duration_ms/1000).toFixed(2)+" s"}</span></span></button>`).join("");
+  } catch(error) { if($("#history-list")) $("#history-list").textContent=error.message; }
+}
+
+function renderAll() { renderSidebar(); renderNotebook(); inspectorFrame(); }
+function selectCell(id,scroll=false) {
+  if(!state.doc?.cells.some(c=>c.id===id)) return;
+  state.selected=id;
+  document.querySelectorAll(".cell.selected").forEach(el=>el.classList.remove("selected"));
+  $(`#cell-${id}`)?.classList.add("selected");
+  renderSidebar(); inspectorFrame();
+  if(scroll) $(`#cell-${id}`)?.scrollIntoView({behavior:"smooth",block:"start"});
+}
+
+function updateSaveState(label="已保存", error=false) {
+  const el=$("#save-state");
+  if(el) { el.innerHTML=`${icon(error?"warning":state.dirty?"clock":"check")}${h(label)}`;el.classList.toggle("error-text",error); }
+}
+function touch(scope="document") {
+  state.dirty=true;state.editSeq++;state.context=null;
+  if(scope==="global")state.globalDirty=true;else state.documentDirty=true;
+  updateSaveState("等待保存…");clearTimeout(state.timer);
+  state.timer=setTimeout(()=>save().catch(error=>toast(error.message,true)),600);
+}
+function editablePayload() {
+  const doc=state.doc;
+  return {revision:doc.revision,title:doc.title,global:{goal:doc.global.goal,constraints:doc.global.constraints},
+    cells:doc.cells.map(c=>Object.fromEntries(["id","type","title","source","expected_output","output_format","mode","context_note"].map(k=>[k,c[k]])))};
+}
+async function save() {
+  if(state.savePromise) { await state.savePromise; if(state.dirty) return save(); return; }
+  if(!state.dirty || !state.doc) return;
+  const seq=state.editSeq, nid=state.doc.id, globalOnly=state.globalDirty&&!state.documentDirty;
+  const payload=globalOnly?{revision:state.doc.global.revision,goal:state.doc.global.goal,constraints:state.doc.global.constraints}:editablePayload();
+  updateSaveState("正在保存…");
+  state.savePromise=(async()=>{
+    try {
+      const doc=await api(`/api/notebooks/${nid}${globalOnly?"/global":""}`,"PUT",payload);
+      if(state.doc.id!==nid) return;
+      if(seq===state.editSeq) { state.doc=doc;state.dirty=false;state.globalDirty=false;state.documentDirty=false; }
+      else {state.doc.revision=doc.revision;state.doc.global.revision=doc.global.revision;}
+      const item=state.boot.notebooks.find(n=>n.id===nid);
+      if(item) {item.title=doc.title;item.updated_at=doc.updated_at;}
+      updateSaveState(state.dirty?"等待保存…":"已保存");
+      renderSidebar();
+      if(!state.dirty) {
+        doc.cells.forEach(c=>{
+          const el=$(`[data-status-id="${c.id}"]`);if(el)el.innerHTML=tagHTML(c);
+          const card=$(`#cell-${c.id} .output-block`);
+          if(card){card.classList.toggle("stale-output",c.stale);if(c.stale&&!$(".stale-label",card)){const label=document.createElement("span");label.className="stale-label";label.textContent="上游已更改 · 此结果需重新验证";$(".duration",card)?.remove();$(".output-heading",card).insertBefore(label,$(".output-links",card));}}
+          const stamp=$(`#cell-${c.id} .cell-actions .cell-stamp`);if(stamp)stamp.innerHTML=stampHTML(c);
+        });
+        const globalStamp=$(".global-foot .cell-stamp");if(globalStamp)globalStamp.innerHTML=stampHTML(doc.global);
+        refreshContext();
+      }
+    } catch(error) {updateSaveState("保存失败 · 请重试",true);throw error;}
+  })();
+  try {await state.savePromise;} finally {state.savePromise=null;}
+  if(state.dirty) return save();
+}
+async function flushSave() {clearTimeout(state.timer);await save();}
+
+async function openNotebook(id) {
+  await flushSave();
+  state.doc=await api(`/api/notebooks/${id}`);state.dirty=false;state.globalDirty=false;state.documentDirty=false;
+  state.selected=state.doc.cells.find(c=>c.type==="order")?.id || state.doc.cells[0]?.id || null;
+  state.context=null;state.live=null;
+  localStorage.setItem("castle-notebook",id);
+  renderAll();
+  if(state.doc.runtime.active_run_id) {const run=await api(`/api/runs/${state.doc.runtime.active_run_id}`);watchRun(run).catch(e=>toast(e.message,true));}
+}
+
+function watchRun(run) {
+  state.live=run;state.live.outputs=[];state.doc.runtime.active_run_id=run.id;
+  const cell=state.doc.cells.find(c=>c.id===run.cell_id);if(cell){cell.status="running";cell.execution_count=run.execution_count;}
+  state.selected=run.cell_id;renderAll();
+  let ended=false, lost=false;
+  return new Promise((resolve,reject)=>{
+    const source=new EventSource(`/api/runs/${run.id}/events`);state.source=source;
+    const finish=async final=>{
+      if(ended)return;ended=true;source.close();state.source=null;state.live=null;
+      try {
+        await flushSave();
+        const latest=await api(`/api/notebooks/${run.notebook_id}`);
+        if(state.globalDirty){latest.global.goal=state.doc.global.goal;latest.global.constraints=state.doc.global.constraints;}
+        state.doc=latest;
+        final.stale=Boolean(final.stale||latest.cells.find(c=>c.id===run.cell_id)?.stale);
+        state.boot.notebooks=await api("/api/notebooks");
+        renderAll();
+        if(final.status!=="succeeded") toast(final.error || "执行未完成，请检查输出与运行记录。",true);
+        else if(!state.sequence) toast(final.stale?"Global 已变化，本次结果已标记失效。":"本步执行完成，结果与输入快照已保存。");
+        resolve(final);
+      } catch(error) {state.doc.runtime.active_run_id=null;renderAll();reject(error);}
+    };
+    source.onmessage=event=>{
+      if(ended || state.live?.id!==run.id)return;
+      const message=JSON.parse(event.data), data=message.data;
+      if(message.type==="output") {
+        const previous=state.live.outputs.at(-1);
+        if(previous && ["stdout","stderr"].includes(data.kind) && previous.kind===data.kind)previous.text+=data.text||"";
+        else state.live.outputs.push(data);
+        const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML(state.live.outputs);
+      } else if(message.type==="canonical_output") {
+        state.live.outputs=[data];const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML([data]);
+      } else if(message.type==="variables") {
+        state.doc.runtime.variables=data.variables;state.doc.runtime.kernel_id=data.kernel_id;
+        if(state.tab==="variables")inspectorFrame();
+      } else if(message.type==="tool" || message.type==="log" || message.type==="status") {
+        const el=$(`#trace-${run.cell_id}`);if(el)el.textContent=message.type==="tool"?`${data.name} · ${data.input}`:data.text||data.message||"";
+      } else if(message.type==="finished")finish(data);
+    };
+    source.onerror=async()=>{
+      if(ended)return;
+      try {const latest=await api(`/api/runs/${run.id}`);if(latest.status!=="running")await finish(latest);else if(!lost){lost=true;toast("实时连接暂时中断，正在自动重连…");}}
+      catch {if(!lost){lost=true;toast("无法连接本地服务。恢复后将自动重连。",true);}}
+    };
+  });
+}
+
+async function runCell(id) {
+  await flushSave();
+  if(busy())throw new Error("请先等待或停止当前单元。");
+  const run=await api(`/api/notebooks/${state.doc.id}/cells/${id}/run`,"POST",{});
+  state.markdownEditing.delete(id);
+  return watchRun(run);
+}
+async function runAll() {
+  await flushSave();
+  state.sequence=true;state.sequenceStop=false;
+  const ids=state.doc.cells.map(c=>c.id);
+  try {
+    for(const id of ids) {
+      if(state.sequenceStop)break;
+      const result=await runCell(id);
+      if(result.status!=="succeeded"||result.stale)break;
+    }
+  } finally {state.sequence=false;renderAll();}
+}
+
+function showModal(title,body,wide=false) {
+  const modal=$("#modal");if(modal.open)modal.close();
+  modal.className=wide?"wide":"";
+  modal.innerHTML=`<div class="modal-head"><h2 id="modal-title">${h(title)}</h2><button class="icon-btn" data-action="close-modal" aria-label="关闭窗口">${icon("close")}</button></div><div class="modal-body">${body}</div>`;
+  modal.showModal();
+}
+function newModal() {
+  const root=state.boot.project_path, project=state.doc?.project_path||root;
+  const relative=project.startsWith(root+"\\")||project.startsWith(root+"/")?project.slice(root.length+1):".";
+  showModal("新建 Notebook",`<form id="new-form"><div class="path-block">${icon("folder")}<code>${h(root)}</code></div><label class="modal-label">项目子目录<input name="relative_path" value="${h(relative)}" placeholder="." autocomplete="off"></label><label class="modal-label">标题<input name="title" placeholder="未命名 Notebook" maxlength="200" autocomplete="off"></label><fieldset class="template-grid"><legend>模板</legend><label class="template-option"><input type="radio" name="template" value="blank" checked><span>${icon("notebook")}<strong>空白</strong><small>自定义单元</small></span></label><label class="template-option"><input type="radio" name="template" value="quant"><span>${icon("code")}<strong>金融研究</strong><small>合成数据</small></span></label><label class="template-option"><input type="radio" name="template" value="algorithm"><span>${icon("terminal")}<strong>算法验证</strong><small>边界断言</small></span></label></fieldset><button class="btn primary full" type="submit">创建</button></form>`);
+}
+function initModal() {
+  showModal("从项目初始化",`<div class="path-block">${icon("folder")}<code>${h(state.boot.project_path)}</code></div><form id="init-form"><label class="modal-label">子目录<input name="relative_path" value="." placeholder="." autocomplete="off"></label><div class="modal-callout">${icon("info")}本次指令要求 Claude 只读分析；生成代码需手动执行。</div>${!state.boot.capabilities.claude?'<p class="error-text">请先安装并登录 Claude Code，再重启服务。</p>':""}<div class="modal-actions"><button class="btn outline" type="button" data-action="scan-project">文件概览</button><button class="btn primary" type="submit" ${!state.boot.capabilities.claude?"disabled":""}>用 Claude 分析</button></div><div id="scan-result"></div></form>`);
+}
+async function contextModal(id) {
+  await flushSave();selectCell(id);
+  const context=state.live?.cell_id===id?state.live.context:await api(`/api/notebooks/${state.doc.id}/cells/${id}/context`);
+  state.context=context;
+  showModal("执行输入 · 完整上下文",`<p class="modal-description">${h(context.policy)}<br>以下文本与本次状态下发送给 Claude 的输入一致；执行记录会保存当时的独立快照。${context.config_path?`<br>模板配置：<code>${h(context.config_path)}</code>`:""}</p><div class="context-modal-meta"><span>${context.characters.toLocaleString()} 字符 · ~${context.estimated_tokens.toLocaleString()} tokens</span><button class="btn outline small" data-action="copy-context">${icon("copy")}复制输入</button></div><pre class="context-full">${h(context.prompt)}</pre><div class="context-hash"><span>SHA-256</span><code>${h(context.fingerprint)}</code></div>`,true);
+}
+async function viewRun(id) {
+  const run=await api(`/api/runs/${id}`);const events=await fetch(`/api/runs/${id}/artifact?name=events`).then(r=>r.ok?r.text():"");
+  const trace=events.split("\n").filter(Boolean).map(line=>{try{return JSON.parse(line);}catch{return null;}}).filter(e=>e && ["status","tool","tool_result","log","validation","finished"].includes(e.type));
+  showModal(`${run.cell_title || "单元"} · 执行记录`,`<div class="run-meta-grid"><div><span>状态</span><strong class="${run.status==="failed"?"error-text":""}">${h(statusLabel[run.status]||run.status)}</strong></div><div><span>执行时间</span><strong>${h(timeText(run.started_at,true))}</strong></div><div><span>输入版本</span><strong>Cell r${run.cell_revision} · Global r${run.global_revision}</strong></div><div><span>运行 ID</span><code>${h(run.id)}</code></div></div>${run.error?`<div class="run-error">${h(run.error)}</div>`:""}<div class="run-downloads">${[["context","输入快照"],["output","输出文件"],["events","事件记录"],["run","完整元数据"]].map(([name,label])=>`<a class="btn outline small" href="/api/runs/${id}/artifact?name=${name}" download>${icon("download")}${label}</a>`).join("")}</div><details class="run-detail" open><summary>最终输出</summary><div class="history-output">${outputsHTML(run.outputs)}</div></details><details class="run-detail"><summary>实际输入 · ${run.context.characters} 字符</summary><pre class="context-full">${h(run.context.prompt)}</pre><code class="full-hash">${h(run.context.fingerprint)}</code></details><details class="run-detail"><summary>运行事件 · ${trace.length} 条</summary><div class="event-list">${trace.map(e=>`<div><time>${h(timeText(e.at))}</time><strong>${h(e.type)}</strong><pre>${h(e.data.text||e.data.message||e.data.name||e.data.status||"")}${e.data.input?"\n"+h(e.data.input):""}</pre></div>`).join("")}</div></details><div class="artifact-path">${icon("folder")}<code>${h(run.artifact)}</code></div>`,true);
+  $("#modal .modal-body").insertAdjacentHTML("beforeend",`<div class="path-block">${icon("folder")}<code>${h(run.project_path)}</code></div>${projectChangesHTML(run.project_changes)}${run.project_changes?`<a class="btn outline small" href="/api/runs/${id}/artifact?name=changes" download>${icon("download")}文件变更记录</a>`:""}`);
+}
+
+async function mutateCells(fn) {
+  await flushSave();if(busy() || state.sequence)throw new Error("请等待或停止执行后再编辑。");
+  fn();touch();await flushSave();renderAll();
+}
+async function action(name,el) {
+  const id=el.dataset.id;
+  if(name==="file-menu"||name==="cell-menu"){const menu=$(`#${name}`),open=menu.hidden;document.querySelectorAll(".dropdown").forEach(el=>el.hidden=true);menu.hidden=!open;return;}
+  if(name==="save"){await flushSave();return toast("已保存。");}
+  if(name==="run-selected"){if(state.selected)return runCell(state.selected);return;}
+  if(name==="add-default")return action("add",{dataset:{type:currentCell()?.type||"code",insert:true}});
+  if(["delete-selected","duplicate-selected","up-selected","down-selected"].includes(name)){
+    if(!state.selected)return;
+    return action({"delete-selected":"delete","duplicate-selected":"duplicate","up-selected":"move-up","down-selected":"move-down"}[name],{dataset:{id:state.selected}});
+  }
+  if(name==="new")return newModal();
+  if(name==="init")return initModal();
+  if(name==="open")return openNotebook(id);
+  if(name==="select")return selectCell(id,true);
+  if(name==="scroll-global")return $("#global-cell")?.scrollIntoView({behavior:"smooth"});
+  if(name==="close-modal")return $("#modal").close();
+  if(name==="tab"){state.tab=el.dataset.tab;return inspectorFrame();}
+  if(name==="project"){state.tab="project";state.inspectorOpen=true;$(".workspace").classList.add("inspector-open");return inspectorFrame();}
+  if(name==="refresh-project")return renderProject();
+  if(name==="project-file"){
+    const file=await api(`/api/notebooks/${state.doc.id}/project/file?path=${encodeURIComponent(el.dataset.path)}`);
+    return showModal(`项目文件 · ${file.path}`,`<p class="modal-description">${h(state.doc.project_path)}<br>当前文件内容</p><pre class="context-full">${h(file.source)}</pre>`,true);
+  }
+  if(name==="sidebar")return $(".workspace").classList.toggle("sidebar-open");
+  if(name==="inspector"){state.inspectorOpen=!state.inspectorOpen;return $(".workspace").classList.toggle("inspector-open",state.inspectorOpen);}
+  if(name==="run")return runCell(id);
+  if(name==="run-all")return runAll();
+  if(name==="stop"){state.sequenceStop=true;const rid=state.live?.id || state.doc?.runtime.active_run_id;if(rid)return api(`/api/runs/${rid}/cancel`,"POST",{});return;}
+  if(name==="context")return contextModal(id);
+  if(name==="open-session"){
+    el.disabled=true;
+    try {const session=await api(`/api/notebooks/${state.doc.id}/cells/${id}/open-session`,"POST",{});toast(`已在新终端打开对话：${session.session_name}`);}
+    finally {el.disabled=false;}
+    return;
+  }
+  if(name==="copy-context"){await navigator.clipboard.writeText(state.context.prompt);return toast("完整输入已复制。");}
+  if(name==="edit-markdown"){if(busy())return;await flushSave();state.selected=id;state.markdownEditing.has(id)?state.markdownEditing.delete(id):state.markdownEditing.add(id);renderAll();$(`#cell-${id} textarea`)?.focus();return;}
+  if(name==="history"){selectCell(id);state.tab="history";inspectorFrame();state.inspectorOpen=true;$(".workspace").classList.add("inspector-open");return;}
+  if(name==="view-run")return viewRun(id);
+  if(name==="reset")return showModal("重启 Python 内核",`<p>重启将清空当前共享变量，保留所有历史输出。已有计算结果会标记失效，需从上游重新执行。</p><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn primary" data-action="confirm-reset">${icon("refresh")}重启内核</button></div>`);
+  if(name==="confirm-reset"){await flushSave();state.doc=await api(`/api/notebooks/${state.doc.id}/kernel/reset`,"POST",{});$("#modal").close();renderAll();return toast("内核已重启，历史输出已保留。");}
+  if(name==="add")return mutateCells(()=>{const stamp=new Date().toISOString(),kind=el.dataset.type;const cell={id:newId(),type:kind,title:"",source:"",expected_output:"",context_note:"",mode:"llm",output_format:"markdown",created_at:stamp,updated_at:stamp,revision:1,status:"idle",stale:false,outputs:[],run_ids:[]};const at=el.dataset.insert?state.doc.cells.findIndex(c=>c.id===state.selected)+1:state.doc.cells.length;state.doc.cells.splice(at,0,cell);state.selected=cell.id;if(kind==="markdown")state.markdownEditing.add(cell.id);}).then(()=>{$(`#cell-${state.selected}`)?.scrollIntoView({behavior:"smooth",block:"center"});$(`#cell-${state.selected} textarea`)?.focus();});
+  if(["move-up","move-down","duplicate"].includes(name))return mutateCells(()=>{const index=state.doc.cells.findIndex(c=>c.id===id);if(name==="duplicate"){const copy=structuredClone(state.doc.cells[index]);Object.assign(copy,{id:newId(),title:copy.title+" · 副本",status:"idle",stale:false,outputs:[],run_ids:[],last_run_id:undefined,last_error:null,initializer:false,applied_run_id:undefined});state.doc.cells.splice(index+1,0,copy);state.selected=copy.id;}else{const to=index+(name==="move-up"?-1:1);if(to>=0 && to<state.doc.cells.length)[state.doc.cells[index],state.doc.cells[to]]=[state.doc.cells[to],state.doc.cells[index]];}});
+  if(name==="delete")return showModal("删除这个单元",`<p>将删除当前文档中的「${h(state.doc.cells.find(c=>c.id===id).title)}」。独立运行证据文件仍保存在本地，下游结果会标记失效。</p><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn danger" data-action="confirm-delete" data-id="${id}">删除单元</button></div>`);
+  if(name==="confirm-delete"){$("#modal").close();return mutateCells(()=>{state.doc.cells=state.doc.cells.filter(c=>c.id!==id);state.selected=state.doc.cells[0]?.id;});}
+  if(name==="apply-init"){await flushSave();state.doc=await api(`/api/notebooks/${state.doc.id}/apply-init`,"POST",{run_id:id});renderAll();return toast("项目已拆分为独立单元。检查代码后再逐步运行。");}
+  if(name==="scan-project"){el.disabled=true;try{const result=await api("/api/project/scan","POST",{relative_path:$("#init-form input[name=relative_path]").value});$("#scan-result").innerHTML=`<p class="muted">${result.files.length} 个文件${result.truncated?" · 概览已截断":""}</p><pre>${h(result.files.join("\n"))}</pre><p class="muted">${h(result.policy)}</p>`;}finally{el.disabled=false;}return;}
+  if(name==="environment")return showModal("本地运行环境",`<div class="environment-details"><label>项目工作目录</label><code>${h(state.doc?.project_path||state.boot.project_path)}</code><label>Python 内核</label><code>${h(state.boot.capabilities.python)}</code><label>Claude CLI</label><p>${state.boot.capabilities.claude?'<span class="status-tag succeeded">已检测到</span> 运行时沿用本机 Claude 的模型、工具、权限与登录配置。':'<span class="status-tag failed">未检测到</span> 安装并登录后，重启本服务。'}</p><label>执行上限</label><p>Python ${state.boot.capabilities.code_timeout} 秒 · Claude ${state.boot.capabilities.agent_timeout} 秒</p></div><p class="muted">切换研究环境：启动服务时指定 <code>--python &lt;解释器路径&gt;</code>。初始化其他项目：使用 <code>--project &lt;项目目录&gt;</code>。</p>`);
+  if(name==="help")return showModal("把端到端过程，拆成可控的每一步",`<div class="help-steps"><div><b>01</b><section><h3>用 Global 约束全局</h3><p>写清目的、数据口径和执行边界。修改后，下游旧结果会标记失效。</p></section></div><div><b>02</b><section><h3>用单元推进研究</h3><p>Markdown 记录假设，Python 运行真实代码，Order 把精简上文与输出契约发送给 Claude。Python 单元共享变量。</p></section></div><div><b>03</b><section><h3>先检查，再决定下一步</h3><p>在检查器查看完整输入、有效结果和变量。每次执行都有独立的输入、输出与事件文件，代码建议由你检查后执行。</p></section></div></div><div class="shortcut-list"><span>执行并选择下一个单元<kbd>Shift + Enter</kbd></span><span>执行当前单元<kbd>Ctrl + Enter</kbd></span><span>立即保存<kbd>Ctrl + S</kbd></span><span>代码缩进<kbd>Tab</kbd></span></div>`);
+}
+
+document.addEventListener("click",event=>{
+  const el=event.target.closest("[data-action]");
+  if(el && !el.disabled){event.preventDefault();if(!["file-menu","cell-menu"].includes(el.dataset.action))document.querySelectorAll(".dropdown").forEach(el=>el.hidden=true);action(el.dataset.action,el).catch?.(error=>toast(error.message,true));return;}
+  const card=event.target.closest("[data-cell-card]");if(card && state.selected!==card.dataset.cellCard)selectCell(card.dataset.cellCard);
+  if(!event.target.closest(".menu-wrap"))document.querySelectorAll(".dropdown").forEach(el=>el.hidden=true);
+});
+document.addEventListener("focusin",event=>{const id=event.target.dataset?.cell;if(id&&state.selected!==id)selectCell(id);});
+document.addEventListener("dblclick",event=>{const el=event.target.closest(".markdown-preview");if(el)action("edit-markdown",el).catch(error=>toast(error.message,true));});
+document.addEventListener("input",event=>{
+  const el=event.target;
+  if(!el.dataset.field || !state.doc)return;
+  if(el.dataset.global)state.doc.global[el.dataset.field]=el.value;
+  else if(el.dataset.cell){const cell=state.doc.cells.find(c=>c.id===el.dataset.cell);if(cell)cell[el.dataset.field]=el.value;
+    if(el.classList.contains("code-input"))el.previousElementSibling.innerHTML=pythonHTML(el.value);}
+  else state.doc[el.dataset.field]=el.value;
+  if(el.tagName==="TEXTAREA"){el.style.height="auto";el.style.height=`${Math.min(540,Math.max(28,el.scrollHeight))}px`;}
+  touch(el.dataset.global?"global":"document");
+});
+document.addEventListener("change",event=>{
+  if(event.target.id==="cell-type"){
+    const kind=event.target.value;
+    mutateCells(()=>{const cell=currentCell();cell.type=kind;if(kind==="markdown")state.markdownEditing.add(cell.id);}).catch(e=>toast(e.message,true));return;
+  }
+  if(event.target.tagName==="SELECT"&&event.target.dataset.field)event.target.dispatchEvent(new Event("input",{bubbles:true}));
+});
+document.addEventListener("scroll",event=>{if(event.target.classList?.contains("code-input")){event.target.previousElementSibling.scrollTop=event.target.scrollTop;event.target.previousElementSibling.scrollLeft=event.target.scrollLeft;}},true);
+document.addEventListener("submit",async event=>{
+  if(!["new-form","init-form"].includes(event.target.id))return;
+  event.preventDefault();const form=event.target, submit=$("button[type=submit]",form);submit.disabled=true;
+  try {
+    await flushSave();
+    if(busy())throw new Error("请等待或停止当前运行后再创建。");
+    const values=Object.fromEntries(new FormData(form));
+    if(form.id==="new-form"){
+      const doc=await api("/api/notebooks","POST",values);state.boot.notebooks=await api("/api/notebooks");$("#modal").close();await openNotebook(doc.id);
+    } else {
+      const result=await api("/api/project/initialize","POST",{...values,run:true});state.doc=result.notebook;state.selected=result.run?.cell_id;state.boot.notebooks=await api("/api/notebooks");localStorage.setItem("castle-notebook",state.doc.id);$("#modal").close();renderAll();if(result.run)watchRun(result.run).catch(e=>toast(e.message,true));
+    }
+  } catch(error){toast(error.message,true);}finally{submit.disabled=false;}
+});
+document.addEventListener("keydown",event=>{
+  if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==="s"){event.preventDefault();flushSave().then(()=>toast("已保存到本地。")).catch(e=>toast(e.message,true));return;}
+  if($("#modal").open)return;
+  if(event.key==="Tab" && event.target.classList?.contains("code-input")){event.preventDefault();const el=event.target;el.setRangeText("    ",el.selectionStart,el.selectionEnd,"end");el.dispatchEvent(new Event("input",{bubbles:true}));return;}
+  if(event.key==="Enter"&&(event.shiftKey||event.ctrlKey||event.metaKey)&&currentCell()&&!busy()&&!state.sequence){event.preventDefault();const id=state.selected,advance=event.shiftKey;runCell(id).then(result=>{if(advance&&result.status==="succeeded"){const i=state.doc.cells.findIndex(c=>c.id===id);if(state.doc.cells[i+1])selectCell(state.doc.cells[i+1].id,true);}}).catch(e=>toast(e.message,true));}
+  if(event.key==="?" && !["INPUT","TEXTAREA","SELECT"].includes(event.target.tagName))action("help",{});
+});
+window.addEventListener("beforeunload",event=>{if(state.dirty){event.preventDefault();event.returnValue="";}});
+$("#modal").addEventListener("click",event=>{if(event.target===$("#modal")){const rect=event.target.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)event.target.close();}});
+
+(async()=>{
+  try {
+    state.boot=await api("/api/bootstrap");
+    const stored=localStorage.getItem("castle-notebook");
+    const first=state.boot.notebooks.find(n=>n.id===stored) || state.boot.notebooks[0];
+    if(first){state.doc=await api(`/api/notebooks/${first.id}`);state.selected=state.doc.cells.find(c=>c.type==="order")?.id||state.doc.cells[0]?.id;}
+    shell();
+    if(state.doc?.runtime.active_run_id){const run=await api(`/api/runs/${state.doc.runtime.active_run_id}`);watchRun(run).catch(e=>toast(e.message,true));}
+  } catch(error){$("#app").innerHTML=`<div class="boot error-text">${icon("warning")}<h1>无法打开研究工作台</h1><p>${h(error.message)}</p><a class="btn outline" href="/">重新连接</a></div>`;}
+})();
