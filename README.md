@@ -56,7 +56,7 @@ files = !dir
 
 当前执行实际改变项目文件时，本 Notebook 其他已有的 Python / Order 结果也会保留并标记失效，包含当前步骤之前的结果。内核变量保留；验证新源码前需主动重新加载模块或重启内核。外部编辑器的独立修改及其他 Notebook 的结果不作自动依赖追踪。
 
-Global 在执行期间也可编辑并自动保存。当前执行继续使用启动时的输入快照；如果期间 Global 发生变化，返回结果会标记失效。其他单元的输入在执行中锁定，防止意外改动正在运行的代码或指令。
+执行期间可继续编辑并自动保存 Global 和其他单元（Python、Markdown、Order），仅锁定当前执行单元的输入。当前执行使用启动时的输入快照；期间修改 Global 或上游单元，会将本次结果标记失效；编辑下游单元不影响本次结果。运行全部时也可编辑其他单元，后续执行使用届时保存的内容。同一 Notebook 仍按顺序执行，增删、移动、转换类型及合并拆分需等待当前执行结束。
 
 上下文与 harness prompt 位于研究项目的 `.castle/context.json`。`features` 控制 Global、历史输入/输出、变量、输出契约、手写摘要和历史精简等开关；`templates` 可编辑 harness 正文、各段格式、拼接顺序及 Claude 的读取指令；`limits` 设置字符预算。保存后下次预览或运行立即生效，无需重启。详见 [上下文配置说明](docs/context-config.md)。
 
@@ -148,6 +148,7 @@ Notebook 文档和运行证据默认位于启动项目的 `.castle/`，已加入
 ```powershell
 python -m unittest discover -s tests -v
 node --check castle_notebook/static/app.js
+node --test tests/test_app.js
 ```
 
 测试包含真实 Python 子进程、项目模块导入、代理写入实际项目文件、变更回收、共享变量、取消/超时、失效传播、精简上下文、实际 HTTP/SSE 通信、输出契约和初始化。Claude 测试使用子进程协议夹具，不产生模型费用；这与真实 Claude 云端调用的验证不同。

@@ -5,7 +5,7 @@ const h = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;",
 const state = {boot:null, doc:null, selected:null, tab:"context", context:null, contextRequest:0,
   projectRequest:0,
   outputNotebook:null, outputFingerprint:"", outputInFlight:false, outputDisconnected:false,
-  dirty:false, globalDirty:false, documentDirty:false, dirtyFields:new Set(), editSeq:0, savePromise:null, timer:null, live:null, source:null, finishingRun:false,
+  dirty:false, globalDirty:false, documentDirty:false, dirtyFields:new Set(), editSeq:0, savePromise:null, timer:null, live:null, source:null, runRefresh:null,
   sequence:false, sequenceStop:false, markdownEditing:new Set(), orderEditing:new Set(),
   inputEditBases:new Map(), inputConflicts:new Map(), savingInputs:new Map(), expandedOrderOutputs:new Set(), inspectorOpen:false};
 
@@ -34,8 +34,9 @@ const icon = (name, cls="") => `<svg class="icon ${cls}" viewBox="0 0 24 24" fil
 const timeText = (value, full=false) => value ? new Date(value).toLocaleString("zh-CN", full ? {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false} : {hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}) : "—";
 const typeLabel = {code:"PYTHON", markdown:"MARKDOWN", order:"ORDER"};
 const statusLabel = {idle:"待执行", running:"执行中", succeeded:"已完成", failed:"执行失败", cancelled:"已停止", interrupted:"已中断"};
-const busy = () => Boolean(state.live || state.doc?.runtime?.active_run_id);
-const cellLocked = id => Boolean(state.sequence || state.live?.operation || state.live?.cell_id===id);
+const busy = () => Boolean(state.live || state.doc?.runtime?.active_run_id || state.runRefresh);
+const cellLocked = id => Boolean(state.live?.operation || state.live?.cell_id===id ||
+  (state.doc?.runtime?.active_run_id && !state.live));
 const currentCell = () => state.doc?.cells.find(c => c.id === state.selected);
 const newId = () => crypto.randomUUID().replaceAll("-", "").slice(0,12);
 
@@ -292,9 +293,6 @@ function projectChangesHTML(changes) {
 }
 
 function renderNotebook() {
-  const focused=document.activeElement;
-  const globalFocus=focused?.dataset?.global ? {field:focused.dataset.field,start:focused.selectionStart,end:focused.selectionEnd} : null;
-  const cellFocus=focused?.dataset?.cell ? {id:focused.dataset.cell,field:focused.dataset.field,start:focused.selectionStart,end:focused.selectionEnd} : null;
   const doc = state.doc;
   if (!doc) { $("#notebook").innerHTML=`<div class="empty-workspace">${icon("notebook")}<h1>开始一篇研究笔记</h1><p>定义全局目的，再把问题拆成可验证的步骤。</p><button class="btn primary" data-action="new">${icon("plus")}新建 Notebook</button></div>`; return; }
   const disabled=busy() || state.sequence ? "disabled" : "";
@@ -303,8 +301,6 @@ function renderNotebook() {
     <div id="cells">${doc.cells.map(cellHTML).join("")}</div>
     <div class="add-cell-bar"><button data-action="add" data-type="code" ${disabled} title="添加 Python 单元">+ Python</button><button data-action="add" data-type="markdown" ${disabled} title="添加 Markdown 单元">+ Markdown</button><button data-action="add" data-type="order" ${disabled} title="添加 AI Order 单元">+ Order</button></div></div>`;
   autoSize();
-  if(globalFocus){const el=$(`[data-global][data-field="${globalFocus.field}"]`);el?.focus({preventScroll:true});el?.setSelectionRange(globalFocus.start,globalFocus.end);}
-  if(cellFocus){const el=$(`[data-cell="${cellFocus.id}"][data-field="${cellFocus.field}"]`);el?.focus({preventScroll:true});if(el?.setSelectionRange)el.setSelectionRange(cellFocus.start,cellFocus.end);}
 }
 
 function orderSessionHTML(session, cellId) {
@@ -419,7 +415,15 @@ async function renderHistoryList() {
   } catch(error) { if($("#history-list")) $("#history-list").textContent=error.message; }
 }
 
-function renderAll() { renderSidebar(); renderNotebook(); inspectorFrame(); }
+function renderAll() {
+  const focused=document.activeElement, field=focused?.dataset?.field;
+  const selector=field ? focused.dataset.cell ? `[data-cell="${focused.dataset.cell}"][data-field="${field}"]` :
+    focused.dataset.global ? `[data-global][data-field="${field}"]` : "#document-title" : null;
+  const selection=selector ? {start:focused.selectionStart,end:focused.selectionEnd,top:focused.scrollTop,left:focused.scrollLeft} : null;
+  renderSidebar();renderNotebook();inspectorFrame();
+  const target=selector&&$(selector);
+  if(target&&!target.disabled){const details=target.closest("details");if(details)details.open=true;target.focus({preventScroll:true});if(selection.start!=null)target.setSelectionRange(selection.start,selection.end);target.scrollTop=selection.top;target.scrollLeft=selection.left;}
+}
 function selectCell(id,scroll=false) {
   if(!state.doc?.cells.some(c=>c.id===id)) return;
   state.selected=id;
@@ -438,7 +442,7 @@ function touch(scope="document",field=null) {
   if(field)state.dirtyFields.add(field);
   if(scope==="global")state.globalDirty=true;else state.documentDirty=true;
   updateSaveState("等待保存…");clearTimeout(state.timer);
-  state.timer=setTimeout(()=>save().catch(error=>{if(!state.finishingRun)toast(error.message,true);}),600);
+  state.timer=setTimeout(()=>save().catch(error=>{if(!state.runRefresh)toast(error.message,true);}),600);
 }
 function editablePayload() {
   const doc=state.doc;
@@ -447,6 +451,7 @@ function editablePayload() {
       ...(c.type==="order"?{input_edited:state.inputEditBases.has(c.id),input_file_sha256:(state.inputEditBases.get(c.id)||c.file_input)?.sha256}:{} )}))};
 }
 async function save() {
+  if(state.runRefresh) { await state.runRefresh; return save(); }
   if(state.savePromise) { await state.savePromise; if(state.dirty) return save(); return; }
   if(!state.dirty || !state.doc) return;
   const seq=state.editSeq, nid=state.doc.id, globalOnly=state.globalDirty&&!state.documentDirty;
@@ -527,12 +532,17 @@ function watchRun(run) {
   return new Promise((resolve,reject)=>{
     const source=new EventSource(`/api/runs/${run.id}/events`);state.source=source;
     const finish=async final=>{
-      if(ended)return;ended=true;source.close();state.source=null;state.live=null;state.finishingRun=true;
+      if(ended)return;ended=true;source.close();state.source=null;
       try {
         clearTimeout(state.timer);
-        if(state.savePromise){try{await state.savePromise;}catch(error){if(error.status!==409)throw error;}await Promise.resolve();}
-        const latest=await api(`/api/notebooks/${run.notebook_id}`), draft=state.doc;
-        state.doc=rebaseDirtyDraft(latest,draft);state.finishingRun=false;
+        // Pause new saves until the final document revision is known. An in-flight
+        // save may have raced the run's revision update; keep its local draft.
+        state.runRefresh=(async()=>{
+          if(state.savePromise){try{await state.savePromise;}catch(error){if(error.status!==409)throw error;}}
+          const latest=await api(`/api/notebooks/${run.notebook_id}`);
+          state.doc=rebaseDirtyDraft(latest,state.doc);
+        })();
+        await state.runRefresh;state.runRefresh=null;state.live=null;
         await flushSave();
         if(final.applied_cell_ids?.length)state.selected=final.applied_cell_ids[0];
         final.stale=Boolean(final.stale||state.doc.cells.find(c=>c.id===run.cell_id)?.stale);
@@ -542,7 +552,7 @@ function watchRun(run) {
         else if(run.operation) toast(run.operation.kind==="merge"?"Order 已合并，原对话关联已清空。":"Order 已拆分，内容与对话已分别保存。");
         else if(!state.sequence) toast(final.stale?final.stale_reason||"上游输入已变化，本次结果已标记失效。":"本步执行完成，结果与输入快照已保存。");
         resolve(final);
-      } catch(error) {state.finishingRun=false;state.doc.runtime.active_run_id=null;renderAll();reject(error);}
+      } catch(error) {state.runRefresh=null;state.live=null;state.doc.runtime.active_run_id=null;renderAll();reject(error);}
     };
     source.onmessage=event=>{
       if(ended || state.live?.id!==run.id)return;
@@ -703,6 +713,7 @@ async function action(name,el) {
     return;
   }
   if(name==="use-input-file"||name==="keep-input-draft") {
+    if(cellLocked(id))return;
     const cell=state.doc.cells.find(c=>c.id===id), latest=state.inputConflicts.get(id);
     if(!cell||!latest)return;
     if(latest.file_input.state==="unavailable")throw new Error("需求文件暂不可读，请等待恢复后再选择版本。");
@@ -775,7 +786,7 @@ document.addEventListener("keydown",event=>{
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==="s"){event.preventDefault();flushSave().then(()=>toast("已保存到本地。")).catch(e=>toast(e.message,true));return;}
   if($("#modal").open)return;
   if(event.key==="Tab" && event.target.classList?.contains("code-input")){event.preventDefault();const el=event.target;el.setRangeText("    ",el.selectionStart,el.selectionEnd,"end");el.dispatchEvent(new Event("input",{bubbles:true}));return;}
-  if(event.key==="Enter"&&(event.shiftKey||event.ctrlKey||event.metaKey)&&currentCell()&&!busy()&&!state.sequence){event.preventDefault();const id=state.selected,advance=event.shiftKey;runCell(id).then(result=>{if(advance&&result.status==="succeeded"){const i=state.doc.cells.findIndex(c=>c.id===id);if(state.doc.cells[i+1])selectCell(state.doc.cells[i+1].id,true);}}).catch(e=>toast(e.message,true));}
+  if(event.key==="Enter"&&(event.shiftKey||event.ctrlKey||event.metaKey)&&currentCell()&&!busy()&&!state.sequence){event.preventDefault();const id=state.selected,advance=event.shiftKey;runCell(id).then(result=>{if(advance&&result.status==="succeeded"&&state.selected===id){const i=state.doc.cells.findIndex(c=>c.id===id);if(state.doc.cells[i+1])selectCell(state.doc.cells[i+1].id,true);}}).catch(e=>toast(e.message,true));}
   if(event.key==="?" && !["INPUT","TEXTAREA","SELECT"].includes(event.target.tagName))action("help",{});
 });
 window.addEventListener("beforeunload",event=>{if(state.dirty){event.preventDefault();event.returnValue="";}});

@@ -548,6 +548,7 @@ class Engine:
                         writes.append((cell, item.get("source", ""), info["sha256"]))
             doc = editable_document(current, incoming)
             editable_fields = ("title", "source", "expected_output", "context_note", "mode", "output_format")
+            upstream_changed = False
             if active:
                 if [(cell["id"], cell["type"]) for cell in doc["cells"]] != [
                         (cell["id"], cell["type"]) for cell in current["cells"]]:
@@ -561,8 +562,7 @@ class Engine:
                                     if cell["id"] == active_id)
                 changed_indices = [index for index, (old, new) in enumerate(zip(current["cells"], doc["cells"]))
                                    if any(old[field] != new[field] for field in editable_fields)]
-                if changed_indices and min(changed_indices) < active_index:
-                    active["upstream_changed"] = True
+                upstream_changed = bool(changed_indices and min(changed_indices) < active_index)
             for cell, value, expected in writes:
                 info, _ = self.read_input_file(cell["run_ids"][-1], current["project_path"])
                 if info["state"] == "unavailable" or info["sha256"] != expected:
@@ -580,6 +580,8 @@ class Engine:
                 updated = next(item for item in doc["cells"] if item["id"] == cell["id"])
                 updated["file_input"] = self.read_input_file(cell["run_ids"][-1], current["project_path"])[0]
             self.store.put(doc)
+            if upstream_changed:
+                active["upstream_changed"] = True
             return self.document(notebook_id)
 
     def save_global(self, notebook_id, payload):

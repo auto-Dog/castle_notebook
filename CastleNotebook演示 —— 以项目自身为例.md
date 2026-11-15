@@ -3,7 +3,7 @@
 以下过程模拟了一个Castle Notebook动态展示全局信息的方式，展示的案例是castle notebook自身的开发过程
 
 假设以下文本就是Global Cell
-
+>>>
 ---
 
 ## 项目背景
@@ -29,9 +29,10 @@
 > 
 
 ---
+<<<
 
 假设以下文本就是Input Cell 1
-
+>>>
 ---
 
 Input
@@ -45,12 +46,12 @@ Input
 类似于Jupyter Notebook Server的极简版实现，前端界面可以用网页展示
 功能层：
 Global Cell: 存放核心目的
-实时可编辑的全局项目目的、约束
+    实时可编辑的全局项目目的、约束
 Input Cell：可以是代码类型，可以是Markdown类型，可以是Order类型（需要指定预期Output）
-Run Button：Order Input类型，把上文的内容连同本次指令一起发给LLM，harness要求LLM将本次对话结论输出到xx文件，这个文件将提供Outpu Cell展示内容
-每一个step，实际给AI的输入都是他的全部精简版上文
+    Run Button：Order Input类型，把上文的内容连同本次指令一起发给LLM，harness要求LLM将本次对话结论输出到xx文件，这个文件将提供Outpu Cell展示内容
+    每一个step，实际给AI的输入都是他的全部精简版上文
 Output Cell：同Jupyter Notebook
-所有cell要带时间戳
+    所有cell要带时间戳
 要加一个Init from project功能，调用AI Agent从已有项目初始化成这种Notebook
 ```
 
@@ -60,16 +61,17 @@ Output:
 
 做好了，如下，xxx。
 
-![Image](https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/authcode/?code=ZGFhN2UxMGYwNTY0NjNhY2YzMTkwMGJlYjdlZTI3ZTJfNDczN2IzMDEwNWM3OWVjM2ExNGI4YjBlZjkzYTBlNzRfSUQ6NzcwODA3MTc5NzM1NDI2OTk2NF8xNzk0Njc4NTM0OjE3OTQ3NjQ5MzRfVjM)
+![Image](xxx)
 
 
 
 ---
+<<<
 
 发现BUG，去开了个对话要求检查：
 
 假设以下文本就是Input Cell 2
-
+>>>
 ---
 
 Input: 
@@ -85,6 +87,7 @@ Output:
 
 
 ---
+<<<
 
 然后在这个对话又提了个问题：关于上下文模板，可否放在配置文件里，这样我可以编辑哪些功能是开启/关闭。AI答复：“
 
@@ -104,6 +107,7 @@ Output:
 
 此时，cell 2中应自动多出内容，假设以下文本就是Input Cell 2\(Update 1\)：
 
+>>>
 ---
 
 Input: 解决没跑通问题，运行ID：d016b87badef ；随后又新增上下文模板可编辑功能
@@ -123,11 +127,12 @@ Output: 已改好：完整输入保存到 \[\.castle/prompts/inputc0a1218fdf04\.
 
 
 ---
+<<<
 
 与此同时，新功能也在开发：
 
 假设以下文本就是Input Cell 3：
-
+>>>
 ---
 
 Input:
@@ -149,13 +154,13 @@ Output:
 **目前仍不支持 widgets 和完整 Jupyter 协议**
 
 ---
-
+<<<
 
 
 最后，在推出0\.9\.1版本时，以上的cell由于均属于实现需求，在项目管理中不需要零散分布成多个对话。值得被合并：
 
 假设以下是Input Cell 1，由原始的Input Cell 1，2，3合并，合并过程由一个claude会话实现
-
+>>>
 ---
 
 Input: 
@@ -197,9 +202,10 @@ Output:
 如需运行项目，执行命令：
 
 ---
+<<<
 
 Cell 2 \(Python Cell\)
-
+>>>
 ---
 
 ```PowerShell
@@ -209,7 +215,7 @@ Cell 2 \(Python Cell\)
 ```
 
 ---
-
+<<<
 
 
 \(完\)

@@ -62,6 +62,29 @@ class BackgroundTests(unittest.TestCase):
         self.assertEqual(settings["hooks"]["Stop"][0]["hooks"][0]["command"], sys.executable)
         self.assertEqual(events[-1]["type"], "finished")
 
+    def test_other_cell_edits_are_saved_while_native_background_job_runs(self):
+        running = new_cell("order", source="BG_WAIT", expected_output="Markdown")
+        others = [new_cell(kind, source="Original draft", expected_output="Markdown")
+                  for kind in ("code", "markdown", "order")]
+        self.doc["cells"] = [running, *others]
+        self.store.put(self.doc)
+        run = self.engine.start(self.doc["id"], running["id"])
+        self.wait(run["id"], "background_id")
+        payload = self.engine.document(self.doc["id"])
+        for cell in payload["cells"][1:]:
+            cell.update(source=f"Updated {cell['type']} draft", context_note="New context")
+        saved = self.engine.save(self.doc["id"], payload)
+        self.assertEqual(saved["runtime"]["active_run_id"], run["id"])
+        self.assertEqual(saved["cells"][0]["status"], "running")
+        self.assertEqual(self.engine.get_run(run["id"])["input_snapshot"]["source"], "BG_WAIT")
+        self.engine.cancel(run["id"])
+        final = self.wait(run["id"])
+        self.assertFalse(final["stale"], "Downstream edits do not invalidate the running input")
+        saved = self.engine.document(self.doc["id"])
+        for cell in saved["cells"][1:]:
+            self.assertEqual(cell["source"], f"Updated {cell['type']} draft")
+            self.assertEqual(cell["context_note"], "New context")
+
     def test_blocked_running_job_can_be_opened_live_and_after_restart(self):
         run = self.start("BG_BLOCKED BG_WAIT")
         active = self.wait(run["id"], "background_state", "blocked")

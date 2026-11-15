@@ -19,7 +19,7 @@
   },
   "templates": {
     "prompt": "# CastleNotebook / explicit research step\n{instructions}{global}{previous_steps}{variables}{current_step}{expected_output}{output_format}",
-    "instructions": "请解决我写在“## Current step”的当前输入需求。\n同时，遵循 Global 目的与“约束/规则”，\n按预期输出要求返回最终内容。\n本会话的需求摘要文件为 `{input_file}`（相对于项目目录）。随着需求澄清、追加或调整，每轮对话结束前用 Markdown 更新该文件，归纳当前完整需求（可以是对话中后续提出的需求），尽量用bullet方式给出。可替换上一版。Order Input Cell 会实时显示此文件。\n最终回答按照jupyter notebook cell支持的形式（文本、格式文本、图片、widget）写入本次运行目录 `{run_dir}` 的 output.md（相对项目目录的完整路径：`{output_file}`）。注意：此后的每一轮对话，都要按照最初的格式需求更新这个output文件。\n\n",
+    "instructions": "请解决我写在“## Current step”的当前输入需求。\n同时，遵循 Global 目的与“约束/规则”，\n按预期输出要求返回最终内容。\n本会话的需求摘要文件为 `{input_file}`（相对于项目目录）。随着需求澄清、追加或调整，每轮对话结束前用 Markdown 更新该文件，归纳当前原始需求、完整需求（可以是对话中后续提出的需求），每条内容精简。格式：尽量用bullet方式给出。可替换上一版。Order Input Cell 会实时显示此文件。\n最终回答按照jupyter notebook cell支持的形式（文本、格式文本、图片、widget）写入本次运行目录 `{run_dir}` 的 output.md（相对项目目录的完整路径：`{output_file}`），格式：TLDR总结做了什么，后面跟着详细内容。注意：此后的每一轮对话，都要按照最初的格式需求更新这个output文件。\n\n",
     "global": "## Global / revision {revision}\n{goal}{constraints}",
     "global_goal": "目的：\n{goal}\n",
     "global_constraints": "\n约束/规则：\n- {constraints}\n",

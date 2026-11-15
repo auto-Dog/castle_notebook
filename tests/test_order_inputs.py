@@ -111,6 +111,30 @@ class OrderInputTests(unittest.TestCase):
         self.assertTrue(run["stale"])
         self.assertIn("input.md", run["stale_reason"])
 
+    def test_rejected_upstream_input_save_does_not_invalidate_the_running_snapshot(self):
+        upstream = self.execute(self.add("Original upstream requirements"))
+        started = self.engine.start(self.doc["id"], self.add("FAKE_FILE_WAIT")["id"])
+        payload = self.engine.document(self.doc["id"])
+        payload["cells"][0].update(source="Unsaved upstream draft", input_edited=True)
+        read_input = self.engine.read_input_file
+        upstream_reads = 0
+
+        def become_unavailable(rid, project):
+            nonlocal upstream_reads
+            if rid == upstream["id"]:
+                upstream_reads += 1
+                if upstream_reads > 1:
+                    return {"state": "unavailable"}, None
+            return read_input(rid, project)
+
+        with patch.object(self.engine, "read_input_file", side_effect=become_unavailable):
+            with self.assertRaises(Problem) as conflict:
+                self.engine.save(self.doc["id"], payload)
+        self.assertEqual(conflict.exception.status, 409)
+        final = wait_run(self.engine, started["id"])
+        self.assertFalse(final["stale"])
+        self.assertEqual(self.input_path(upstream).read_text(encoding="utf-8"), "Original upstream requirements")
+
     def test_editor_saves_update_file_and_unrelated_autosave_keeps_external_input(self):
         run = self.execute(self.add())
         payload = self.engine.document(self.doc["id"])
