@@ -74,9 +74,20 @@ claude auth status
 
 `templates.instructions` 的输出要求段落通过 `{run_dir}`、`{output_file}` 告知 Claude 本次输出位置，默认展开为 `.castle/runs/<运行ID>` 和 `.castle/runs/<运行ID>/output.md`，相对于项目工作目录。预览与执行复用同一运行 ID，输入文件和上下文快照中的路径一致。`templates.invocation` 也支持这些变量，启动指令不自动追加路径。
 
-Windows 下，Order 单元底部显示最近一次执行的 **Session Name**。点击“打开对话”，会在该次运行的项目目录中打开新的 Claude Code 终端，通过运行记录中保存的真实 Session ID 执行 `claude --resume <session-id>`。Claude 会将 `-p` 创建的会话排除在交互式名称搜索之外，因此名称用于展示，恢复使用对应 UUID（见 [Claude 会话文档](https://code.claude.com/docs/en/sessions#loop-p-agent-sdk-and-background-sessions)）。每次重跑都有独立名称，刷新或重启服务后仍可打开；未执行、执行中和未保存会话的历史运行会禁用按钮。终端中的后续对话保存在 Claude 会话中，Notebook 的执行快照与 Output 保留原结果。
+Windows 下，Order 单元底部显示最近一次执行的 **Session Name**。点击“打开对话”，会在该次运行的项目目录中打开新的 Claude Code 终端，通过运行记录中保存的真实 Session ID 执行 `claude --resume <session-id>`。Claude 会将 `-p` 创建的会话排除在交互式名称搜索之外，因此名称用于展示，恢复使用对应 UUID（见 [Claude 会话文档](https://code.claude.com/docs/en/sessions#loop-p-agent-sdk-and-background-sessions)）。每次重跑都有独立名称，刷新或重启服务后仍可打开；未执行、执行中和未保存会话的历史运行会禁用按钮。终端中的后续对话保存在 Claude 会话中；对 `output.md` 的更新会继续反映到对应 Order 的 Out Cell。
 
-最终回答由 harness 写入该次运行的 `output.md`，Output Cell 从同一份规范化结果展示。未完成的工具协议文本、截断回答和失败状态不会被标为成功，原始输出仍保留；启动时会校验旧 Order 的错误成功记录并追加纠正事件。选择 JSON 时执行严格语法校验；项目初始化另做结构校验。自然语言输出契约仍需研究者检查。
+Order 的 Out Cell 以最近一次运行的 `output.md` 为来源，在页面可见时约每秒检查一次变化，实时渲染文件；执行中以及执行完成后的续聊、外部编辑、文件替换都会同步。CLI 进度保留在运行日志中。模型已写出 `output.md` 时，后台直接采用文件，执行结束不会用 CLI 的确认消息覆盖它；模型未写文件时，后台用最终回答创建该文件。
+
+Order 标题栏及“单元”菜单支持 **Merge AI Cells** 和 **Split AI Cells**，可补充整理要求。Agent 会重写指令、预期输出、摘要和已有 Out 结论，完成后自动替换原单元并保存：
+
+- **合并**：选择另一个 Order，归纳为一个单元，放在两者较早的位置；中间其他单元保持原有顺序。合并后的单元清空原 AI 对话关联，下次运行开启新会话。
+- **拆分**：按两个任务边界拆成连续的 Order，并通过 Claude 原生 `--resume <原会话ID> --fork-session` 为两者复制独立会话（[会话分叉说明](https://code.claude.com/docs/en/sessions#branch-a-session)）。原单元没有可恢复对话时只拆分内容。每份对话使用独立的输入文件和 `output.md`，可以分别续聊。
+
+整理只改 Notebook 内容，不重新执行原任务。新单元分别保存更新后的 `.castle/prompts/input<运行ID>.md` 和输出文件；原输入快照与运行证据保留归档，合并后不再关联原对话，拆分后保留原执行历史。下游旧结果标记失效；原结论已失效或执行失败时，整理不会使它重新有效。整理过程可从新单元的记录中查看。失败、取消、超时、复制会话失败，或整理期间 Global / 原输出发生变化时，保留原单元，避免覆盖新内容。
+
+最新文件内容同时缓存到 Notebook，下载 Notebook 时也会读取当前文件。文件暂不可用时会明确提示并展示已保存的快照；空文件会清空显示，恢复后继续同步。实时显示上限为 2 MB。输出改变会使下游已有结果失效，后续 AI 上下文使用当前文件内容。运行历史中的原始输出和指纹保留首次执行时的记录。
+
+未完成的工具协议文本、截断回答和失败状态不会被标为成功，原始输出仍保留；启动时会校验旧 Order 的错误成功记录并追加纠正事件。选择 JSON 时对首次执行采用的文件或最终回答执行严格语法校验；项目初始化另做结构校验。自然语言输出契约仍需研究者检查。
 
 从项目初始化：“文件 → 从项目初始化”，可先预览目录。本次指令要求 Claude 只读分析并返回全局定义和单元 JSON；检查后点击“采用拆分结果”。拆分优先引用现有源码入口、导入真实模块，并为后续开发步骤声明目标文件及验证方法。生成代码不会自动执行。界面支持启动目录及其子目录；其他项目使用 `--project` 启动。
 

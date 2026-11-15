@@ -1,0 +1,4 @@
+interface:
+  display_name: "CastleNotebook"
+  short_description: "Manage AI orders and outputs in Jupyter notebooks"
+  default_prompt: "Use $castle-notebook to turn this project into a Jupyter notebook with Global and AI Order cells."
