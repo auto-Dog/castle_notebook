@@ -68,15 +68,27 @@ Global 在执行期间也可编辑并自动保存。当前执行继续使用启�
 claude auth status
 ```
 
-每个 Order 将完整输入写入研究项目的 `.castle/prompts/input<运行ID>.md`，再在后台调用本机 Claude，等价于 `claude "请读取 .castle/prompts/input<运行ID>.md，按其中要求完成任务" -n "ID<运行ID>"`。模型、工具、MCP、权限和登录状态均沿用本机配置，不额外指定工具白名单、计划模式、系统提示或轮数上限。旧 Notebook 的 LLM / Agent 字段兼容保留，两者均使用同一种原生调用。
+每个 Order 将完整输入写入研究项目的 `.castle/prompts/input<运行ID>.md`，通过原生后台命令启动一个属于用户的 Claude 会话：
 
-实际命令使用 `claude -p "请读取 .castle/prompts/input<运行ID>.md，按其中要求完成任务" -n "ID<运行ID>" --output-format stream-json --verbose --include-partial-messages`。`-p` 用于后台非交互执行，流式参数用于网页显示进度；命令行只传文件路径和固定读取指令，Claude 自行读取 Markdown。输入文件与运行目录的 `context.md` 内容及 SHA-256 指纹一致，避免完整输入中的引号、换行和长度影响命令行。CLI 会按正常方式保存命名会话。不在网页中存储 API Key，不设置跳过权限检查参数。参考 [Claude CLI 参数文档](https://code.claude.com/docs/en/cli-reference)。
+```powershell
+claude --background "请读取 .castle/prompts/input<运行ID>.md，按其中要求完成任务" -n "ID<运行ID>" --permission-mode auto --settings <运行目录>/claude-settings.json
+```
 
-`templates.instructions` 的输出要求段落通过 `{run_dir}`、`{output_file}` 告知 Claude 本次输出位置，默认展开为 `.castle/runs/<运行ID>` 和 `.castle/runs/<运行ID>/output.md`，相对于项目工作目录。预览与执行复用同一运行 ID，输入文件和上下文快照中的路径一致。`templates.invocation` 也支持这些变量，启动指令不自动追加路径。
+默认 `auto` 由 Claude 的审批模型检查工具调用，减少日常确认，需要用户处理的提问或权限请求可以进入实时对话处理。`bypassPermissions` 会跳过常规审批，等价于 `--dangerously-skip-permissions`；只有显式传入 `--claude-permission-mode bypassPermissions` 才启用。也可选择 `acceptEdits`、`default`、`plan`、`dontAsk`。模型、工具、MCP 和登录继续使用本机配置。首次使用原生后台前，在项目目录运行一次 `claude` 完成目录信任确认；未完成时网页显示 CLI 的具体错误。auto 可能因模型或设置限制退回 Manual，界面展示实际权限模式，不自动切换到 bypassPermissions。参考 [CLI 参数](https://code.claude.com/docs/en/cli-reference)与[权限模式](https://code.claude.com/docs/en/permission-modes)。
 
-Windows 下，Order 单元底部显示最近一次执行的 **Session Name**。点击“打开对话”，会在该次运行的项目目录中打开新的 Claude Code 终端，通过运行记录中保存的真实 Session ID 执行 `claude --resume <session-id>`。Claude 会将 `-p` 创建的会话排除在交互式名称搜索之外，因此名称用于展示，恢复使用对应 UUID（见 [Claude 会话文档](https://code.claude.com/docs/en/sessions#loop-p-agent-sdk-and-background-sessions)）。每次重跑都有独立名称，刷新或重启服务后仍可打开；未执行、执行中和未保存会话的历史运行会禁用按钮。终端中的后续对话保存在 Claude 会话中；对 `output.md` 的更新会继续反映到对应 Order 的 Out Cell。
+Notebook 只负责触发与收集，不占有会话。`claude agents` 可查看后台列表，`claude agents --cwd <项目目录>` 只看当前项目，`claude attach <Background ID>` 可随时进入同一个实时对话，处理提问、权限或继续交流；退出终端后会话仍保留。关闭网页或停止 Notebook 服务不会终止原生后台会话，重启服务会继续收集原来的运行，不重复发起任务。只有明确点击“停止”才调用 `claude stop`。原生后台不受 `--agent-timeout` 限制，等待用户处理时持续监听。参考 [Claude 原生后台会话](https://code.claude.com/docs/en/agent-view)。
 
+每次运行的 `claude-settings.json` 只附加记录事件的命令 Hook，将工具活动、实际权限模式和最终回答保存到运行目录。后台状态来自 `claude agents --json --all`，可见进度来自 `claude logs`；不解析 Claude 私有状态或 transcript。完整输入与 `context.md` 内容及 SHA-256 指纹一致，命令行只传文件路径和固定读取指令。
+
+旧版 CLI 或无原生后台能力的环境可显式使用 `--claude-launch-mode print`，此时调用 `claude -p ... --permission-mode auto --output-format stream-json --verbose --include-partial-messages`。`--background` 与 `-p` 不能混用；print 会话不出现在原生后台列表，执行完成后按 UUID 恢复。出现工具权限拒绝时，保留原始回答并标记执行失败。
+`templates.instructions` 通过 `{input_file}`、`{run_dir}`、`{output_file}` 告知 Claude 当前需求和输出的位置，默认展开为 `.castle/runs/<运行ID>/input.md`、`.castle/runs/<运行ID>` 和 `.castle/runs/<运行ID>/output.md`，相对于项目工作目录。预览与执行复用同一运行 ID，输入文件和上下文快照中的路径一致。`templates.invocation` 也支持这些变量，启动指令不自动追加路径。
+
+Windows 和 Linux 下，Order 单元底部显示 **Session Name**、**Background ID** 和实际权限模式。原生后台会话启动后，“打开对话”立即可用，通过 `claude attach <id>` 在新终端进入同一实时对话，执行中也能处理问题；历史 print 会话使用 `claude --resume <session-id> --permission-mode <配置值>`。Linux 优先使用 `TERMINAL`，再自动查找常用终端；无桌面的服务器可直接在自己的终端运行 `claude attach`。未执行或未生成会话时按钮禁用。续聊对 `input.md`、`output.md` 的更新继续同步到对应单元。
 Order 的 Out Cell 以最近一次运行的 `output.md` 为来源，在页面可见时约每秒检查一次变化，实时渲染文件；执行中以及执行完成后的续聊、外部编辑、文件替换都会同步。CLI 进度保留在运行日志中。模型已写出 `output.md` 时，后台直接采用文件，执行结束不会用 CLI 的确认消息覆盖它；模型未写文件时，后台用最终回答创建该文件。
+
+Order 的 Input Cell 同样实时渲染该运行的 `input.md`，支持 Markdown 和任务清单。运行时先将当前指令写入该文件，harness 要求 Claude 在每轮对话结束前更新当前完整需求摘要、已确认约束和完成状态，可替换上一版，因此追加或调整的需求会回到对应 Input Cell。点击“编辑”或双击需求正文可直接修改，保存时同步写回文件；编辑期间文件被模型更新时保留草稿，并提供“使用文件版本”和“用我的版本覆盖文件”。无关字段的自动保存会保留最新文件内容。
+
+续聊的最新输入也会缓存到 Notebook，并用于后续上下文和单元合并、拆分。输入更新会使下游结果失效；初始 `.castle/prompts/input<运行ID>.md`、`context.md` 和运行记录中的 `input_snapshot` 保留原始内容。`input.md` 上限为 32000 字符；文件丢失或暂不可读时明确显示 Notebook 快照，恢复后继续同步。旧运行首次读取时自动补建需求文件，通过“打开对话”重新进入旧会话时会一次性告知 Claude 新的文件维护要求。已打开的旧终端需重新打开对话后接收该说明。
 
 Order 标题栏及“单元”菜单支持 **Merge AI Cells** 和 **Split AI Cells**，可补充整理要求。Agent 会重写指令、预期输出、摘要和已有 Out 结论，完成后自动替换原单元并保存：
 
@@ -101,8 +113,9 @@ Notebook 文档和运行证据默认位于启动项目的 `.castle/`，已加入
   prompts/input<run-id>.md   # Claude 自行读取的完整输入
   notebooks/<notebook-id>.json
   runs/<run-id>/
-    context.md       # 实际输入，SHA-256 指纹
-    output.md        # 最终输出
+    context.md       # 启动时的完整输入快照，SHA-256 指纹
+    input.md         # 随当前对话更新的需求摘要，Input Cell 实时读取
+    output.md        # 随当前对话更新的输出，Out Cell 实时读取
     events.jsonl     # 时间戳、流式输出、工具事件、终态
     project-before.json / project-after.json  # 执行前后项目文件内容指纹
     changes.json     # 实际新增、修改和删除的文件清单
@@ -122,9 +135,11 @@ Notebook 文档和运行证据默认位于启动项目的 `.castle/`，已加入
 --port 8765           本机端口
 --python PATH         内核解释器，默认启动服务的 Python
 --claude PATH         Claude 可执行文件或 npm cli.js
+--claude-launch-mode background   原生后台（默认）；print 为旧版非交互模式
+--claude-permission-mode auto   Claude 自动审批（默认），需要时进入终端处理
 --data-dir PATH       文档与证据目录，默认 <project>/.castle
 --code-timeout 60     Python 执行秒数上限
---agent-timeout 240   Claude 执行秒数上限
+--agent-timeout 240   print 模式 Claude 执行秒数上限；原生后台不设期限
 --empty               不自动创建首次示例
 ```
 
@@ -137,6 +152,6 @@ node --check castle_notebook/static/app.js
 
 测试包含真实 Python 子进程、项目模块导入、代理写入实际项目文件、变更回收、共享变量、取消/超时、失效传播、精简上下文、实际 HTTP/SSE 通信、输出契约和初始化。Claude 测试使用子进程协议夹具，不产生模型费用；这与真实 Claude 云端调用的验证不同。
 
-服务仅绑定 `127.0.0.1`，限制 Host / Origin，并使用页面会话令牌保护写操作。Python 拥有当前用户的文件访问权限；Claude 使用本机已有权限配置。0.9 不提供操作系统级沙箱或多人认证，不适合暴露为远程公共服务。
+服务仅绑定 `127.0.0.1`，限制 Host / Origin，并使用页面会话令牌保护写操作。Python 拥有当前用户的文件访问权限；Claude 默认使用 auto 自动审批，可用启动参数调整。0.9 不提供操作系统级沙箱或多人认证，不适合暴露为远程公共服务。
 
 详细范围与设计见 [0.9 开发说明](docs/0.9-plan.md)。

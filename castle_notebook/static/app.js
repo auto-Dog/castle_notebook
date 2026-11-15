@@ -5,8 +5,9 @@ const h = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;",
 const state = {boot:null, doc:null, selected:null, tab:"context", context:null, contextRequest:0,
   projectRequest:0,
   outputNotebook:null, outputFingerprint:"", outputInFlight:false, outputDisconnected:false,
-  dirty:false, globalDirty:false, documentDirty:false, editSeq:0, savePromise:null, timer:null, live:null, source:null,
-  sequence:false, sequenceStop:false, markdownEditing:new Set(), inspectorOpen:false};
+  dirty:false, globalDirty:false, documentDirty:false, dirtyFields:new Set(), editSeq:0, savePromise:null, timer:null, live:null, source:null, finishingRun:false,
+  sequence:false, sequenceStop:false, markdownEditing:new Set(), orderEditing:new Set(),
+  inputEditBases:new Map(), inputConflicts:new Map(), savingInputs:new Map(), expandedOrderOutputs:new Set(), inspectorOpen:false};
 
 const paths = {
   merge:'m4 4 6 6m10-6-6 6m-2 0v11m-4-4 4 4 4-4',
@@ -34,6 +35,7 @@ const timeText = (value, full=false) => value ? new Date(value).toLocaleString("
 const typeLabel = {code:"PYTHON", markdown:"MARKDOWN", order:"ORDER"};
 const statusLabel = {idle:"待执行", running:"执行中", succeeded:"已完成", failed:"执行失败", cancelled:"已停止", interrupted:"已中断"};
 const busy = () => Boolean(state.live || state.doc?.runtime?.active_run_id);
+const cellLocked = id => Boolean(state.sequence || state.live?.operation || state.live?.cell_id===id);
 const currentCell = () => state.doc?.cells.find(c => c.id === state.selected);
 const newId = () => crypto.randomUUID().replaceAll("-", "").slice(0,12);
 
@@ -41,7 +43,7 @@ async function api(path, method="GET", data) {
   const response = await fetch(path, {method, headers:{...(method !== "GET" ? {"Content-Type":"application/json", "X-Castle-Token":state.boot.token} : {})}, body:data === undefined ? undefined : JSON.stringify(data)});
   let result;
   try { result = await response.json(); } catch { throw new Error("服务返回了无法读取的响应，请检查本地服务。"); }
-  if (!response.ok) throw new Error(result.error || `请求失败 (${response.status})`);
+  if (!response.ok) {const error=new Error(result.error || `请求失败 (${response.status})`);error.status=response.status;throw error;}
   return result;
 }
 
@@ -78,7 +80,10 @@ function markdown(source) {
     if (/^\s*>/.test(line)) { result += `<blockquote>${inline(line.replace(/^\s*>\s?/, ""))}</blockquote>`; i++; continue; }
     if (/^\s*([-*]|\d+\.)\s/.test(line)) {
       const ordered = /^\s*\d+\./.test(line); const tag=ordered ? "ol" : "ul"; result+=`<${tag}>`;
-      while (i < lines.length && /^\s*([-*]|\d+\.)\s/.test(lines[i])) result += `<li>${inline(lines[i++].replace(/^\s*([-*]|\d+\.)\s/, ""))}</li>`;
+      while (i < lines.length && /^\s*([-*]|\d+\.)\s/.test(lines[i])) {
+        const item=lines[i++].replace(/^\s*([-*]|\d+\.)\s/, ""), task=item.match(/^\[([ xX])\]\s+(.*)$/);
+        result += task ? `<li class="task-list-item"><input type="checkbox" disabled ${task[1].toLowerCase()==="x"?"checked":""} aria-label="${task[1]===" "?"未完成":"已完成"}">${inline(task[2])}</li>` : `<li>${inline(item)}</li>`;
+      }
       result += `</${tag}>`; continue;
     }
     if (line.includes("|") && i+1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i+1])) {
@@ -105,6 +110,69 @@ function outputsHTML(outputs) {
 
 function orderRunId(cell) {
   return state.live?.cell_id===cell.id && !state.live.operation ? state.live.id : cell.run_ids.at(-1) || cell.last_run_id;
+}
+
+function orderInputMode(cell) {
+  return orderRunId(cell)&&!state.orderEditing.has(cell.id) ? "preview" : "edit";
+}
+
+function inputFileStateHTML(cell) {
+  const rid=orderRunId(cell), info=cell.file_input?.run_id===rid?cell.file_input:null;
+  if(!rid)return "";
+  const label=state.outputDisconnected?"连接中断，显示最近内容":info?.state==="ready"?"input.md · 实时":
+    info?.cached?"需求文件暂不可用，显示 Notebook 快照":info?.error||"等待 input.md…";
+  return `<span>${h(label)}</span><code title="${h(info?.path||"input.md")}">${h(info?.path||"input.md")}</code><button class="text-button" data-action="${state.orderEditing.has(cell.id)?"done-order":"edit-order"}" data-id="${cell.id}" ${cellLocked(cell.id)?"disabled":""}>${state.orderEditing.has(cell.id)?"完成":"编辑"}</button>`;
+}
+
+function inputConflictHTML(cell) {
+  if(!state.inputConflicts.has(cell.id))return "";
+  const disabled=cellLocked(cell.id)?"disabled":"";
+  return `<span>需求文件已更新，当前编辑草稿已保留。</span><button class="text-button" data-action="use-input-file" data-id="${cell.id}" ${disabled}>使用文件版本</button><button class="text-button" data-action="keep-input-draft" data-id="${cell.id}" ${disabled}>用我的版本覆盖文件</button>`;
+}
+
+function orderInputContentHTML(cell) {
+  if(orderInputMode(cell)==="preview")return `<div class="order-input-preview markdown" data-id="${cell.id}" tabindex="0" title="双击编辑当前需求">${cell.source?markdown(cell.source):'<p class="muted">需求文件为空。双击编辑。</p>'}</div>`;
+  return `<textarea id="source-${cell.id}" class="order-input" data-field="source" data-cell="${cell.id}" aria-label="AI 指令" rows="2" maxlength="32000" placeholder="本步 AI 指令…" ${cellLocked(cell.id)?"disabled":""}>${h(cell.source)}</textarea>`;
+}
+
+function orderInputHTML(cell) {
+  return `<div id="input-${cell.id}" class="order-input-source" data-input-mode="${orderInputMode(cell)}"><div class="input-file-state">${inputFileStateHTML(cell)}</div><div class="input-file-conflict" ${state.inputConflicts.has(cell.id)?"":"hidden"}>${inputConflictHTML(cell)}</div><div class="order-source-content">${orderInputContentHTML(cell)}</div></div>`;
+}
+
+function updateOrderInput(cell) {
+  const root=$(`#input-${cell.id}`);if(!root)return;
+  const label=$(".input-file-state",root), labelHTML=inputFileStateHTML(cell);
+  if(label.innerHTML!==labelHTML)label.innerHTML=labelHTML;
+  const conflict=$(".input-file-conflict",root), conflictHTML=inputConflictHTML(cell);
+  if(conflict.innerHTML!==conflictHTML)conflict.innerHTML=conflictHTML;
+  conflict.hidden=!conflictHTML;
+  const content=$(".order-source-content",root), mode=orderInputMode(cell);
+  if(root.dataset.inputMode!==mode) {root.dataset.inputMode=mode;content.innerHTML=orderInputContentHTML(cell);}
+  else if(mode==="preview") {
+    if(root.dataset.sourceVersion!==cell.source)content.innerHTML=orderInputContentHTML(cell);
+  } else {
+    const editor=$("textarea",content);
+    if(editor.value!==cell.source) {
+      const start=editor.selectionStart,end=editor.selectionEnd;editor.value=cell.source;
+      editor.setSelectionRange(Math.min(start,cell.source.length),Math.min(end,cell.source.length));
+    }
+  }
+  root.dataset.sourceVersion=cell.source;
+  autoSize();
+}
+
+function receiveOrderInput(cell,item) {
+  const base=state.inputEditBases.get(cell.id);
+  if(base&&item.file_input.sha256!==base.sha256&&item.source!==cell.source&&state.savingInputs.get(cell.id)!==item.source) {
+    state.inputConflicts.set(cell.id,item);
+  } else {
+    state.inputConflicts.delete(cell.id);
+    if(!base)cell.source=item.source;
+    else if(item.source===cell.source)state.inputEditBases.set(cell.id,{sha256:item.file_input.sha256});
+  }
+  cell.file_input=item.file_input;cell.revision=item.revision;cell.updated_at=item.updated_at;
+  updateOrderInput(cell);
+  const stamp=$(`#cell-${cell.id} .cell-stamp`);if(stamp)stamp.innerHTML=stampHTML(cell);
 }
 
 function orderOutputHTML(cell) {
@@ -136,9 +204,12 @@ async function refreshOrderOutputs() {
     const recovered=state.outputDisconnected;
     state.outputDisconnected=false;state.outputFingerprint=result.fingerprint;
     if(result.changed) {
+      let contextChanged=false;
       for(const item of result.cells) {
         const cell=state.doc.cells.find(c=>c.id===item.id&&c.type==="order");
         if(!cell||orderRunId(cell)!==item.file_output.run_id)continue;
+        contextChanged ||= item.source!==cell.source||item.file_output.sha256!==cell.file_output?.sha256;
+        receiveOrderInput(cell,item);
         cell.outputs=item.outputs;cell.file_output=item.file_output;
         updateOrderOutput(cell);
       }
@@ -149,16 +220,17 @@ async function refreshOrderOutputs() {
         const status=$(`[data-status-id="${id}"]`);if(status)status.innerHTML=tagHTML(cell);
         const block=$(`#cell-${id} .output-block`);if(block) {
           block.classList.add("stale-output");
-          if(!$(".stale-label",block))$(".output-heading",block)?.insertAdjacentHTML("afterbegin",'<span class="stale-label">上游输出已更新 · 此结果需重新验证</span>');
+          if(!$(".stale-label",block))$(".output-heading",block)?.insertAdjacentHTML("afterbegin",'<span class="stale-label">上游内容已更新 · 此结果需重新验证</span>');
         }
       }
       state.doc.updated_at=result.updated_at;
+      if(contextChanged)refreshContext();
     }
-    if(recovered)state.doc.cells.filter(c=>c.type==="order").forEach(updateOrderOutput);
+    if(recovered)state.doc.cells.filter(c=>c.type==="order").forEach(c=>{updateOrderInput(c);updateOrderOutput(c);});
   } catch {
     if(state.doc?.id===nid&&!state.outputDisconnected) {
       state.outputDisconnected=true;
-      state.doc.cells.filter(c=>c.type==="order").forEach(updateOrderOutput);
+      state.doc.cells.filter(c=>c.type==="order").forEach(c=>{updateOrderInput(c);updateOrderOutput(c);});
     }
   } finally {state.outputInFlight=false;}
 }
@@ -222,6 +294,7 @@ function projectChangesHTML(changes) {
 function renderNotebook() {
   const focused=document.activeElement;
   const globalFocus=focused?.dataset?.global ? {field:focused.dataset.field,start:focused.selectionStart,end:focused.selectionEnd} : null;
+  const cellFocus=focused?.dataset?.cell ? {id:focused.dataset.cell,field:focused.dataset.field,start:focused.selectionStart,end:focused.selectionEnd} : null;
   const doc = state.doc;
   if (!doc) { $("#notebook").innerHTML=`<div class="empty-workspace">${icon("notebook")}<h1>开始一篇研究笔记</h1><p>定义全局目的，再把问题拆成可验证的步骤。</p><button class="btn primary" data-action="new">${icon("plus")}新建 Notebook</button></div>`; return; }
   const disabled=busy() || state.sequence ? "disabled" : "";
@@ -231,32 +304,47 @@ function renderNotebook() {
     <div class="add-cell-bar"><button data-action="add" data-type="code" ${disabled} title="添加 Python 单元">+ Python</button><button data-action="add" data-type="markdown" ${disabled} title="添加 Markdown 单元">+ Markdown</button><button data-action="add" data-type="order" ${disabled} title="添加 AI Order 单元">+ Order</button></div></div>`;
   autoSize();
   if(globalFocus){const el=$(`[data-global][data-field="${globalFocus.field}"]`);el?.focus({preventScroll:true});el?.setSelectionRange(globalFocus.start,globalFocus.end);}
+  if(cellFocus){const el=$(`[data-cell="${cellFocus.id}"][data-field="${cellFocus.field}"]`);el?.focus({preventScroll:true});if(el?.setSelectionRange)el.setSelectionRange(cellFocus.start,cellFocus.end);}
 }
 
+function orderSessionHTML(session, cellId) {
+  const canOpen=session?.available && state.boot.capabilities.claude;
+  const reason=session?.reason || (!state.boot.capabilities.claude ? "请安装并登录 Claude Code 后重启服务。" : "请先运行此 Order 单元，再打开对话。");
+  return `<span class="session-name" title="${h(session?.name || reason)}">${session?.name?`Session Name <code>${h(session.name)}</code>`:"运行后可打开对话"}${session?.background_id?` · Background <code>${h(session.background_id)}</code>`:""}${session?.permission_mode?` · ${h(session.permission_mode)}`:""}</span><button class="text-button" data-action="open-session" data-id="${cellId}" title="${h(canOpen?"在新终端查看实时对话并继续交流":reason)}" ${canOpen?"":"disabled"}>${icon("terminal")}打开对话</button>`;
+}
+function liveSession(run) {
+  return {name:run.session_name,id:run.session_id,background_id:run.background_id,
+          permission_mode:run.provider_permission_mode,available:Boolean(run.background_id),
+          reason:"请等待后台会话启动后再打开对话。"};
+}
+function refreshSessionButton(cellId, session) {
+  const row=$(`#session-${cellId}`);if(!row)return;
+  row.innerHTML=orderSessionHTML(session,cellId);
+}
 function cellHTML(cell,index) {
-  const disabled=busy() || state.sequence ? "disabled" : "";
+  const disabled=cellLocked(cell.id) ? "disabled" : "";
+  const executionDisabled=busy() || state.sequence ? "disabled" : "";
   const live=state.live?.cell_id===cell.id;
   const editing=state.markdownEditing.has(cell.id);
+  const outputExpanded=cell.type==="order"&&state.expandedOrderOutputs.has(cell.id);
   let input="";
   if (cell.type === "code") {
     input=`<div class="code-editor"><pre class="code-highlight" aria-hidden="true">${pythonHTML(cell.source)}</pre><textarea class="code-input" data-field="source" data-cell="${cell.id}" spellcheck="false" wrap="off" aria-label="Python 代码" rows="4" ${disabled}>${h(cell.source)}</textarea></div>`;
   } else if (cell.type === "markdown") {
     input=editing ? `<textarea class="markdown-input" data-field="source" data-cell="${cell.id}" spellcheck="false" aria-label="Markdown 内容" ${disabled}>${h(cell.source)}</textarea>` : `<div class="markdown markdown-preview" data-id="${cell.id}" title="双击编辑 Markdown">${cell.source ? markdown(cell.source) : '<p class="placeholder">Markdown</p>'}</div>`;
   } else {
-    input=`<div class="order-body"><textarea id="source-${cell.id}" class="order-input" data-field="source" data-cell="${cell.id}" aria-label="AI 指令" rows="2" placeholder="本步 AI 指令…" ${disabled}>${h(cell.source)}</textarea><div class="contract-row"><label for="contract-${cell.id}">预期</label><textarea id="contract-${cell.id}" class="contract-input" data-field="expected_output" data-cell="${cell.id}" placeholder="输出契约" aria-label="预期输出" rows="1" maxlength="8000" ${disabled}>${h(cell.expected_output)}</textarea></div><div class="order-options"><span>Claude</span><select aria-label="输出格式" data-field="output_format" data-cell="${cell.id}" ${disabled}>${["markdown","json","text"].map(v=>`<option value="${v}" ${cell.output_format===v?"selected":""}>${v==="markdown"?"Markdown":v==="json"?"JSON":"Text"}</option>`).join("")}</select><button class="text-button" data-action="context" data-id="${cell.id}">上下文</button></div></div>`;
+    input=`<div class="order-body">${orderInputHTML(cell)}<div class="contract-row"><label for="contract-${cell.id}">预期</label><textarea id="contract-${cell.id}" class="contract-input" data-field="expected_output" data-cell="${cell.id}" placeholder="输出契约" aria-label="预期输出" rows="1" maxlength="8000" ${disabled}>${h(cell.expected_output)}</textarea></div><div class="order-options"><span>Claude</span><select aria-label="输出格式" data-field="output_format" data-cell="${cell.id}" ${disabled}>${["markdown","json","text"].map(v=>`<option value="${v}" ${cell.output_format===v?"selected":""}>${v==="markdown"?"Markdown":v==="json"?"JSON":"Text"}</option>`).join("")}</select><button class="text-button" data-action="context" data-id="${cell.id}">上下文</button></div></div>`;
   }
   if (cell.type === "order") {
-    const session=live ? {name:state.live.session_name,available:false,reason:"请等待或停止本次执行后再打开对话。"} : cell.session;
-    const canOpen=session?.available && state.boot.capabilities.claude;
-    const reason=session?.reason || (!state.boot.capabilities.claude ? "请安装并登录 Claude Code 后重启服务。" : "请先运行此 Order 单元，再打开对话。");
-    input+=`<div class="order-session"><span class="session-name" title="${h(session?.name || reason)}">${session?.name?`Session Name <code>${h(session.name)}</code>`:"运行后可打开对话"}</span><button class="text-button" data-action="open-session" data-id="${cell.id}" title="${h(canOpen?"在新终端打开此会话":reason)}" ${canOpen?"":"disabled"}>${icon("terminal")}打开对话</button></div>`;
+    const session=live ? liveSession(state.live) : cell.session;
+    input+=`<div class="order-session" id="session-${cell.id}">${orderSessionHTML(session,cell.id)}</div>`;
   }
   const count=cell.execution_count||cell.run_ids.length||" ";
   const hasOutput=live||cell.outputs.length||cell.last_error||(cell.type==="order"&&orderRunId(cell));
-  const operations=cell.type==="order"?`<button class="icon-btn" data-action="merge-cells" data-id="${cell.id}" title="Merge AI Cells · 合并两个 Order，清空原对话关联" aria-label="Merge AI Cells" ${disabled||!state.boot.capabilities.claude||state.doc.cells.filter(c=>c.type==="order").length<2?"disabled":""}>${icon("merge")}</button><button class="icon-btn" data-action="split-cells" data-id="${cell.id}" title="Split AI Cells · 拆分为两个 Order，复制原对话" aria-label="Split AI Cells" ${disabled||!state.boot.capabilities.claude||state.doc.cells.length>=100?"disabled":""}>${icon("split")}</button>`:"";
+  const operations=cell.type==="order"?`<button class="icon-btn" data-action="merge-cells" data-id="${cell.id}" title="Merge AI Cells · 合并两个 Order，清空原对话关联" aria-label="Merge AI Cells" ${executionDisabled||!state.boot.capabilities.claude||state.doc.cells.filter(c=>c.type==="order").length<2?"disabled":""}>${icon("merge")}</button><button class="icon-btn" data-action="split-cells" data-id="${cell.id}" title="Split AI Cells · 拆分为两个 Order，复制原对话" aria-label="Split AI Cells" ${executionDisabled||!state.boot.capabilities.claude||state.doc.cells.length>=100?"disabled":""}>${icon("split")}</button>`:"";
   return `<article class="cell ${cell.type}-cell ${state.selected===cell.id?"selected":""}" id="cell-${cell.id}" data-cell-card="${cell.id}" tabindex="0" title="${h(cell.title)} · 更新 ${h(timeText(cell.updated_at,true))}">
-    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${disabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${live&&state.live.operation?'<span class="status-tag running"><i class="spinner"></i>整理中</span>':tagHTML(cell)}</span>${operations}<button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
-    <div class="output-block ${cell.stale?"stale-output":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span></div><div class="output-content" id="output-${cell.id}">${cell.type==="order"?orderOutputHTML(cell):live?outputsHTML(state.live.outputs):outputsHTML(cell.outputs)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
+    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${executionDisabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${live&&state.live.operation?'<span class="status-tag running"><i class="spinner"></i>整理中</span>':tagHTML(cell)}</span>${operations}<button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
+    <div class="output-block ${cell.stale?"stale-output":""} ${outputExpanded?"output-expanded":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span>${cell.type==="order"?`<button class="output-expand" data-action="toggle-order-output" data-id="${cell.id}" aria-controls="output-${cell.id}" aria-expanded="${outputExpanded}" aria-label="${outputExpanded?"恢复滚动显示":"展开完整输出"}" title="${outputExpanded?"恢复滚动显示":"展开完整输出"}">${icon("chevron")}</button>`:""}</div><div class="output-content" id="output-${cell.id}">${cell.type==="order"?orderOutputHTML(cell):live?outputsHTML(state.live.outputs):outputsHTML(cell.outputs)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
 }
 
 function autoSize() {
@@ -272,7 +360,7 @@ function inspectorFrame() {
   if(state.tab==="variables") renderVariables();
   if(state.tab==="history") renderHistoryList();
   if(state.tab==="context") {
-    $("#inspector-body").innerHTML=`<div class="inspector-selection"><span class="mini-label">当前单元 · r${cell.revision}</span><strong>${String(index+1).padStart(2,"0")} <span>/</span> ${h(cell.title || typeLabel[cell.type])}</strong><small>创建 ${h(timeText(cell.created_at,true))}<br>更新 ${h(timeText(cell.updated_at,true))}</small></div><div id="context-details" class="context-details"><p class="muted">正在准备上下文预览…</p></div><details class="manual-context"><summary>自定义上文摘要</summary><textarea aria-label="精简上下文摘要" data-field="context_note" data-cell="${cell.id}" maxlength="3000" rows="3" ${busy()?"disabled":""}>${h(cell.context_note)}</textarea></details>`;
+    $("#inspector-body").innerHTML=`<div class="inspector-selection"><span class="mini-label">当前单元 · r${cell.revision}</span><strong>${String(index+1).padStart(2,"0")} <span>/</span> ${h(cell.title || typeLabel[cell.type])}</strong><small>创建 ${h(timeText(cell.created_at,true))}<br>更新 ${h(timeText(cell.updated_at,true))}</small></div><div id="context-details" class="context-details"><p class="muted">正在准备上下文预览…</p></div><details class="manual-context"><summary>自定义上文摘要</summary><textarea aria-label="精简上下文摘要" data-field="context_note" data-cell="${cell.id}" maxlength="3000" rows="3" ${cellLocked(cell.id)?"disabled":""}>${h(cell.context_note)}</textarea></details>`;
     refreshContext();
   }
 }
@@ -345,30 +433,42 @@ function updateSaveState(label="已保存", error=false) {
   const el=$("#save-state");
   if(el) { el.innerHTML=`${icon(error?"warning":state.dirty?"clock":"check")}${h(label)}`;el.classList.toggle("error-text",error); }
 }
-function touch(scope="document") {
+function touch(scope="document",field=null) {
   state.dirty=true;state.editSeq++;state.context=null;
+  if(field)state.dirtyFields.add(field);
   if(scope==="global")state.globalDirty=true;else state.documentDirty=true;
   updateSaveState("等待保存…");clearTimeout(state.timer);
-  state.timer=setTimeout(()=>save().catch(error=>toast(error.message,true)),600);
+  state.timer=setTimeout(()=>save().catch(error=>{if(!state.finishingRun)toast(error.message,true);}),600);
 }
 function editablePayload() {
   const doc=state.doc;
   return {revision:doc.revision,title:doc.title,global:{goal:doc.global.goal,constraints:doc.global.constraints},
-    cells:doc.cells.map(c=>Object.fromEntries(["id","type","title","source","expected_output","output_format","mode","context_note"].map(k=>[k,c[k]])))};
+    cells:doc.cells.map(c=>({...Object.fromEntries(["id","type","title","source","expected_output","output_format","mode","context_note"].map(k=>[k,c[k]])),
+      ...(c.type==="order"?{input_edited:state.inputEditBases.has(c.id),input_file_sha256:(state.inputEditBases.get(c.id)||c.file_input)?.sha256}:{} )}))};
 }
 async function save() {
   if(state.savePromise) { await state.savePromise; if(state.dirty) return save(); return; }
   if(!state.dirty || !state.doc) return;
   const seq=state.editSeq, nid=state.doc.id, globalOnly=state.globalDirty&&!state.documentDirty;
+  if(!globalOnly&&state.inputConflicts.size) {updateSaveState("需求文件有更新 · 请选择版本",true);throw new Error("需求文件已更新，草稿已保留。请在 Input Cell 选择使用哪个版本。");}
   const payload=globalOnly?{revision:state.doc.global.revision,goal:state.doc.global.goal,constraints:state.doc.global.constraints}:editablePayload();
+  state.savingInputs=new Map((payload.cells||[]).filter(c=>c.type==="order"&&c.input_edited).map(c=>[c.id,c.source]));
   updateSaveState("正在保存…");
   state.savePromise=(async()=>{
     try {
       const doc=await api(`/api/notebooks/${nid}${globalOnly?"/global":""}`,"PUT",payload);
       if(state.doc.id!==nid) return;
       state.outputFingerprint="";
-      if(seq===state.editSeq) { state.doc=doc;state.dirty=false;state.globalDirty=false;state.documentDirty=false; }
+      if(!globalOnly)for(const saved of doc.cells) {
+        if(!state.savingInputs.has(saved.id))continue;
+        const local=state.doc.cells.find(c=>c.id===saved.id);
+        if(local?.source===saved.source)state.inputEditBases.delete(saved.id);
+        else if(local)state.inputEditBases.set(saved.id,{sha256:saved.file_input?.sha256});
+        state.inputConflicts.delete(saved.id);
+      }
+      if(seq===state.editSeq) { state.doc=doc;state.dirty=false;state.globalDirty=false;state.documentDirty=false;state.dirtyFields.clear(); }
       else {state.doc.revision=doc.revision;state.doc.global.revision=doc.global.revision;}
+      state.doc.cells.filter(c=>c.type==="order").forEach(updateOrderInput);
       const item=state.boot.notebooks.find(n=>n.id===nid);
       if(item) {item.title=doc.title;item.updated_at=doc.updated_at;}
       updateSaveState(state.dirty?"等待保存…":"已保存");
@@ -383,7 +483,11 @@ async function save() {
         const globalStamp=$(".global-foot .cell-stamp");if(globalStamp)globalStamp.innerHTML=stampHTML(doc.global);
         refreshContext();
       }
-    } catch(error) {updateSaveState("保存失败 · 请重试",true);throw error;}
+    } catch(error) {
+      updateSaveState("保存失败 · 草稿已保留",true);
+      if(error.status===409){state.outputFingerprint="";await refreshOrderOutputs();}
+      throw error;
+    } finally {state.savingInputs.clear();}
   })();
   try {await state.savePromise;} finally {state.savePromise=null;}
   if(state.dirty) return save();
@@ -393,11 +497,25 @@ async function flushSave() {clearTimeout(state.timer);await save();}
 async function openNotebook(id) {
   await flushSave();
   state.doc=await api(`/api/notebooks/${id}`);state.dirty=false;state.globalDirty=false;state.documentDirty=false;
+  state.dirtyFields.clear();
+  state.orderEditing.clear();state.inputEditBases.clear();state.inputConflicts.clear();state.expandedOrderOutputs.clear();
   state.selected=state.doc.cells.find(c=>c.type==="order")?.id || state.doc.cells[0]?.id || null;
   state.context=null;state.live=null;
   localStorage.setItem("castle-notebook",id);
   renderAll();
   if(state.doc.runtime.active_run_id) {const run=await api(`/api/runs/${state.doc.runtime.active_run_id}`);watchRun(run).catch(e=>toast(e.message,true));}
+}
+
+function rebaseDirtyDraft(latest,draft) {
+  for(const key of state.dirtyFields) {
+    const [scope,id,field]=key.split("|");
+    if(scope==="cell") {
+      const source=draft.cells.find(cell=>cell.id===id), target=latest.cells.find(cell=>cell.id===id);
+      if(source&&target&&field in source)target[field]=source[field];
+    } else if(scope==="global"&&id in draft.global)latest.global[id]=draft.global[id];
+    else if(scope==="document"&&id!=="structure"&&id in draft)latest[id]=draft[id];
+  }
+  return latest;
 }
 
 function watchRun(run) {
@@ -409,21 +527,22 @@ function watchRun(run) {
   return new Promise((resolve,reject)=>{
     const source=new EventSource(`/api/runs/${run.id}/events`);state.source=source;
     const finish=async final=>{
-      if(ended)return;ended=true;source.close();state.source=null;state.live=null;
+      if(ended)return;ended=true;source.close();state.source=null;state.live=null;state.finishingRun=true;
       try {
+        clearTimeout(state.timer);
+        if(state.savePromise){try{await state.savePromise;}catch(error){if(error.status!==409)throw error;}await Promise.resolve();}
+        const latest=await api(`/api/notebooks/${run.notebook_id}`), draft=state.doc;
+        state.doc=rebaseDirtyDraft(latest,draft);state.finishingRun=false;
         await flushSave();
-        const latest=await api(`/api/notebooks/${run.notebook_id}`);
-        if(state.globalDirty){latest.global.goal=state.doc.global.goal;latest.global.constraints=state.doc.global.constraints;}
-        state.doc=latest;
         if(final.applied_cell_ids?.length)state.selected=final.applied_cell_ids[0];
-        final.stale=Boolean(final.stale||latest.cells.find(c=>c.id===run.cell_id)?.stale);
+        final.stale=Boolean(final.stale||state.doc.cells.find(c=>c.id===run.cell_id)?.stale);
         state.boot.notebooks=await api("/api/notebooks");
         renderAll();
         if(final.status!=="succeeded") toast(final.error || "执行未完成，请检查输出与运行记录。",true);
         else if(run.operation) toast(run.operation.kind==="merge"?"Order 已合并，原对话关联已清空。":"Order 已拆分，内容与对话已分别保存。");
         else if(!state.sequence) toast(final.stale?final.stale_reason||"上游输入已变化，本次结果已标记失效。":"本步执行完成，结果与输入快照已保存。");
         resolve(final);
-      } catch(error) {state.doc.runtime.active_run_id=null;renderAll();reject(error);}
+      } catch(error) {state.finishingRun=false;state.doc.runtime.active_run_id=null;renderAll();reject(error);}
     };
     source.onmessage=event=>{
       if(ended || state.live?.id!==run.id)return;
@@ -441,6 +560,10 @@ function watchRun(run) {
       } else if(message.type==="canonical_output") {
         if(run.cell_type==="order"){state.outputFingerprint="";refreshOrderOutputs();return;}
         state.live.outputs=[data];const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML([data]);
+      } else if(message.type==="session") {
+        state.live.background_id=data.background_id;state.live.session_id=data.id;
+        state.live.provider_permission_mode=data.permission_mode;
+        refreshSessionButton(run.cell_id,liveSession(state.live));
       } else if(message.type==="variables") {
         state.doc.runtime.variables=data.variables;state.doc.runtime.kernel_id=data.kernel_id;
         if(state.tab==="variables")inspectorFrame();
@@ -460,6 +583,7 @@ async function runCell(id) {
   await flushSave();
   if(busy())throw new Error("请先等待或停止当前单元。");
   const run=await api(`/api/notebooks/${state.doc.id}/cells/${id}/run`,"POST",{});
+  if(run.document_revision)state.doc.revision=run.document_revision;
   state.markdownEditing.delete(id);
   return watchRun(run);
 }
@@ -512,12 +636,13 @@ async function viewRun(id) {
   const run=await api(`/api/runs/${id}`);const events=await fetch(`/api/runs/${id}/artifact?name=events`).then(r=>r.ok?r.text():"");
   const trace=events.split("\n").filter(Boolean).map(line=>{try{return JSON.parse(line);}catch{return null;}}).filter(e=>e && ["status","tool","tool_result","log","validation","finished"].includes(e.type));
   showModal(`${run.cell_title || "单元"} · 执行记录`,`<div class="run-meta-grid"><div><span>状态</span><strong class="${run.status==="failed"?"error-text":""}">${h(statusLabel[run.status]||run.status)}</strong></div><div><span>执行时间</span><strong>${h(timeText(run.started_at,true))}</strong></div><div><span>输入版本</span><strong>Cell r${run.cell_revision} · Global r${run.global_revision}</strong></div><div><span>运行 ID</span><code>${h(run.id)}</code></div></div>${run.error?`<div class="run-error">${h(run.error)}</div>`:""}<div class="run-downloads">${[["context","输入快照"],["output","输出文件"],["events","事件记录"],["run","完整元数据"]].map(([name,label])=>`<a class="btn outline small" href="/api/runs/${id}/artifact?name=${name}" download>${icon("download")}${label}</a>`).join("")}</div><details class="run-detail" open><summary>最终输出</summary><div class="history-output">${outputsHTML(run.outputs)}</div></details><details class="run-detail"><summary>实际输入 · ${run.context.characters} 字符</summary><pre class="context-full">${h(run.context.prompt)}</pre><code class="full-hash">${h(run.context.fingerprint)}</code></details><details class="run-detail"><summary>运行事件 · ${trace.length} 条</summary><div class="event-list">${trace.map(e=>`<div><time>${h(timeText(e.at))}</time><strong>${h(e.type)}</strong><pre>${h(e.data.text||e.data.message||e.data.name||e.data.status||"")}${e.data.input?"\n"+h(e.data.input):""}</pre></div>`).join("")}</div></details><div class="artifact-path">${icon("folder")}<code>${h(run.artifact)}</code></div>`,true);
+  if(run.cell_type==="order")$("#modal .run-downloads").insertAdjacentHTML("afterbegin",`<a class="btn outline small" href="/api/runs/${id}/artifact?name=input" download>${icon("download")}当前需求文件</a>`);
   $("#modal .modal-body").insertAdjacentHTML("beforeend",`<div class="path-block">${icon("folder")}<code>${h(run.project_path)}</code></div>${projectChangesHTML(run.project_changes)}${run.project_changes?`<a class="btn outline small" href="/api/runs/${id}/artifact?name=changes" download>${icon("download")}文件变更记录</a>`:""}`);
 }
 
 async function mutateCells(fn) {
   await flushSave();if(busy() || state.sequence)throw new Error("请等待或停止执行后再编辑。");
-  fn();touch();await flushSave();renderAll();
+  fn();touch("document","document|structure");await flushSave();renderAll();
 }
 async function action(name,el) {
   const id=el.dataset.id;
@@ -546,6 +671,15 @@ async function action(name,el) {
   }
   if(name==="sidebar")return $(".workspace").classList.toggle("sidebar-open");
   if(name==="inspector"){state.inspectorOpen=!state.inspectorOpen;return $(".workspace").classList.toggle("inspector-open",state.inspectorOpen);}
+  if(name==="toggle-order-output"){
+    const expanded=!state.expandedOrderOutputs.has(id);
+    expanded?state.expandedOrderOutputs.add(id):state.expandedOrderOutputs.delete(id);
+    el.closest(".output-block")?.classList.toggle("output-expanded",expanded);
+    el.setAttribute("aria-expanded",String(expanded));
+    el.setAttribute("aria-label",expanded?"恢复滚动显示":"展开完整输出");
+    el.title=expanded?"恢复滚动显示":"展开完整输出";
+    return;
+  }
   if(name==="run")return runCell(id);
   if(name==="run-all")return runAll();
   if(name==="stop"){state.sequenceStop=true;const rid=state.live?.id || state.doc?.runtime.active_run_id;if(rid)return api(`/api/runs/${rid}/cancel`,"POST",{});return;}
@@ -557,15 +691,31 @@ async function action(name,el) {
     return;
   }
   if(name==="copy-context"){await navigator.clipboard.writeText(state.context.prompt);return toast("完整输入已复制。");}
-  if(name==="edit-markdown"){if(busy())return;await flushSave();state.selected=id;state.markdownEditing.has(id)?state.markdownEditing.delete(id):state.markdownEditing.add(id);renderAll();$(`#cell-${id} textarea`)?.focus();return;}
+  if(name==="edit-markdown"){if(cellLocked(id))return;await flushSave();state.selected=id;state.markdownEditing.has(id)?state.markdownEditing.delete(id):state.markdownEditing.add(id);renderAll();$(`#cell-${id} textarea`)?.focus();return;}
+  if(name==="edit-order"||name==="done-order") {
+    if(cellLocked(id))return;
+    await flushSave();state.selected=id;
+    name==="edit-order"?state.orderEditing.add(id):state.orderEditing.delete(id);
+    updateOrderInput(state.doc.cells.find(c=>c.id===id));
+    if(name==="edit-order")$(`#source-${id}`)?.focus();
+    return;
+  }
+  if(name==="use-input-file"||name==="keep-input-draft") {
+    const cell=state.doc.cells.find(c=>c.id===id), latest=state.inputConflicts.get(id);
+    if(!cell||!latest)return;
+    if(latest.file_input.state==="unavailable")throw new Error("需求文件暂不可读，请等待恢复后再选择版本。");
+    if(name==="use-input-file") {cell.source=latest.source;state.inputEditBases.delete(id);}
+    else state.inputEditBases.set(id,{sha256:latest.file_input.sha256});
+    state.inputConflicts.delete(id);updateOrderInput(cell);touch("document",`cell|${id}|source`);await flushSave();return;
+  }
   if(name==="history"){selectCell(id);state.tab="history";inspectorFrame();state.inspectorOpen=true;$(".workspace").classList.add("inspector-open");return;}
   if(name==="view-run")return viewRun(id);
   if(name==="reset")return showModal("重启 Python 内核",`<p>重启将清空当前共享变量，保留所有历史输出。已有计算结果会标记失效，需从上游重新执行。</p><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn primary" data-action="confirm-reset">${icon("refresh")}重启内核</button></div>`);
   if(name==="confirm-reset"){await flushSave();state.doc=await api(`/api/notebooks/${state.doc.id}/kernel/reset`,"POST",{});$("#modal").close();renderAll();return toast("内核已重启，历史输出已保留。");}
   if(name==="add")return mutateCells(()=>{const stamp=new Date().toISOString(),kind=el.dataset.type;const cell={id:newId(),type:kind,title:"",source:"",expected_output:"",context_note:"",mode:"llm",output_format:"markdown",created_at:stamp,updated_at:stamp,revision:1,status:"idle",stale:false,outputs:[],run_ids:[]};const at=el.dataset.insert?state.doc.cells.findIndex(c=>c.id===state.selected)+1:state.doc.cells.length;state.doc.cells.splice(at,0,cell);state.selected=cell.id;if(kind==="markdown")state.markdownEditing.add(cell.id);}).then(()=>{$(`#cell-${state.selected}`)?.scrollIntoView({behavior:"smooth",block:"center"});$(`#cell-${state.selected} textarea`)?.focus();});
-  if(["move-up","move-down","duplicate"].includes(name))return mutateCells(()=>{const index=state.doc.cells.findIndex(c=>c.id===id);if(name==="duplicate"){const copy=structuredClone(state.doc.cells[index]);Object.assign(copy,{id:newId(),title:copy.title+" · 副本",status:"idle",stale:false,outputs:[],run_ids:[],last_run_id:undefined,last_error:null,initializer:false,applied_run_id:undefined});state.doc.cells.splice(index+1,0,copy);state.selected=copy.id;}else{const to=index+(name==="move-up"?-1:1);if(to>=0 && to<state.doc.cells.length)[state.doc.cells[index],state.doc.cells[to]]=[state.doc.cells[to],state.doc.cells[index]];}});
+  if(["move-up","move-down","duplicate"].includes(name))return mutateCells(()=>{const index=state.doc.cells.findIndex(c=>c.id===id);if(name==="duplicate"){const copy=structuredClone(state.doc.cells[index]);Object.assign(copy,{id:newId(),title:copy.title+" · 副本",status:"idle",stale:false,outputs:[],run_ids:[],last_run_id:undefined,last_error:null,initializer:false,applied_run_id:undefined,file_input:undefined,file_output:undefined,input_session_synced:undefined});state.doc.cells.splice(index+1,0,copy);state.selected=copy.id;}else{const to=index+(name==="move-up"?-1:1);if(to>=0 && to<state.doc.cells.length)[state.doc.cells[index],state.doc.cells[to]]=[state.doc.cells[to],state.doc.cells[index]];}});
   if(name==="delete")return showModal("删除这个单元",`<p>将删除当前文档中的「${h(state.doc.cells.find(c=>c.id===id).title)}」。独立运行证据文件仍保存在本地，下游结果会标记失效。</p><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn danger" data-action="confirm-delete" data-id="${id}">删除单元</button></div>`);
-  if(name==="confirm-delete"){$("#modal").close();return mutateCells(()=>{state.doc.cells=state.doc.cells.filter(c=>c.id!==id);state.selected=state.doc.cells[0]?.id;});}
+  if(name==="confirm-delete"){$("#modal").close();return mutateCells(()=>{state.doc.cells=state.doc.cells.filter(c=>c.id!==id);state.expandedOrderOutputs.delete(id);state.selected=state.doc.cells[0]?.id;});}
   if(name==="apply-init"){await flushSave();state.doc=await api(`/api/notebooks/${state.doc.id}/apply-init`,"POST",{run_id:id});renderAll();return toast("项目已拆分为独立单元。检查代码后再逐步运行。");}
   if(name==="scan-project"){el.disabled=true;try{const result=await api("/api/project/scan","POST",{relative_path:$("#init-form input[name=relative_path]").value});$("#scan-result").innerHTML=`<p class="muted">${result.files.length} 个文件${result.truncated?" · 概览已截断":""}</p><pre>${h(result.files.join("\n"))}</pre><p class="muted">${h(result.policy)}</p>`;}finally{el.disabled=false;}return;}
   if(name==="environment")return showModal("本地运行环境",`<div class="environment-details"><label>项目工作目录</label><code>${h(state.doc?.project_path||state.boot.project_path)}</code><label>Python 内核</label><code>${h(state.boot.capabilities.python)}</code><label>Claude CLI</label><p>${state.boot.capabilities.claude?'<span class="status-tag succeeded">已检测到</span> 运行时沿用本机 Claude 的模型、工具、权限与登录配置。':'<span class="status-tag failed">未检测到</span> 安装并登录后，重启本服务。'}</p><label>执行上限</label><p>Python ${state.boot.capabilities.code_timeout} 秒 · Claude ${state.boot.capabilities.agent_timeout} 秒</p></div><p class="muted">切换研究环境：启动服务时指定 <code>--python &lt;解释器路径&gt;</code>。初始化其他项目：使用 <code>--project &lt;项目目录&gt;</code>。</p>`);
@@ -579,16 +729,20 @@ document.addEventListener("click",event=>{
   if(!event.target.closest(".menu-wrap"))document.querySelectorAll(".dropdown").forEach(el=>el.hidden=true);
 });
 document.addEventListener("focusin",event=>{const id=event.target.dataset?.cell;if(id&&state.selected!==id)selectCell(id);});
-document.addEventListener("dblclick",event=>{const el=event.target.closest(".markdown-preview");if(el)action("edit-markdown",el).catch(error=>toast(error.message,true));});
+document.addEventListener("dblclick",event=>{const el=event.target.closest(".markdown-preview,.order-input-preview");if(el)action(el.classList.contains("order-input-preview")?"edit-order":"edit-markdown",el).catch(error=>toast(error.message,true));});
 document.addEventListener("input",event=>{
   const el=event.target;
   if(!el.dataset.field || !state.doc)return;
-  if(el.dataset.global)state.doc.global[el.dataset.field]=el.value;
-  else if(el.dataset.cell){const cell=state.doc.cells.find(c=>c.id===el.dataset.cell);if(cell)cell[el.dataset.field]=el.value;
+  let scope="document",field=`document|${el.dataset.field}`;
+  if(el.dataset.global){state.doc.global[el.dataset.field]=el.value;scope="global";field=`global|${el.dataset.field}`;}
+  else if(el.dataset.cell){const cell=state.doc.cells.find(c=>c.id===el.dataset.cell);
+    if(cell?.type==="order"&&el.dataset.field==="source"&&!state.inputEditBases.has(cell.id))state.inputEditBases.set(cell.id,{sha256:cell.file_input?.sha256});
+    if(cell)cell[el.dataset.field]=el.value;
+    field=`cell|${el.dataset.cell}|${el.dataset.field}`;
     if(el.classList.contains("code-input"))el.previousElementSibling.innerHTML=pythonHTML(el.value);}
   else state.doc[el.dataset.field]=el.value;
   if(el.tagName==="TEXTAREA"){el.style.height="auto";el.style.height=`${Math.min(540,Math.max(28,el.scrollHeight))}px`;}
-  touch(el.dataset.global?"global":"document");
+  touch(scope,field);
 });
 document.addEventListener("change",event=>{
   if(event.target.id==="cell-type"){

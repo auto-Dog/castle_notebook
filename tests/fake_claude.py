@@ -15,6 +15,8 @@ full_prompt = prompt_file.read_text(encoding="utf-8")
 prompt = full_prompt.rsplit("## Current step / ", 1)[-1]
 output_match = re.search(r"相对项目目录的完整路径：`([^`]+)`", full_prompt)
 output_file = Path(output_match.group(1)) if output_match else Path(".castle/runs") / prompt_file.stem.removeprefix("input") / "output.md"
+input_match = re.search(r"需求摘要文件为 `([^`]+)`", full_prompt)
+input_file = Path(input_match.group(1)) if input_match else output_file.with_name("input.md")
 
 
 def emit(data):
@@ -59,6 +61,10 @@ elif "FAKE_PROJECT_EDIT" in prompt:
     Path("verification.txt").write_text("project artifact", encoding="utf-8")
     Path("obsolete.txt").unlink()
     answer = "已修改 project_model.py，新增 verification.txt，删除 obsolete.txt；等待 Python 单元验证。"
+elif "FAKE_UPDATE_INPUT" in prompt:
+    input_file.write_text("## 当前需求\n\n- [x] 修复初始问题\n- [ ] 新增可编辑上下文模板", encoding="utf-8")
+    output_file.write_text("初始问题已修复，正在处理新增需求。", encoding="utf-8")
+    answer = "输入与输出文件均已更新。"
 elif "FAKE_WRITE_JSON_FILE" in prompt:
     output_file.write_text('{"from_file": true}', encoding="utf-8")
     answer = "JSON 已写入文件。"

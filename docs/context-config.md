@@ -34,7 +34,7 @@
 
 ## 编辑 harness prompt
 
-`templates.instructions` 是可直接编辑的 harness 说明正文，包括角色、只处理当前单元等要求；这段文字可以自由重写。它支持 `{run_dir}`、`{output_file}`、`{run_id}`、`{session_name}`、`{prompt_file}` 运行变量，其余内容为普通文本，可以直接包含 JSON 花括号。
+`templates.instructions` 是可直接编辑的 harness 说明正文，包括角色、只处理当前单元等要求；这段文字可以自由重写。它支持 `{input_file}`、`{run_dir}`、`{output_file}`、`{run_id}`、`{session_name}`、`{prompt_file}` 运行变量，其余内容为普通文本，可以直接包含 JSON 花括号。
 
 `templates.prompt` 控制完整 prompt 的拼接顺序，支持下列区块占位符：
 
@@ -66,7 +66,7 @@
 | `current_step` | `{id}`、`{revision}`、`{title}`、`{type}`、`{source}` |
 | `expected_output` | `{expected_output}` |
 | `output_format` | `{output_format}` |
-| `invocation` | `{prompt_file}`、`{run_id}`、`{session_name}`、`{run_dir}`、`{output_file}` |
+| `invocation` | `{prompt_file}`、`{run_id}`、`{session_name}`、`{run_dir}`、`{input_file}`、`{output_file}` |
 
 `templates.invocation` 是后台传给 Claude 的简短启动指令，例如：
 
@@ -79,15 +79,16 @@
 }
 ```
 
-完整输入仍写入 `.castle/prompts/input<运行ID>.md`，命令行只传渲染后的 `invocation`。Claude 的工具、权限与模型使用本机配置。
+完整输入仍写入 `.castle/prompts/input<运行ID>.md`，命令行只传渲染后的 `invocation`。Claude 的工具和模型使用本机配置；权限由服务启动参数 --claude-permission-mode 指定，默认 auto 自动审批，需要时可进入实时对话处理。
 
-输出路径在 `templates.instructions` 的输出要求段落中展开，例如：
+需求摘要与输出路径在 `templates.instructions` 中展开，例如：
 
 ```text
+本会话的需求摘要文件为 `{input_file}`（相对于项目目录）。随着需求澄清、追加或调整，每轮对话结束前用 Markdown 更新该文件，归纳当前完整需求、已确认的约束和完成状态，可替换上一版。Order Input Cell 会实时显示此文件。
 最终回答按照jupyter notebook cell支持的形式（文本、格式文本、图片、widget）写入本次运行目录 `{run_dir}` 的 output.md（相对项目目录的完整路径：`{output_file}`）。注意：此后的每一轮对话，都要按照最初的格式需求更新这个output文件。
 ```
 
-`{run_dir}` 默认展开为 `.castle/runs/<运行ID>`，`{output_file}` 默认展开为 `.castle/runs/<运行ID>/output.md`，统一使用 `/` 并相对于项目工作目录解析。指定自定义 `--data-dir` 时按真实位置计算相对路径；同驱动器下的项目外目录使用 `../`，跨驱动器时明确报错。启动指令不再自动追加输出路径；需要时仍可在 `invocation` 中主动引用这些变量。
+`{input_file}` 默认展开为 `.castle/runs/<运行ID>/input.md`，`{run_dir}` 为 `.castle/runs/<运行ID>`，`{output_file}` 为 `.castle/runs/<运行ID>/output.md`，统一使用 `/` 并相对于项目工作目录解析。指定自定义 `--data-dir` 时按真实位置计算相对路径；同驱动器下的项目外目录使用 `../`，跨驱动器时明确报错。启动指令不再自动追加路径；需要时仍可在 `invocation` 中主动引用这些变量。
 
 预览会预分配本次运行 ID，实际执行复用该 ID，因此预览、输入 Markdown 文件和运行记录中的输出路径一致。执行后下一次预览会分配新的 ID。配置快照保留模板原文，输入快照保存已经展开的相对路径。Order 的 Out Cell 持续读取对应 `output.md`，后续对话更新该文件后会自动刷新；模型未写出文件时，后台用最终回答创建它。
 
@@ -104,3 +105,5 @@
 当前指令及启用的 Global 内容完整保留。关闭历史精简后，历史内容超过总预算会明确报错。配置语法、占位符或开关类型错误也会明确报错，文件不会被默认配置覆盖。
 
 运行记录的 `context.config` 保存实际使用的配置，`context.config_fingerprint` 保存配置指纹；`context.md` 和 prompt 文件保存当次组装后的完整输入。修改配置不会覆盖旧运行的输入和配置快照。
+
+`input.md` 与完整 prompt 文件用途不同：它只保存会话当前的需求摘要，最初复制当前单元指令，以后由 Claude 或 Input Cell 编辑器更新。输入正文会实时渲染并缓存到 Notebook，后续上下文、合并及拆分使用最新需求。文件变动不覆盖初始 prompt、`context.md`、`input_snapshot` 或它们的指纹。模板中的维护要求可以自行修改；关闭 `features.instructions` 时不会向新会话传入这段要求。

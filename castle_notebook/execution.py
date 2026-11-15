@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import shlex
 import shutil
 import signal
 import subprocess
@@ -21,6 +22,19 @@ from .core import (Problem, apply_initialization, editable_document, now,
 from .cell_operations import operation_cell, parse_cells, replace_cells, select_cells
 
 OUTPUT_LIMIT = 2000000
+INPUT_LIMIT = 32000
+
+LINUX_TERMINALS = (
+    ("x-terminal-emulator", ("-e",)),
+    ("gnome-terminal", ("--",)),
+    ("kgx", ("--",)),
+    ("konsole", ("-e",)),
+    ("xfce4-terminal", ("-x",)),
+    ("alacritty", ("-e",)),
+    ("kitty", ("--",)),
+    ("foot", ("--",)),
+    ("xterm", ("-e",)),
+)
 
 
 def spawn_options():
@@ -64,7 +78,11 @@ def pipe_reader(stream, messages, channel="stdout"):
 
 
 def resolve_claude(override=None):
-    candidate = override or shutil.which("claude")
+    if override:
+        expanded = Path(override).expanduser()
+        candidate = str(expanded) if expanded.is_file() else shutil.which(override)
+    else:
+        candidate = shutil.which("claude")
     if not candidate:
         return None
     path = Path(candidate)
@@ -85,6 +103,37 @@ def resolve_claude(override=None):
     return [str(path)] if path.is_file() else None
 
 
+def linux_terminal_command(command):
+    """Wrap an argv for a visible Linux terminal without invoking a shell."""
+    candidates = []
+    configured = os.environ.get("TERMINAL", "").strip()
+    if configured:
+        try:
+            parts = shlex.split(configured)
+        except ValueError as exc:
+            raise Problem(f"环境变量 TERMINAL 无法解析：{exc}", 503) from exc
+        if parts:
+            candidates.append((parts[0], tuple(parts[1:])))
+    candidates.extend((name, ()) for name, _ in LINUX_TERMINALS)
+
+    seen = set()
+    launch_flags = dict(LINUX_TERMINALS)
+    for name, options in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        executable = shutil.which(name)
+        if not executable:
+            path = Path(name).expanduser()
+            executable = str(path) if path.is_file() else None
+        if not executable:
+            continue
+        terminal_name = Path(name).name.lower()
+        flags = launch_flags.get(terminal_name, ("-e",))
+        return [executable, *options, *flags, *command]
+    return None
+
+
 def session_details(run=None):
     name = run.get("session_name") if run else None
     command = run.get("command", []) if run else []
@@ -95,23 +144,37 @@ def session_details(run=None):
         reason = "请先运行此 Order 单元，再打开对话。"
     elif run.get("derived") and not session_id:
         reason = "此整理单元暂无 AI 对话；运行后可打开新对话。"
-    elif run["status"] == "running":
+    elif run["status"] == "running" and not run.get("background_id"):
         reason = "请等待或停止本次执行后再打开对话。"
     elif not name or "--no-session-persistence" in command:
         reason = "此历史运行未保存 Claude 会话，请重新运行 Order 单元。"
-    elif not session_id:
+    elif not session_id and not run.get("background_id"):
         reason = "本次执行未生成可恢复的 Claude 会话，请重新运行 Order 单元。"
     else:
         reason = ""
-    return {"name": name, "id": session_id, "available": not reason, "reason": reason}
+    return {"name": name, "id": session_id, "available": not reason, "reason": reason,
+            "background_id": run.get("background_id") if run else None,
+            "permission_mode": run.get("provider_permission_mode") if run else None}
 
 
 def open_claude_terminal(command, project):
-    if os.name != "nt":
-        raise Problem("在新终端打开 Claude 对话目前仅支持 Windows。", 503)
+    if os.name == "nt":
+        launcher = command
+        options = {"creationflags": subprocess.CREATE_NEW_CONSOLE}
+    elif sys.platform.startswith("linux"):
+        launcher = linux_terminal_command(command)
+        if not launcher:
+            raise Problem(
+                "找不到可用的 Linux 终端。请安装 x-terminal-emulator、GNOME Terminal、Konsole、"
+                "Xfce Terminal、Alacritty、Kitty、Foot 或 XTerm，或设置 TERMINAL 环境变量。",
+                503,
+            )
+        options = {"start_new_session": True}
+    else:
+        raise Problem("在新终端打开 Claude 对话目前支持 Windows 和 Linux。", 503)
     try:
         # A visible console is intentional: the user continues the conversation here.
-        process = subprocess.Popen(command, cwd=project, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        process = subprocess.Popen(launcher, cwd=project, **options)
     except OSError as exc:
         raise Problem(f"无法打开 Claude 对话终端：{exc}", 503) from exc
     threading.Thread(target=process.wait, daemon=True).start()
@@ -181,12 +244,19 @@ class Kernel:
 
 
 class Engine:
-    def __init__(self, store, python=None, claude_command=None, code_timeout=60, agent_timeout=240):
+    def __init__(self, store, python=None, claude_command=None, code_timeout=60, agent_timeout=240,
+                 claude_launch_mode="background", claude_permission_mode="auto"):
         self.store = store
         self.python = python or sys.executable
         self.claude_command = claude_command if claude_command is not None else resolve_claude()
         self.code_timeout = code_timeout
         self.agent_timeout = agent_timeout
+        if claude_launch_mode not in {"background", "print"}:
+            raise Problem("Claude 启动模式必须为 background 或 print。")
+        if claude_permission_mode not in {"bypassPermissions", "auto", "acceptEdits", "default", "plan", "dontAsk"}:
+            raise Problem("Claude 权限模式无效。")
+        self.claude_launch_mode = claude_launch_mode
+        self.claude_permission_mode = claude_permission_mode
         self.lock = threading.RLock()
         self.active = {}
         self.runs = {}
@@ -196,6 +266,7 @@ class Engine:
 
     def recover(self):
         # A persisted output is evidence, never proof a new process has its variables.
+        background = []
         for entry in self.store.list():
             doc = self.store.get(entry["id"])
             affected = False
@@ -224,6 +295,11 @@ class Engine:
                 if cell["type"] == "code" and cell["run_ids"]:
                     affected = True
                 if cell["status"] == "running":
+                    latest = self.store.get_run(cell["run_ids"][-1]) if cell["run_ids"] else None
+                    if (latest and cell["type"] == "order" and latest["status"] == "running"
+                            and latest.get("claude_launch_mode") == "background"):
+                        background.append((latest, copy.deepcopy(cell), doc))
+                        continue
                     cell["status"] = "failed"
                     for rid in cell["run_ids"][-1:]:
                         run = self.store.get_run(rid)
@@ -235,6 +311,19 @@ class Engine:
             if affected:
                 doc["revision"] += 1
                 self.store.put(doc)
+        for run, cell, doc in background:
+            rid = run["id"]
+            before = self.store.run_path(rid) / "project-before.json"
+            control = {"run": run, "events": self.events(rid), "cancel": threading.Event(),
+                       "detach": threading.Event(), "condition": threading.Condition(), "process": None,
+                       "output_characters": 0, "stream_events": 0, "resume_background": True,
+                       "project_before": json.loads(before.read_text(encoding="utf-8")) if before.is_file() else None}
+            self.runs[rid] = control
+            self.active[doc["id"]] = rid
+            run.pop("collection_state", None)
+            worker = threading.Thread(target=self._execute, args=(rid, cell, doc), daemon=True)
+            control["thread"] = worker
+            worker.start()
 
     def _revalidate_saved_order(self, run):
         """Correct old protocol-only successes without discarding their evidence."""
@@ -282,7 +371,13 @@ class Engine:
 
     def read_output_file(self, rid, project):
         """Read only the output belonging to a known run, with a bounded payload."""
-        path = self.store.run_path(rid) / "output.md"
+        return self._read_cell_file(rid, project, "output.md", OUTPUT_LIMIT, "输出", "2 MB 显示上限")
+
+    def read_input_file(self, rid, project):
+        return self._read_cell_file(rid, project, "input.md", INPUT_LIMIT * 4, "需求输入", "32000 字符上限", INPUT_LIMIT)
+
+    def _read_cell_file(self, rid, project, filename, byte_limit, label_name, limit_name, character_limit=None):
+        path = self.store.run_path(rid) / filename
         try:
             label = Path(os.path.relpath(path, project)).as_posix()
         except ValueError:
@@ -290,24 +385,39 @@ class Engine:
         info = {"run_id": rid, "path": label, "state": "missing", "sha256": None}
         try:
             if path.is_symlink():
-                info.update(state="unavailable", error="输出文件是符号链接，无法实时读取。")
+                info.update(state="unavailable", error=f"{label_name}文件是符号链接，无法实时读取。")
                 return info, None
             with path.open("rb") as stream:
-                raw = stream.read(OUTPUT_LIMIT + 1)
-            if len(raw) > OUTPUT_LIMIT:
-                info.update(state="unavailable", error="输出文件超过 2 MB 显示上限。")
+                raw = stream.read(byte_limit + 1)
+            if len(raw) > byte_limit:
+                info.update(state="unavailable", error=f"{label_name}文件超过 {limit_name}。")
                 return info, None
             value = raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            if character_limit is not None and len(value) > character_limit:
+                info.update(state="unavailable", error=f"{label_name}文件超过 {limit_name}。")
+                return info, None
             info.update(state="ready", sha256=hashlib.sha256(value.encode("utf-8")).hexdigest())
             return info, value
         except FileNotFoundError:
             return info, None
         except OSError:
-            info.update(state="unavailable", error="输出文件暂时无法读取，正在等待文件恢复。")
+            info.update(state="unavailable", error=f"{label_name}文件暂时无法读取，正在等待文件恢复。")
             return info, None
 
+    def _seed_input_file(self, doc, cell, run):
+        info, value = self.read_input_file(run["id"], doc["project_path"])
+        if (info["state"] == "missing" and not run.get("input_file") and
+                cell.get("file_input", {}).get("run_id") != run["id"]):
+            try:
+                with (self.store.run_path(run["id"]) / "input.md").open("xb") as stream:
+                    stream.write(cell["source"].encode("utf-8"))
+            except (FileExistsError, OSError):
+                pass
+            info, value = self.read_input_file(run["id"], doc["project_path"])
+        return info, value
+
     def sync_output_files(self, notebook_id):
-        """Refresh the notebook's derived cache without changing its editable revision."""
+        """Refresh live input/output caches; source writes are protected by file hashes."""
         with self.lock:
             doc = self.store.get(notebook_id)
             changed = False
@@ -317,6 +427,17 @@ class Engine:
                     continue
                 rid = cell["run_ids"][-1]
                 run = self.get_run(rid)
+                input_info, source = self._seed_input_file(doc, cell, run)
+                if source is not None and source != cell["source"]:
+                    cell.update(source=source, revision=cell["revision"] + 1, updated_at=now())
+                    first_changed = min(first_changed, index)
+                    changed = True
+                elif source is None:
+                    input_info["cached"] = bool(cell["source"])
+                    input_info["cached_sha256"] = hashlib.sha256(cell["source"].encode()).hexdigest()
+                if input_info != cell.get("file_input"):
+                    cell["file_input"] = input_info
+                    changed = True
                 info, value = self.read_output_file(rid, doc["project_path"])
                 previous_info = cell.get("file_output") or {}
                 cache_matches = previous_info.get("run_id") == rid or cell.get("last_run_id") == rid
@@ -354,10 +475,12 @@ class Engine:
     def order_outputs(self, notebook_id, after=""):
         with self.lock:
             doc = self.sync_output_files(notebook_id)
-            cells = [{"id": cell["id"], "outputs": cell["outputs"], "file_output": cell["file_output"]}
+            cells = [{"id": cell["id"], "source": cell["source"], "revision": cell["revision"],
+                      "updated_at": cell["updated_at"], "file_input": cell["file_input"],
+                      "outputs": cell["outputs"], "file_output": cell["file_output"]}
                      for cell in doc["cells"] if cell["type"] == "order" and cell["run_ids"]]
             stale_ids = [cell["id"] for cell in doc["cells"] if cell["stale"]]
-            signature = [[cell["id"], cell["file_output"]] for cell in cells]
+            signature = [[cell["id"], cell["file_input"], cell["revision"], cell["file_output"]] for cell in cells]
             fingerprint = hashlib.sha256(json.dumps([signature, stale_ids], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
             result = {"fingerprint": fingerprint, "changed": fingerprint != after}
             if result["changed"]:
@@ -366,7 +489,7 @@ class Engine:
 
     def open_session(self, notebook_id, cell_id):
         with self.lock:
-            doc = self.store.get(notebook_id)
+            doc = self.sync_output_files(notebook_id)
             cell = next((c for c in doc["cells"] if c["id"] == cell_id), None)
             if not cell:
                 raise Problem("单元不存在。", 404)
@@ -380,15 +503,82 @@ class Engine:
                 raise Problem("未发现 Claude CLI。请安装并登录 Claude Code 后重启服务。", 503)
             # Headless (-p) sessions are excluded from Claude's interactive name search.
             # Resume the exact saved UUID while keeping Session Name as the display label.
-            command = [*self.claude_command, "--resume", session["id"]]
+            command = ([*self.claude_command, "attach", session["background_id"]] if session["background_id"]
+                       else [*self.claude_command, "--resume", session["id"],
+                             "--permission-mode", self.claude_permission_mode])
+            legacy_notice = not run.get("input_file") and cell.get("input_session_synced") != session["id"]
+            if legacy_notice:
+                command.append(
+                    f"本会话新增需求摘要文件：{cell['file_input']['path']}；输出文件：{cell['file_output']['path']}，"
+                    "路径均相对于当前项目目录。此条仅同步文件位置，保留现有文件内容并等待用户的新要求。"
+                    "后续每轮对话结束前，结合新增或变更需求更新 input.md 为当前完整需求摘要，并更新 output.md 的结论。")
             open_claude_terminal(command, run["project_path"])
+            if legacy_notice:
+                cell["input_session_synced"] = session["id"]
+                self.store.put(doc)
             return {"session_name": session["name"]}
 
     def save(self, notebook_id, payload):
         with self.lock:
-            if notebook_id in self.active:
-                raise Problem("请等待或停止当前执行后再编辑。", 409)
-            doc = editable_document(self.store.get(notebook_id), payload)
+            active = self.runs.get(self.active.get(notebook_id))
+            if active and active["run"].get("operation"):
+                raise Problem("请等待或停止当前单元整理后再编辑。", 409)
+            current = self.sync_output_files(notebook_id)
+            incoming = copy.deepcopy(payload)
+            sources = {cell["id"]: cell for cell in current["cells"]}
+            writes = []
+            if isinstance(incoming, dict) and isinstance(incoming.get("cells"), list):
+                for item in incoming["cells"]:
+                    if not isinstance(item, dict):
+                        continue
+                    cell = sources.get(item.get("id"))
+                    if not cell or cell["type"] != "order" or item.get("type") != "order" or not cell.get("file_input"):
+                        continue
+                    if "input_edited" in item and type(item["input_edited"]) is not bool:
+                        raise Problem("input_edited 必须为 true 或 false。")
+                    edited = item.get("input_edited", item.get("source", cell["source"]) != cell["source"])
+                    if not edited:
+                        item["source"] = cell["source"]
+                    elif item.get("source", "") != cell["source"]:
+                        old_info = item.get("file_input")
+                        expected = item.get("input_file_sha256", old_info.get("sha256") if isinstance(old_info, dict) else None)
+                        info = cell["file_input"]
+                        if info["state"] == "unavailable" or expected != info["sha256"]:
+                            raise Problem("需求文件已更新或暂时不可读，请选择使用文件版本或保留编辑后再保存。", 409)
+                        writes.append((cell, item.get("source", ""), info["sha256"]))
+            doc = editable_document(current, incoming)
+            editable_fields = ("title", "source", "expected_output", "context_note", "mode", "output_format")
+            if active:
+                if [(cell["id"], cell["type"]) for cell in doc["cells"]] != [
+                        (cell["id"], cell["type"]) for cell in current["cells"]]:
+                    raise Problem("执行期间可以编辑其他单元的内容，但不能增删、移动或转换单元。", 409)
+                active_id = active["run"]["cell_id"]
+                before = next(cell for cell in current["cells"] if cell["id"] == active_id)
+                after = next(cell for cell in doc["cells"] if cell["id"] == active_id)
+                if any(before[field] != after[field] for field in editable_fields):
+                    raise Problem("正在执行的单元使用固定输入快照；请编辑其他单元，或先停止当前执行。", 409)
+                active_index = next(index for index, cell in enumerate(current["cells"])
+                                    if cell["id"] == active_id)
+                changed_indices = [index for index, (old, new) in enumerate(zip(current["cells"], doc["cells"]))
+                                   if any(old[field] != new[field] for field in editable_fields)]
+                if changed_indices and min(changed_indices) < active_index:
+                    active["upstream_changed"] = True
+            for cell, value, expected in writes:
+                info, _ = self.read_input_file(cell["run_ids"][-1], current["project_path"])
+                if info["state"] == "unavailable" or info["sha256"] != expected:
+                    raise Problem("需求文件在保存期间发生变化，请重新检查后保存。", 409)
+                path = self.store.run_path(cell["run_ids"][-1]) / "input.md"
+                temporary = path.with_name(f".input-{uid()}.tmp")
+                try:
+                    temporary.write_bytes(value.encode("utf-8"))
+                    info, _ = self.read_input_file(cell["run_ids"][-1], current["project_path"])
+                    if info["state"] == "unavailable" or info["sha256"] != expected:
+                        raise Problem("需求文件在保存期间发生变化，请重新检查后保存。", 409)
+                    os.replace(temporary, path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                updated = next(item for item in doc["cells"] if item["id"] == cell["id"])
+                updated["file_input"] = self.read_input_file(cell["run_ids"][-1], current["project_path"])[0]
             self.store.put(doc)
             return self.document(notebook_id)
 
@@ -421,7 +611,8 @@ class Engine:
         except ValueError as exc:
             raise Problem("项目与证据目录不在同一驱动器，无法生成相对输出路径；请调整 --data-dir。") from exc
         run_info = {"run_id": rid, "session_name": f"ID{rid}", "run_dir": relative_folder,
-                    "output_file": f"{relative_folder}/output.md", "prompt_file": f".castle/prompts/input{rid}.md"}
+                    "input_file": f"{relative_folder}/input.md", "output_file": f"{relative_folder}/output.md",
+                    "prompt_file": f".castle/prompts/input{rid}.md"}
         return pack_context(doc, cell_id, self.runtime(doc["id"])["variables"],
                             load_context_config(doc["project_path"]),
                             scan_project(doc["project_path"], excluded=(self.store.path,)), run_info)
@@ -498,6 +689,10 @@ class Engine:
             run["session_name"] = context["run"]["session_name"]
             run["run_dir"] = context["run"]["run_dir"]
             run["output_file"] = context["run"]["output_file"]
+            run["input_file"] = context["run"]["input_file"]
+            source_bytes = cell["source"].encode("utf-8")
+            (folder / "input.md").write_bytes(source_bytes)
+            run["initial_input_sha256"] = hashlib.sha256(source_bytes).hexdigest()
             prompt_file = Path(doc["project_path"]) / context["run"]["prompt_file"]
             prompt_file.parent.mkdir(parents=True, exist_ok=True)
             prompt_file.write_bytes(prompt_bytes)
@@ -508,7 +703,7 @@ class Engine:
     def _start_run(self, doc, cell, rid, context, before, operation=None):
         run = self._prepare_run(doc, cell, rid, context, before)
         self.pending_contexts.pop((doc["id"], cell["id"]), None)
-        control = {"run": run, "events": [], "cancel": threading.Event(), "condition": threading.Condition(),
+        control = {"run": run, "events": [], "cancel": threading.Event(), "detach": threading.Event(), "condition": threading.Condition(),
                    "process": None, "output_characters": 0, "stream_events": 0, "project_before": before}
         self.runs[rid] = control
         self.active[doc["id"]] = rid
@@ -523,6 +718,7 @@ class Engine:
             cell["run_ids"].append(rid)
         doc["revision"] += 1
         doc["updated_at"] = now()
+        run["document_revision"] = doc["revision"]
         self.store.put_run(run)
         self.store.put(doc)
         self.emit(rid, "status", {"status": "running", "message": "输入快照已保存，开始执行。"})
@@ -538,7 +734,7 @@ class Engine:
             raise Problem("整理期间文档或 Global 已更新，原单元已保留，请重新整理。", 409)
         current = {cell["id"]: cell for cell in doc["cells"]}
         if any(current.get(cell["id"]) != cell for cell in operation["sources"]):
-            raise Problem("整理期间原单元或 output.md 已变化，原单元已保留，请重新整理。", 409)
+            raise Problem("整理期间原单元、input.md 或 output.md 已变化，原单元已保留，请重新整理。", 409)
         return doc
 
     def _apply_operation(self, control):
@@ -567,7 +763,8 @@ class Engine:
                         "这轮只建立拆分后的独立会话，不执行上述指令，不修改任何文件。请仅回复已确认。\n"
                         "本会话已从原 Order 拆分，完整历史仅供参考。以本文件中的当前单元指令和预期输出为准。\n"
                         f"本会话当前输入文件：{context['run']['prompt_file']}\n"
-                        f"此后每轮对话只更新本单元的输出文件：{context['run']['output_file']}\n"
+                        f"此后每轮对话更新本单元的需求摘要文件：{context['run']['input_file']}\n"
+                        f"此后每轮对话更新本单元的输出文件：{context['run']['output_file']}\n"
                         "历史中的其他输入/输出路径已失效，不得继续更新原单元或另一个拆分单元的文件。\n"
                         f"当前已有结论（本轮保持不变）：\n{output_summary(cell['outputs'], OUTPUT_LIMIT + 100000)}\n"
                     )
@@ -575,7 +772,7 @@ class Engine:
                 child = self._prepare_run(candidate, cell, rid, context)
                 child.update(derived=True, operation_run_id=run["id"],
                              source_cell_ids=[source["id"] for source in sources])
-                child_control = {"run": child, "events": [], "cancel": control["cancel"],
+                child_control = {"run": child, "events": [], "cancel": control["cancel"], "detach": control["detach"],
                                  "condition": threading.Condition(), "process": None, "owner": control,
                                  "output_characters": 0, "stream_events": 0}
                 with self.lock:
@@ -606,6 +803,7 @@ class Engine:
                     child.pop("session_name", None)
                 # Session setup must never replace the Agent's reorganized conclusion.
                 Path(child["artifact"]).write_text(output_text, encoding="utf-8")
+                (self.store.run_path(rid) / "input.md").write_bytes(cell["source"].encode("utf-8"))
                 child.update(status="succeeded", outputs=output, finished_at=now(),
                              duration_ms=round((time.monotonic() - began) * 1000),
                              output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
@@ -683,14 +881,22 @@ class Engine:
             outcome = "succeeded" if succeeded else "failed"
         except BaseException as exc:
             outcome = "cancelled" if control["cancel"].is_set() else "failed"
-            run["error"] = str(exc) or type(exc).__name__
-            self.emit(rid, "log", {"text": run["error"]})
+            if not control["detach"].is_set():
+                run["error"] = str(exc) or type(exc).__name__
+                self.emit(rid, "log", {"text": run["error"]})
             if kernel:
                 reset = True
                 kernel.close()
             else:
                 terminate_tree(control["process"])
         finally:
+            if control["detach"].is_set() and run.get("claude_launch_mode") == "background" and not control["cancel"].is_set():
+                with self.lock:
+                    run["collection_state"] = "detached"
+                    self.store.put_run(run)
+                    self.active.pop(doc["id"], None)
+                    self.emit(rid, "detached", {"message": "Notebook 已停止收集，Claude 后台对话继续保留；重启服务后继续收集。"})
+                return
             if control["project_before"] is not None:
                 try:
                     after = snapshot_project(doc["project_path"], excluded=(self.store.path,))
@@ -740,7 +946,7 @@ class Engine:
                 upstream_changed = bool(control.get("upstream_changed"))
                 run["stale"] = bool(reset or global_changed or upstream_changed)
                 run["stale_reason"] = ("Global 在执行期间发生变化。" if global_changed else
-                                       "上游 output.md 在执行期间发生变化。" if upstream_changed else
+                                       "上游单元或其 input.md / output.md 在执行期间发生变化。" if upstream_changed else
                                        "Python 内核已重置。" if reset else None)
                 seen = reset
                 for item in saved["cells"]:
@@ -762,13 +968,17 @@ class Engine:
                 self.emit(rid, "finished", {"status": run["status"], "duration_ms": run["duration_ms"], "error": run["error"], "stale": run["stale"], "stale_reason": run["stale_reason"]})
 
     def _claude(self, control, cell, doc, emit, use_output_file=True):
+        if self.claude_launch_mode == "background" or control.get("resume_background"):
+            from .claude_background import execute
+            return execute(self, control, cell, doc, emit, use_output_file)
         run = control["run"]
         args = [*self.claude_command, "-p", run["invocation_prompt"], "-n", run["session_name"],
+                "--permission-mode", self.claude_permission_mode,
                 "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
         if run.get("resume_session_id"):
             args.extend(["--resume", run["resume_session_id"], "--fork-session"])
-        run["command"] = args
-        emit("log", {"text": f"Claude · 会话 ID{run['id']} · 使用本机配置"})
+        run.update(command=args, claude_launch_mode="print", requested_permission_mode=self.claude_permission_mode)
+        emit("log", {"text": f"Claude · 会话 ID{run['id']} · 权限 {self.claude_permission_mode}"})
         process = subprocess.Popen(args, cwd=doc["project_path"], stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, encoding="utf-8", errors="replace",
@@ -812,6 +1022,7 @@ class Engine:
                 run["session_id"] = event.get("session_id")
                 run["provider_model"] = event.get("model")
                 run["provider_tools"] = event.get("tools", [])
+                run["provider_permission_mode"] = event.get("permissionMode")
                 emit("log", {"text": f"模型：{event.get('model', '未知')} · 可用工具：{', '.join(event.get('tools', [])) or '无'}"})
             elif kind == "stream_event":
                 nested = event.get("event", {})
@@ -842,6 +1053,12 @@ class Engine:
         exit_code = process.wait(timeout=5)
         if not final:
             raise Problem(f"Claude 未返回最终结果（退出码 {exit_code}）。{short(stderr, 1000)} 请检查 claude auth status。")
+        return self._finish_claude(control, cell, doc, emit, final, exit_code, stderr,
+                                   pending_tools, last_stop_reason, use_output_file)
+
+    def _finish_claude(self, control, cell, doc, emit, final, exit_code, stderr,
+                       pending_tools, last_stop_reason, use_output_file):
+        run = control["run"]
         run["provider_result"] = {k: final[k] for k in ("session_id", "num_turns", "total_cost_usd", "usage", "subtype", "permission_denials", "stop_reason", "is_error") if k in final}
         run["session_id"] = final.get("session_id") or run.get("session_id")
         answer = final.get("result")
@@ -867,7 +1084,8 @@ class Engine:
         if pending_tools or stop_reason in {"tool_use", "max_tokens", "pause_turn"}:
             raise Problem(f"模型尚未完成最终回答（停止原因：{stop_reason or '工具调用未返回'}），原始输出已保留。")
         if final.get("permission_denials"):
-            emit("log", {"text": "Claude 记录了工具权限拒绝；最终状态沿用 CLI 的结果，详情见运行元数据。"})
+            names = ", ".join(dict.fromkeys(item.get("tool_name", "未知") for item in final["permission_denials"]))
+            raise Problem(f"Claude 工具权限被拒绝（{names}），本次任务未完整执行；原始输出已保留。请检查权限模式或打开对话处理。")
         validate_order_output(answer, cell["output_format"])
         return True
 
@@ -929,7 +1147,11 @@ class Engine:
     def close(self):
         for rid in list(self.active.values()):
             try:
-                self.cancel(rid)
+                control = self.runs[rid]
+                if control["run"].get("claude_launch_mode") == "background" or self.claude_launch_mode == "background" and control["run"]["cell_type"] == "order":
+                    control["detach"].set()
+                else:
+                    self.cancel(rid)
             except Problem:
                 pass
         for control in list(self.runs.values()):

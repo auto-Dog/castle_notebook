@@ -35,7 +35,7 @@ class CellOperationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.project = Path(self.temp.name)
         self.store = Store(self.project / ".castle")
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         self.doc = new_notebook(self.project)
         self.store.put(self.doc)
 
@@ -86,6 +86,7 @@ class CellOperationTests(unittest.TestCase):
         self.assertFalse(doc["cells"][0]["stale"])
         self.assertTrue(set(merged["run_ids"]).isdisjoint({run["id"] for run in originals}))
         derived = self.engine.get_run(merged["last_run_id"])
+        self.assertEqual((self.project / derived["input_file"]).read_text(encoding="utf-8"), merged["source"])
         prompt = Path(derived["prompt_file"]).read_bytes()
         self.assertIn(merged["source"], prompt.decode("utf-8"))
         self.assertEqual(prompt, (self.store.run_path(derived["id"]) / "context.md").read_bytes())
@@ -120,28 +121,33 @@ class CellOperationTests(unittest.TestCase):
             self.assertEqual(run["command"][run["command"].index("--resume") + 1], original["session"]["id"])
             self.assertIn("--fork-session", run["command"])
             self.assertIn(run["output_file"], Path(run["prompt_file"]).read_text(encoding="utf-8"))
+            self.assertIn(run["input_file"], Path(run["prompt_file"]).read_text(encoding="utf-8"))
+            self.assertEqual((self.project / run["input_file"]).read_text(encoding="utf-8"), child["source"])
             self.assertIn(child["source"], Path(run["prompt_file"]).read_text(encoding="utf-8"))
             self.assertEqual(child["outputs"], original["outputs"])
         Path(runs[0]["artifact"]).write_text("只更新第一份对话的结论", encoding="utf-8")
+        (self.project / runs[0]["input_file"]).write_text("只调整第一份对话的需求", encoding="utf-8")
         doc = self.engine.document(self.doc["id"])
+        self.assertEqual(doc["cells"][0]["source"], "只调整第一份对话的需求")
+        self.assertEqual(doc["cells"][1]["source"], children[1]["source"])
         self.assertEqual(doc["cells"][0]["outputs"][0]["text"], "只更新第一份对话的结论")
         self.assertEqual(doc["cells"][1]["outputs"], original["outputs"])
         self.assertEqual(Path(original_run["artifact"]).read_bytes(), original_output)
         self.engine.close()
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         doc = self.engine.document(doc["id"])
         with patch("castle_notebook.execution.open_claude_terminal") as terminal:
             for child, run in zip(doc["cells"][:2], runs):
                 self.assertTrue(child["session"]["available"])
                 self.engine.open_session(doc["id"], child["id"])
-                self.assertEqual(terminal.call_args.args, ([*FAKE, "--resume", run["session_id"]], str(self.project)))
+                self.assertEqual(terminal.call_args.args, ([*FAKE, "--resume", run["session_id"], "--permission-mode", "auto"], str(self.project)))
 
     def test_split_unrun_cell_has_two_saved_inputs_without_inventing_a_dialogue_or_output(self):
         source = self.add()
         result = wait_run(self.engine, self.transform(source, "split")["id"])
         self.assertEqual(result["status"], "succeeded", result["error"])
         self.engine.close()
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         doc = self.engine.document(self.doc["id"])
         self.assertEqual(len(doc["cells"]), 2)
         for cell in doc["cells"]:
@@ -246,7 +252,7 @@ class CellOperationTests(unittest.TestCase):
         result.update(status="running", finished_at=None)
         result.pop("applied_cell_ids")
         self.store.put_run(result)
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         recovered = self.engine.get_run(result["id"])
         self.assertEqual(recovered["status"], "succeeded")
         self.assertEqual(len(recovered["applied_cell_ids"]), 2)
@@ -269,7 +275,7 @@ class CellOperationTests(unittest.TestCase):
 class CellOperationHTTPTests(unittest.TestCase):
     def test_http_operations_require_token_and_revision_and_publish_completion_events(self):
         with tempfile.TemporaryDirectory() as folder:
-            app = App(folder, claude_command=FAKE, seed=False)
+            app = App(folder, claude_command=FAKE, seed=False, claude_launch_mode="print")
             server = Server(("127.0.0.1", 0), app)
             threading.Thread(target=server.serve_forever, daemon=True).start()
 

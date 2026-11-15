@@ -20,14 +20,16 @@ STATIC = Path(__file__).with_name("static")
 
 class App:
     def __init__(self, project, data_dir=None, python=None, claude_command=None,
-                 seed=True, code_timeout=60, agent_timeout=240):
+                 seed=True, code_timeout=60, agent_timeout=240,
+                 claude_launch_mode="background", claude_permission_mode="auto"):
         self.project = Path(project).resolve()
         if not self.project.is_dir():
             raise Problem("项目目录不存在。")
         self.token = secrets.token_urlsafe(32)
         self.store = Store(data_dir or self.project / ".castle")
         self.context_config_path = ensure_context_config(self.project)
-        self.engine = Engine(self.store, python, claude_command, code_timeout, agent_timeout)
+        self.engine = Engine(self.store, python, claude_command, code_timeout, agent_timeout,
+                             claude_launch_mode, claude_permission_mode)
         if seed and not self.store.list():
             self.store.put(new_notebook(self.project, template="quant"))
 
@@ -148,6 +150,8 @@ class Handler(BaseHTTPRequestHandler):
                               "context_config_path": str(self.app.context_config_path),
                               "capabilities": {"claude": bool(self.app.engine.claude_command),
                                                "python": self.app.engine.python,
+                                               "claude_launch_mode": self.app.engine.claude_launch_mode,
+                                               "claude_permission_mode": self.app.engine.claude_permission_mode,
                                                "code_timeout": self.app.engine.code_timeout,
                                                "agent_timeout": self.app.engine.agent_timeout}})
         if parts == ["api", "notebooks"]:
@@ -229,7 +233,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.stream_events(rid, after)
                 if parts[3] == "artifact" and method == "GET":
                     name = query.get("name", ["output"])[0]
-                    filenames = {"output": "output.md", "context": "context.md", "run": "run.json", "events": "events.jsonl",
+                    filenames = {"input": "input.md", "output": "output.md", "context": "context.md", "run": "run.json", "events": "events.jsonl",
                                  "changes": "changes.json", "project-before": "project-before.json", "project-after": "project-after.json"}
                     if name not in filenames:
                         raise Problem("找不到该产物。", 404)
@@ -290,16 +294,22 @@ def main():
     parser.add_argument("--data-dir", help="Notebook 与运行证据的存储目录，默认 <project>/.castle")
     parser.add_argument("--python", default=sys.executable, help="Python 内核解释器，可指定研究环境")
     parser.add_argument("--claude", help="Claude 可执行文件或 npm cli.js 路径")
+    parser.add_argument("--claude-launch-mode", choices=("background", "print"), default="background",
+                        help="Claude 启动模式：原生后台（默认，可在 claude agents 查看）或非交互流式")
+    parser.add_argument("--claude-permission-mode", default="auto",
+                        choices=("bypassPermissions", "auto", "acceptEdits", "default", "plan", "dontAsk"),
+                        help="Claude 权限模式，默认 auto 自动审批；需要处理时可进入后台对话")
     parser.add_argument("--empty", action="store_true", help="不创建首次启动示例")
     parser.add_argument("--code-timeout", type=int, default=60)
-    parser.add_argument("--agent-timeout", type=int, default=240)
+    parser.add_argument("--agent-timeout", type=int, default=240, help="print 模式 Claude 执行秒数上限；原生后台会话不设执行期限")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.code_timeout <= 3600 or not 1 <= args.agent_timeout <= 3600:
         parser.error("端口必须为 1–65535，超时必须为 1–3600 秒。")
     if args.claude and not resolve_claude(args.claude):
         parser.error("无法解析 Claude 可执行文件；请直接指定 .exe、Unix executable 或 cli.js。")
     app = App(args.project, args.data_dir, args.python, resolve_claude(args.claude),
-              not args.empty, args.code_timeout, args.agent_timeout)
+              not args.empty, args.code_timeout, args.agent_timeout,
+              args.claude_launch_mode, args.claude_permission_mode)
     try:
         server = Server(("127.0.0.1", args.port), app)
     except OSError as exc:

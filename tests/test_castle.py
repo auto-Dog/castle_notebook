@@ -18,7 +18,8 @@ from castle_notebook.core import (MAX_CONTEXT, Problem, Store, default_context_c
                                  initialization_notebook, new_cell, new_notebook,
                                  pack_context, parse_json_output, project_changes, read_project_file,
                                  scan_project, snapshot_project, validate_order_output)
-from castle_notebook.execution import Engine, spawn_options
+from castle_notebook.execution import (Engine, linux_terminal_command, open_claude_terminal,
+                                       resolve_claude, spawn_options)
 from castle_notebook.server import App, Server
 
 FAKE = [sys.executable, str(Path(__file__).with_name("fake_claude.py"))]
@@ -32,6 +33,54 @@ def wait_run(engine, rid, timeout=12):
             return result
         time.sleep(0.02)
     raise AssertionError(f"run {rid} did not finish")
+
+
+class PlatformTests(unittest.TestCase):
+    def test_resolve_claude_accepts_a_command_name_from_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            executable = Path(folder) / "claude"
+            executable.write_text("fixture", encoding="utf-8")
+            with patch("castle_notebook.execution.shutil.which", return_value=str(executable)):
+                self.assertEqual(resolve_claude("claude"), [str(executable)])
+
+    def test_linux_terminal_command_finds_an_emulator_and_preserves_argv(self):
+        command = ["/home/research/.local/bin/claude", "--resume", "session with spaces"]
+
+        def locate(name):
+            return "/usr/bin/gnome-terminal" if name == "gnome-terminal" else None
+
+        with patch.dict("castle_notebook.execution.os.environ", {}, clear=True):
+            with patch("castle_notebook.execution.shutil.which", side_effect=locate):
+                launcher = linux_terminal_command(command)
+        self.assertEqual(launcher, ["/usr/bin/gnome-terminal", "--", *command])
+
+    def test_linux_terminal_command_honors_configured_terminal_options(self):
+        command = ["claude", "--resume", "abc"]
+        with patch.dict("castle_notebook.execution.os.environ", {"TERMINAL": "konsole --new-tab"}, clear=True):
+            with patch("castle_notebook.execution.shutil.which", return_value="/usr/bin/konsole"):
+                launcher = linux_terminal_command(command)
+        self.assertEqual(launcher, ["/usr/bin/konsole", "--new-tab", "-e", *command])
+
+    def test_open_claude_terminal_launches_linux_emulator_in_project(self):
+        command = ["claude", "--resume", "abc"]
+        launcher = ["/usr/bin/x-terminal-emulator", "-e", *command]
+        with patch("castle_notebook.execution.os.name", "posix"), \
+                patch("castle_notebook.execution.sys.platform", "linux"), \
+                patch("castle_notebook.execution.linux_terminal_command", return_value=launcher), \
+                patch("castle_notebook.execution.subprocess.Popen") as popen, \
+                patch("castle_notebook.execution.threading.Thread") as thread:
+            open_claude_terminal(command, "/work/project")
+        popen.assert_called_once_with(launcher, cwd="/work/project", start_new_session=True)
+        thread.assert_called_once_with(target=popen.return_value.wait, daemon=True)
+        thread.return_value.start.assert_called_once_with()
+
+    def test_open_claude_terminal_reports_missing_linux_emulator(self):
+        with patch("castle_notebook.execution.os.name", "posix"), \
+                patch("castle_notebook.execution.sys.platform", "linux"), \
+                patch("castle_notebook.execution.linux_terminal_command", return_value=None):
+            with self.assertRaisesRegex(Problem, "找不到可用的 Linux 终端") as error:
+                open_claude_terminal(["claude", "--resume", "abc"], "/work/project")
+        self.assertEqual(error.exception.status, 503)
 
 
 class CoreTests(unittest.TestCase):
@@ -274,9 +323,9 @@ class CoreTests(unittest.TestCase):
             config = {"features": {"instructions": False}, "templates": {"prompt": "LEGACY {current_step}"}}
             result = pack_context(doc, cell["id"], config=config)
             self.assertIn(str(root.resolve()), result["prompt"])
-            self.assertIn("project_model.py", result["prompt"])
-            self.assertIn("直接修改项目内相应源码和测试", result["prompt"])
-            self.assertIn("只读分析、规划或初始化", result["prompt"])
+            self.assertIn("project_model.py", result["project"]["files"])
+            self.assertIn("项目源码、测试和数据文件是实际工作对象", result["prompt"])
+            self.assertIn("Python 单元与代理使用同一项目目录", result["prompt"])
             self.assertIn("LEGACY", result["prompt"])
             self.assertEqual(result["project"]["project_path"], str(root.resolve()))
             config["templates"]["prompt"] = "{project}CUSTOM {current_step}"
@@ -323,7 +372,7 @@ class EngineTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.project = Path(self.temp.name)
         self.store = Store(self.project / ".castle")
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         self.doc = new_notebook(self.project)
         self.store.put(self.doc)
 
@@ -589,7 +638,7 @@ class EngineTests(unittest.TestCase):
         self.assertIn("tool_result", [e["type"] for e in events])
         self.assertEqual(run["provider_model"], "fixture-model")
         self.assertEqual(run["command"][len(FAKE):], ["-p", run["invocation_prompt"], "-n", f"ID{run['id']}",
-                         "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
+                         "--permission-mode", "auto", "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
         self.assertNotIn("--dangerously-skip-permissions", run["command"])
 
     def test_model_written_output_file_is_canonical_and_never_overwritten(self):
@@ -698,7 +747,7 @@ class EngineTests(unittest.TestCase):
         run = wait_run(self.engine, started["id"])
         self.assertEqual(run["status"], "succeeded")
         self.assertTrue(run["stale"])
-        self.assertIn("上游 output.md", run["stale_reason"])
+        self.assertIn("output.md", run["stale_reason"])
         next_cell = self.add("order", "Review latest evidence")
         context = self.engine.context(self.doc["id"], next_cell["id"])
         self.assertIn("UPDATED_UPSTREAM_EVIDENCE", context["prompt"])
@@ -771,7 +820,7 @@ class EngineTests(unittest.TestCase):
     def test_custom_output_path_placeholders_use_custom_data_directory(self):
         self.engine.close()
         self.store = Store(self.project / "separate evidence with spaces")
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         self.store.put(self.doc)
         config = {"templates": {"invocation": "Read {prompt_file}\nRun: {run_dir}\nOutput: {output_file}"}}
         ensure_context_config(self.project).write_text(json.dumps(config), encoding="utf-8")
@@ -798,7 +847,7 @@ class EngineTests(unittest.TestCase):
         workspace = self.project / "workspace"
         workspace.mkdir()
         self.store = Store(self.project / "evidence")
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         self.doc = new_notebook(workspace)
         self.store.put(self.doc)
         run = self.execute(self.add("order", "Inspect evidence"))
@@ -842,7 +891,7 @@ class EngineTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 run = self.execute(self.add("order", "FAKE_JSON", "json", mode=mode))
                 self.assertEqual(run["status"], "succeeded")
-                for flag in ("--tools", "--permission-mode", "--strict-mcp-config", "--system-prompt",
+                for flag in ("--tools", "--strict-mcp-config", "--system-prompt",
                              "--mcp-config", "--disable-slash-commands", "--max-turns", "--no-session-persistence"):
                     self.assertNotIn(flag, run["command"])
 
@@ -854,7 +903,7 @@ class EngineTests(unittest.TestCase):
         self.assertNotEqual(first["session_id"], latest["session_id"])
         self.assertEqual(latest["session_name"], f"ID{latest['id']}")
         before = self.store.get(self.doc["id"])
-        restored = Engine(self.store, claude_command=FAKE)
+        restored = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         try:
             session = restored.document(self.doc["id"])["cells"][-1]["session"]
             self.assertTrue(session["available"])
@@ -862,7 +911,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(session["id"], latest["session_id"])
             with patch("castle_notebook.execution.open_claude_terminal") as launch:
                 result = restored.open_session(self.doc["id"], cell["id"])
-            launch.assert_called_once_with([*FAKE, "--resume", latest["session_id"]], str(self.project))
+            launch.assert_called_once_with([*FAKE, "--resume", latest["session_id"], "--permission-mode", "auto"], str(self.project))
             self.assertEqual(result, {"session_name": latest["session_name"]})
             self.assertEqual(self.store.get(self.doc["id"]), before)
             self.assertEqual(self.store.get_run(latest["id"]), latest)
@@ -903,7 +952,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(self.engine.document(self.doc["id"])["cells"][-1]["session"]["available"])
         with patch("castle_notebook.execution.open_claude_terminal") as launch:
             self.engine.open_session(self.doc["id"], cell["id"])
-        launch.assert_called_once_with([*FAKE, "--resume", session_id], str(self.project))
+        launch.assert_called_once_with([*FAKE, "--resume", session_id, "--permission-mode", "auto"], str(self.project))
 
     def test_old_session_metadata_uses_command_but_rejects_disabled_persistence(self):
         cell = self.add("order", "Inspect evidence")
@@ -911,11 +960,11 @@ class EngineTests(unittest.TestCase):
         name = run.pop("session_name")
         session_id = run.pop("session_id")
         self.store.put_run(run)
-        restored = Engine(self.store, claude_command=FAKE)
+        restored = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         try:
             with patch("castle_notebook.execution.open_claude_terminal") as launch:
                 restored.open_session(self.doc["id"], cell["id"])
-                launch.assert_called_once_with([*FAKE, "--resume", session_id], str(self.project))
+                launch.assert_called_once_with([*FAKE, "--resume", session_id, "--permission-mode", "auto"], str(self.project))
                 self.assertEqual(restored.document(self.doc["id"])["cells"][-1]["session"]["name"], name)
                 launch.reset_mock()
                 run["command"].append("--no-session-persistence")
@@ -966,9 +1015,11 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(run["status"], "failed")
                 self.assertIn(error, run["error"])
 
-    def test_native_permission_fallback_keeps_cli_final_status(self):
+    def test_permission_denials_fail_and_preserve_the_original_answer(self):
         run = self.execute(self.add("order", "FAKE_DENIED_TOOL"))
-        self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(run["status"], "failed")
+        self.assertIn("权限被拒绝", run["error"])
+        self.assertTrue(run["outputs"])
         self.assertEqual(run["provider_result"]["permission_denials"], [{"tool_name": "Read"}])
 
     def test_recovery_corrects_old_protocol_success_with_audit_and_downstream_invalidation(self):
@@ -981,7 +1032,7 @@ class EngineTests(unittest.TestCase):
         doc["cells"][0].update(status="succeeded", last_error=None)
         self.store.put(doc)
         raw_before = Path(failed["artifact"]).read_bytes()
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         corrected = self.engine.get_run(failed["id"])
         self.assertEqual(corrected["status"], "failed")
         self.assertEqual(corrected["validation"]["previous_status"], "succeeded")
@@ -996,7 +1047,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(events[-2]["type"], "validation")
         self.assertEqual(events[-1]["data"]["status"], "failed")
         self.engine.close()
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         self.assertEqual(self.engine.events(failed["id"]), events)
 
     def test_contract_and_missing_provider_fail_before_run(self):
@@ -1014,15 +1065,43 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(error.exception.status, 503)
         self.assertEqual(self.engine.active, {})
 
-    def test_serial_execution_and_edit_conflicts(self):
-        cell = self.add("code", "import time\ntime.sleep(5)")
+    def test_serial_execution_locks_running_cell_but_allows_other_cell_edits(self):
+        upstream = self.add("code", "value = 1")
+        cell = self.add("order", "FAKE_FILE_WAIT")
+        downstream = self.add("code", "next_value = 1")
         run = self.engine.start(self.doc["id"], cell["id"])
+        self.assertEqual(run["document_revision"], self.store.get(self.doc["id"])["revision"])
         with self.assertRaises(Problem):
             self.engine.start(self.doc["id"], cell["id"])
-        with self.assertRaises(Problem):
-            self.engine.save(self.doc["id"], self.store.get(self.doc["id"]))
-        self.engine.cancel(run["id"])
-        self.assertEqual(wait_run(self.engine, run["id"])["status"], "cancelled")
+
+        payload = self.engine.document(self.doc["id"])
+        payload["cells"][0]["source"] = "value = 2"
+        payload["cells"][2]["source"] = "next_value = 2"
+        saved = self.engine.save(self.doc["id"], payload)
+        self.assertEqual(saved["cells"][0]["source"], "value = 2")
+        self.assertEqual(saved["cells"][2]["source"], "next_value = 2")
+        self.assertEqual(saved["runtime"]["active_run_id"], run["id"])
+
+        protected = copy.deepcopy(saved)
+        protected["cells"][1]["source"] = "change the running input"
+        with self.assertRaises(Problem) as running_edit:
+            self.engine.save(self.doc["id"], protected)
+        self.assertEqual(running_edit.exception.status, 409)
+
+        reordered = copy.deepcopy(saved)
+        reordered["cells"].reverse()
+        with self.assertRaises(Problem) as structural_edit:
+            self.engine.save(self.doc["id"], reordered)
+        self.assertEqual(structural_edit.exception.status, 409)
+
+        result = wait_run(self.engine, run["id"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(result["stale"])
+        self.assertIn("上游单元", result["stale_reason"])
+        final = self.engine.document(self.doc["id"])
+        self.assertEqual(final["cells"][0]["source"], "value = 2")
+        self.assertEqual(final["cells"][1]["source"], cell["source"])
+        self.assertEqual(final["cells"][2]["source"], "next_value = 2")
 
     def test_global_is_editable_during_run_without_changing_snapshot(self):
         cell = self.add("code", "import time\ntime.sleep(.5)\nx=42")
@@ -1090,7 +1169,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(doc["cells"][0]["stale"])
         self.execute(cell)
         self.engine.close()
-        self.engine = Engine(self.store, claude_command=FAKE)
+        self.engine = Engine(self.store, claude_command=FAKE, claude_launch_mode="print")
         self.assertEqual(self.engine.runtime(doc["id"])["state"], "cold")
         self.assertTrue(self.store.get(doc["id"])["cells"][0]["stale"])
         self.assertEqual(self.engine.get_run(run["id"])["status"], "succeeded")
@@ -1123,7 +1202,7 @@ class HTTPTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
-        cls.app = App(cls.temp.name, claude_command=FAKE, seed=False)
+        cls.app = App(cls.temp.name, claude_command=FAKE, seed=False, claude_launch_mode="print")
         cls.server = Server(("127.0.0.1", 0), cls.app)
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -1274,7 +1353,7 @@ class HTTPTests(unittest.TestCase):
             status, _, body = self.request("POST", open_path, {"session_name": "other", "session_id": "other", "project_path": "other"})
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(body), {"session_name": run["session_name"]})
-            launch.assert_called_once_with([*FAKE, "--resume", run["session_id"]], self.temp.name)
+            launch.assert_called_once_with([*FAKE, "--resume", run["session_id"], "--permission-mode", "auto"], self.temp.name)
         _, _, body = self.request("GET", endpoint)
         self.assertTrue(json.loads(body)["cells"][-1]["session"]["available"])
 
