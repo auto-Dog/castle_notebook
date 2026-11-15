@@ -189,8 +189,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(read_project_file(doc["project_path"], query.get("path", [""])[0],
                                                    excluded=(self.app.store.path,)))
             if len(parts) == 4 and parts[3] == "export" and method == "GET":
-                doc = self.app.store.get(nid)
+                doc = self.app.engine.sync_output_files(nid)
                 return self.send_bytes(json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"), "application/json; charset=utf-8", filename=f"castle-{doc['id']}.json")
+            if parts[3:] == ["outputs"] and method == "GET":
+                return self.json(self.app.engine.order_outputs(nid, query.get("after", [""])[0]))
             if len(parts) == 4 and parts[3] == "global" and method == "PUT":
                 return self.json(self.app.engine.save_global(nid, self.body()))
             if parts[3:] == ["kernel", "reset"] and method == "POST":
@@ -205,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[5] == "run" and method == "POST":
                     self.body()
                     return self.json(self.app.engine.start(nid, cid), 202)
+                if parts[5] in {"merge", "split"} and method == "POST":
+                    return self.json(self.app.engine.transform_cells(nid, cid, parts[5], self.body()), 202)
                 if parts[5] == "open-session" and method == "POST":
                     self.body()
                     return self.json(self.app.engine.open_session(nid, cid))

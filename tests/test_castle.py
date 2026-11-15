@@ -592,6 +592,117 @@ class EngineTests(unittest.TestCase):
                          "--output-format", "stream-json", "--verbose", "--include-partial-messages"])
         self.assertNotIn("--dangerously-skip-permissions", run["command"])
 
+    def test_model_written_output_file_is_canonical_and_never_overwritten(self):
+        run = self.execute(self.add("order", "FAKE_WRITE_FILE"))
+        self.assertEqual(run["status"], "succeeded")
+        expected = "# 文件正文\n\n**第一版**"
+        self.assertEqual(Path(run["artifact"]).read_text(encoding="utf-8"), expected)
+        self.assertEqual(run["outputs"], [{"kind": "markdown", "text": expected}])
+        self.assertIn("不应覆盖文件", run["cli_output"])
+        self.assertEqual(run["output_source"], "file")
+        self.assertEqual(run["output_sha256"], hashlib.sha256(expected.encode()).hexdigest())
+
+    def test_provider_failure_keeps_written_file_and_reports_cli_error(self):
+        run = self.execute(self.add("order", "FAKE_WRITE_FILE FAKE_FAILURE"))
+        self.assertEqual(run["status"], "failed")
+        self.assertIn("CLI 已完成写入", run["error"])
+        self.assertIn("第一版", Path(run["artifact"]).read_text(encoding="utf-8"))
+        self.assertIn("第一版", run["outputs"][0]["text"])
+
+    def test_json_contract_checks_written_file_instead_of_cli_acknowledgement(self):
+        good = self.execute(self.add("order", "FAKE_WRITE_JSON_FILE", "json"))
+        self.assertEqual(good["status"], "succeeded")
+        self.assertEqual(json.loads(good["outputs"][0]["text"]), {"from_file": True})
+        bad = self.execute(self.add("order", "FAKE_WRITE_BAD_JSON_FILE", "json"))
+        self.assertEqual(bad["status"], "failed")
+        self.assertIn("JSON 契约", bad["error"])
+        self.assertEqual(Path(bad["artifact"]).read_text(encoding="utf-8"), "not valid JSON in file")
+
+    def test_output_file_updates_during_execution_and_after_completion(self):
+        cell = self.add("order", "FAKE_FILE_WAIT")
+        started = self.engine.start(self.doc["id"], cell["id"])
+        path = Path(started["artifact"])
+        deadline = time.monotonic() + 5
+        while not path.is_file() and time.monotonic() < deadline:
+            time.sleep(.02)
+        first = self.engine.order_outputs(self.doc["id"])
+        self.assertEqual(self.engine.get_run(started["id"])["status"], "running")
+        self.assertIn("第一版", first["cells"][0]["outputs"][0]["text"])
+        deadline = time.monotonic() + 4
+        while "第二版" not in path.read_text(encoding="utf-8") and time.monotonic() < deadline:
+            time.sleep(.02)
+        second = self.engine.order_outputs(self.doc["id"], first["fingerprint"])
+        self.assertTrue(second["changed"])
+        self.assertIn("第二版", second["cells"][0]["outputs"][0]["text"])
+        run = wait_run(self.engine, started["id"])
+        self.assertIn("第二版", run["outputs"][0]["text"])
+        path.write_text("# 外部对话更新\n\n第三版", encoding="utf-8")
+        after = self.engine.order_outputs(self.doc["id"], second["fingerprint"])
+        self.assertIn("第三版", after["cells"][0]["outputs"][0]["text"])
+        saved = self.store.get(self.doc["id"])
+        self.assertIn("第三版", saved["cells"][0]["outputs"][0]["text"])
+        # The original run remains an immutable execution record.
+        self.assertEqual(self.engine.get_run(run["id"])["outputs"], run["outputs"])
+
+    def test_live_file_cache_does_not_conflict_with_input_save_and_handles_empty_delete_restore(self):
+        cell = self.add("order", "Inspect evidence")
+        run = self.execute(cell)
+        payload = self.store.get(self.doc["id"])
+        path = Path(run["artifact"])
+        path.write_text("# 最新文件", encoding="utf-8")
+        latest = self.engine.order_outputs(self.doc["id"])
+        self.assertEqual(self.store.get(self.doc["id"])["revision"], payload["revision"])
+        payload["title"] = "Input editing remains available"
+        saved = self.engine.save(self.doc["id"], payload)
+        self.assertEqual(saved["title"], payload["title"])
+        self.assertEqual(saved["cells"][0]["outputs"][0]["text"], "# 最新文件")
+        unchanged = self.engine.order_outputs(self.doc["id"], latest["fingerprint"])
+        self.assertFalse(unchanged["changed"])
+        self.assertNotIn("cells", unchanged)
+        path.write_text("", encoding="utf-8")
+        empty = self.engine.order_outputs(self.doc["id"])
+        self.assertEqual(empty["cells"][0]["outputs"][0]["text"], "")
+        self.assertEqual(empty["cells"][0]["file_output"]["state"], "ready")
+        path.write_text("cached before deletion", encoding="utf-8")
+        self.engine.order_outputs(self.doc["id"])
+        path.unlink()
+        missing = self.engine.order_outputs(self.doc["id"])
+        self.assertEqual(missing["cells"][0]["file_output"]["state"], "missing")
+        self.assertTrue(missing["cells"][0]["file_output"]["cached"])
+        self.assertEqual(missing["cells"][0]["outputs"][0]["text"], "cached before deletion")
+        path.write_bytes(b"\xef\xbb\xbf# restored\r\n")
+        restored = self.engine.order_outputs(self.doc["id"])
+        self.assertEqual(restored["cells"][0]["outputs"][0]["text"], "# restored\n")
+
+    def test_live_output_is_bounded_and_follows_only_latest_run(self):
+        cell = self.add("order", "Inspect evidence")
+        first = self.execute(cell)
+        latest = self.execute(cell)
+        Path(first["artifact"]).write_text("historical file changed", encoding="utf-8")
+        data = self.engine.order_outputs(self.doc["id"])
+        self.assertEqual(data["cells"][0]["file_output"]["run_id"], latest["id"])
+        self.assertNotIn("historical file changed", data["cells"][0]["outputs"][0]["text"])
+        Path(latest["artifact"]).write_text("x" * 100, encoding="utf-8")
+        with patch("castle_notebook.execution.OUTPUT_LIMIT", 32):
+            oversized = self.engine.order_outputs(self.doc["id"])
+        self.assertEqual(oversized["cells"][0]["file_output"]["state"], "unavailable")
+        self.assertIn("上限", oversized["cells"][0]["file_output"]["error"])
+        self.assertEqual(oversized["cells"][0]["outputs"], data["cells"][0]["outputs"])
+
+    def test_external_output_changes_invalidate_downstream_and_refresh_context(self):
+        upstream = self.execute(self.add("order", "Inspect evidence"))
+        downstream = self.add("order", "FAKE_FILE_WAIT")
+        started = self.engine.start(self.doc["id"], downstream["id"])
+        Path(upstream["artifact"]).write_text("UPDATED_UPSTREAM_EVIDENCE", encoding="utf-8")
+        self.engine.order_outputs(self.doc["id"])
+        run = wait_run(self.engine, started["id"])
+        self.assertEqual(run["status"], "succeeded")
+        self.assertTrue(run["stale"])
+        self.assertIn("上游 output.md", run["stale_reason"])
+        next_cell = self.add("order", "Review latest evidence")
+        context = self.engine.context(self.doc["id"], next_cell["id"])
+        self.assertIn("UPDATED_UPSTREAM_EVIDENCE", context["prompt"])
+
     def test_prompt_file_preserves_full_input_without_passing_it_in_command(self):
         source = '中文研究输入："double quotes"、\'single quotes\'、反斜杠 \\、反引号 `、美元符号 $、多行\n第二行 & | < >'
         self.doc["global"]["constraints"] = "Global 中的引号与换行必须完整保留。\nDo not alter input."
@@ -996,6 +1107,17 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(Problem):
             self.engine.apply_init(doc["id"], run["id"])
 
+    def test_initialization_uses_latest_visible_output_file(self):
+        doc = initialization_notebook(scan_project(self.project))
+        self.store.put(doc)
+        run = wait_run(self.engine, self.engine.start(doc["id"], doc["cells"][-1]["id"])["id"])
+        updated = json.loads(Path(run["artifact"]).read_text(encoding="utf-8"))
+        updated["goal"] = "采用文件中的最新目标"
+        Path(run["artifact"]).write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+        applied = self.engine.apply_init(doc["id"], run["id"])
+        self.assertEqual(applied["global"]["goal"], updated["goal"])
+        self.assertNotEqual(json.loads(self.engine.get_run(run["id"])["outputs"][0]["text"])["goal"], updated["goal"])
+
 
 class HTTPTests(unittest.TestCase):
     @classmethod
@@ -1061,6 +1183,40 @@ class HTTPTests(unittest.TestCase):
             self.assertIn("context.json", json.loads(body)["error"])
         finally:
             path.write_bytes(original)
+
+    def test_output_file_polling_export_and_input_save_use_latest_file(self):
+        doc = new_notebook(self.temp.name, "Live output integration")
+        cell = new_cell("order", "File output", "FAKE_WRITE_FILE", "Markdown")
+        doc["cells"].append(cell)
+        self.app.store.put(doc)
+        run = wait_run(self.app.engine, self.app.engine.start(doc["id"], cell["id"])["id"])
+        endpoint = f"/api/notebooks/{doc['id']}"
+        status, _, body = self.request("GET", endpoint + "/outputs")
+        self.assertEqual(status, 200)
+        first = json.loads(body)
+        self.assertIn("第一版", first["cells"][0]["outputs"][0]["text"])
+        self.assertEqual(first["cells"][0]["file_output"]["run_id"], run["id"])
+        status, _, body = self.request("GET", endpoint + "/outputs?after=" + first["fingerprint"])
+        self.assertFalse(json.loads(body)["changed"])
+        _, _, body = self.request("GET", endpoint)
+        editable = json.loads(body)
+        path = Path(run["artifact"])
+        replacement = path.with_suffix(".replacement")
+        replacement.write_text("# HTTP live replacement\n\n| A | B |\n|---|---|\n| 1 | 2 |", encoding="utf-8")
+        replacement.replace(path)
+        status, _, body = self.request("GET", endpoint + "/outputs?after=" + first["fingerprint"])
+        self.assertTrue(json.loads(body)["changed"])
+        self.assertIn("HTTP live replacement", json.loads(body)["cells"][0]["outputs"][0]["text"])
+        editable["title"] = "Edited while file updates"
+        status, _, body = self.request("PUT", endpoint, editable)
+        self.assertEqual(status, 200)
+        self.assertIn("HTTP live replacement", json.loads(body)["cells"][0]["outputs"][0]["text"])
+        path.write_text("# Export reads the file directly", encoding="utf-8")
+        status, _, body = self.request("GET", endpoint + "/export")
+        self.assertEqual(json.loads(body)["cells"][0]["outputs"][0]["text"], "# Export reads the file directly")
+        status, _, body = self.request("GET", f"/api/runs/{run['id']}")
+        self.assertIn("第一版", json.loads(body)["outputs"][0]["text"])
+        self.assertEqual(self.request("GET", "/api/notebooks/invalid/outputs")[0], 404)
 
     def test_csrf_origin_and_dns_rebinding_rejected(self):
         self.assertEqual(self.request("POST", "/api/notebooks", {}, token=False)[0], 403)

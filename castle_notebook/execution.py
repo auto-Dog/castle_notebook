@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -16,7 +17,8 @@ import time
 
 from .core import (Problem, apply_initialization, editable_document, now,
                    load_context_config, output_summary, pack_context, project_changes, scan_project,
-                   short, snapshot_project, uid, validate_order_output)
+                   short, snapshot_project, text_field, uid, validate_order_output)
+from .cell_operations import operation_cell, parse_cells, replace_cells, select_cells
 
 OUTPUT_LIMIT = 2000000
 
@@ -91,6 +93,8 @@ def session_details(run=None):
     session_id = (run.get("session_id") or run.get("provider_result", {}).get("session_id")) if run else None
     if not run or run["cell_type"] != "order":
         reason = "请先运行此 Order 单元，再打开对话。"
+    elif run.get("derived") and not session_id:
+        reason = "此整理单元暂无 AI 对话；运行后可打开新对话。"
     elif run["status"] == "running":
         reason = "请等待或停止本次执行后再打开对话。"
     elif not name or "--no-session-persistence" in command:
@@ -195,6 +199,19 @@ class Engine:
         for entry in self.store.list():
             doc = self.store.get(entry["id"])
             affected = False
+            for rid in doc.get("operation_ids", []):
+                operation = self.store.get_run(rid)
+                if operation["status"] == "running":
+                    applied = [cell["id"] for cell in doc["cells"] if cell.get("operation_run_id") == rid]
+                    operation.update(status="succeeded" if applied else "interrupted", finished_at=now(),
+                                     applied_cell_ids=applied,
+                                     error=None if applied else "服务退出中断了整理；原单元已保留。")
+                    self.store.put_run(operation)
+                    for child_id in operation.get("staged_run_ids", []):
+                        child = self.store.get_run(child_id)
+                        if child["status"] == "running":
+                            child.update(status="interrupted", finished_at=now(), error="服务退出中断了对话复制。")
+                            self.store.put_run(child)
             for cell in doc["cells"]:
                 rejected = False
                 if cell["type"] == "order":
@@ -221,7 +238,7 @@ class Engine:
 
     def _revalidate_saved_order(self, run):
         """Correct old protocol-only successes without discarding their evidence."""
-        if run["status"] != "succeeded":
+        if run["status"] != "succeeded" or run.get("derived"):
             return False
         try:
             answer = output_summary(run["outputs"], OUTPUT_LIMIT + 100000)
@@ -256,12 +273,96 @@ class Engine:
 
     def document(self, notebook_id):
         with self.lock:
-            doc = self.store.get(notebook_id)
+            doc = self.sync_output_files(notebook_id)
             for cell in doc["cells"]:
                 if cell["type"] == "order":
                     run = self.get_run(cell["run_ids"][-1]) if cell["run_ids"] else None
                     cell["session"] = session_details(run)
             return doc | {"runtime": self.runtime(notebook_id)}
+
+    def read_output_file(self, rid, project):
+        """Read only the output belonging to a known run, with a bounded payload."""
+        path = self.store.run_path(rid) / "output.md"
+        try:
+            label = Path(os.path.relpath(path, project)).as_posix()
+        except ValueError:
+            label = str(path)
+        info = {"run_id": rid, "path": label, "state": "missing", "sha256": None}
+        try:
+            if path.is_symlink():
+                info.update(state="unavailable", error="输出文件是符号链接，无法实时读取。")
+                return info, None
+            with path.open("rb") as stream:
+                raw = stream.read(OUTPUT_LIMIT + 1)
+            if len(raw) > OUTPUT_LIMIT:
+                info.update(state="unavailable", error="输出文件超过 2 MB 显示上限。")
+                return info, None
+            value = raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            info.update(state="ready", sha256=hashlib.sha256(value.encode("utf-8")).hexdigest())
+            return info, value
+        except FileNotFoundError:
+            return info, None
+        except OSError:
+            info.update(state="unavailable", error="输出文件暂时无法读取，正在等待文件恢复。")
+            return info, None
+
+    def sync_output_files(self, notebook_id):
+        """Refresh the notebook's derived cache without changing its editable revision."""
+        with self.lock:
+            doc = self.store.get(notebook_id)
+            changed = False
+            first_changed = len(doc["cells"])
+            for index, cell in enumerate(doc["cells"]):
+                if cell["type"] != "order" or not cell["run_ids"]:
+                    continue
+                rid = cell["run_ids"][-1]
+                run = self.get_run(rid)
+                info, value = self.read_output_file(rid, doc["project_path"])
+                previous_info = cell.get("file_output") or {}
+                cache_matches = previous_info.get("run_id") == rid or cell.get("last_run_id") == rid
+                outputs = cell["outputs"] if cache_matches else []
+                if value is not None:
+                    outputs = [{"kind": run["output_format"], "text": value}]
+                else:
+                    info["cached"] = bool(outputs)
+                    if outputs:
+                        info["cached_sha256"] = hashlib.sha256(output_summary(outputs, OUTPUT_LIMIT + 100000).encode()).hexdigest()
+                if outputs != cell["outputs"]:
+                    # An external conversation can change the evidence of later cells.
+                    if value is not None:
+                        first_changed = min(first_changed, index)
+                    cell["outputs"] = copy.deepcopy(outputs)
+                    changed = True
+                if info != previous_info:
+                    cell["file_output"] = info
+                    changed = True
+            if first_changed < len(doc["cells"]):
+                for cell in doc["cells"][first_changed + 1:]:
+                    if cell["run_ids"]:
+                        cell["stale"] = True
+                active = self.runs.get(self.active.get(notebook_id))
+                if active:
+                    active_index = next((i for i, cell in enumerate(doc["cells"])
+                                         if cell["id"] == active["run"]["cell_id"]), -1)
+                    if active_index > first_changed:
+                        active["upstream_changed"] = True
+                doc["updated_at"] = now()
+            if changed:
+                self.store.put(doc)
+            return doc
+
+    def order_outputs(self, notebook_id, after=""):
+        with self.lock:
+            doc = self.sync_output_files(notebook_id)
+            cells = [{"id": cell["id"], "outputs": cell["outputs"], "file_output": cell["file_output"]}
+                     for cell in doc["cells"] if cell["type"] == "order" and cell["run_ids"]]
+            stale_ids = [cell["id"] for cell in doc["cells"] if cell["stale"]]
+            signature = [[cell["id"], cell["file_output"]] for cell in cells]
+            fingerprint = hashlib.sha256(json.dumps([signature, stale_ids], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            result = {"fingerprint": fingerprint, "changed": fingerprint != after}
+            if result["changed"]:
+                result.update(cells=cells, stale_cell_ids=stale_ids, updated_at=doc["updated_at"])
+            return result
 
     def open_session(self, notebook_id, cell_id):
         with self.lock:
@@ -307,7 +408,7 @@ class Engine:
 
     def context(self, notebook_id, cell_id):
         with self.lock:
-            doc = self.store.get(notebook_id)
+            doc = self.sync_output_files(notebook_id)
             key = (notebook_id, cell_id)
             rid = self.pending_contexts.get(key) or uid()
             context = self._context(doc, cell_id, rid)
@@ -325,11 +426,43 @@ class Engine:
                             load_context_config(doc["project_path"]),
                             scan_project(doc["project_path"], excluded=(self.store.path,)), run_info)
 
+    def transform_cells(self, notebook_id, cell_id, operation, payload):
+        with self.lock:
+            if notebook_id in self.active:
+                raise Problem("请等待或停止当前执行后再整理单元。", 409)
+            doc = self.sync_output_files(notebook_id)
+            if payload.get("revision") != doc["revision"]:
+                raise Problem("文档已更新，请刷新后再整理单元。", 409)
+            sources = select_cells(doc, cell_id, operation, payload.get("other_cell_id"))
+            instructions = text_field(payload.get("instructions", ""), "整理要求", 4000)
+            if not self.claude_command:
+                raise Problem("合并和拆分需要 Claude CLI，请安装并登录后重启服务。", 503)
+            cell = operation_cell(operation, sources, instructions)
+            rid = uid()
+            context = self._context(doc | {"cells": [cell]}, cell["id"], rid)
+            # The restructuring contract must survive custom prompt feature switches.
+            if cell["source"] not in context["prompt"]:
+                context = self._replace_prompt(context, context["prompt"] + "\n" + cell["source"])
+            details = {"kind": operation, "sources": sources, "revision": doc["revision"] + 1,
+                       "instructions": instructions}
+            if operation == "split" and sources[0]["run_ids"]:
+                session = session_details(self.get_run(sources[0]["run_ids"][-1]))
+                if session["available"]:
+                    details["resume_session_id"] = session["id"]
+            return self._start_run(doc, cell, rid, context, None, details)
+
+    def _replace_prompt(self, context, prompt):
+        if len(prompt) > context["budget"]:
+            raise Problem("整理输入超过上下文预算，请精简内容或调整 max_characters。")
+        return context | {"prompt": prompt, "characters": len(prompt),
+                          "estimated_tokens": math.ceil(len(prompt) / 2.5),
+                          "fingerprint": hashlib.sha256(prompt.encode("utf-8")).hexdigest()}
+
     def start(self, notebook_id, cell_id):
         with self.lock:
             if notebook_id in self.active:
                 raise Problem("同一 Notebook 同时只执行一个单元。", 409)
-            doc = self.store.get(notebook_id)
+            doc = self.sync_output_files(notebook_id)
             cell = next((c for c in doc["cells"] if c["id"] == cell_id), None)
             if not cell:
                 raise Problem("单元不存在。", 404)
@@ -343,53 +476,161 @@ class Engine:
             rid = self.pending_contexts.get(key) or uid()
             context = self._context(doc, cell_id, rid)
             before = snapshot_project(doc["project_path"], excluded=(self.store.path,)) if cell["type"] != "markdown" else None
-            folder = self.store.run_path(rid)
-            folder.mkdir()
-            self.pending_contexts.pop(key, None)
-            artifact = str(folder / "output.md")
-            # Preview and execution use the exact same prompt and fingerprint.
-            prompt_bytes = context["prompt"].encode("utf-8")
-            (folder / "context.md").write_bytes(prompt_bytes)
-            if before is not None:
-                self.store.atomic_json(folder / "project-before.json", before)
-            run = {"id": rid, "notebook_id": notebook_id, "cell_id": cell_id,
-                   "cell_type": cell["type"], "cell_title": cell["title"],
-                   "cell_revision": cell["revision"], "global_revision": doc["global"]["revision"],
-                   "status": "running", "started_at": now(), "finished_at": None,
-                   "mode": cell["mode"], "output_format": cell["output_format"],
-                   "context": context, "outputs": [], "initializer": cell.get("initializer", False),
-                   "artifact": artifact, "error": None, "duration_ms": None,
-                   "input_snapshot": copy.deepcopy(cell), "project_path": doc["project_path"],
-                   "project_changes": None}
-            if cell["type"] == "order":
-                run["session_name"] = context["run"]["session_name"]
-                run["run_dir"] = context["run"]["run_dir"]
-                run["output_file"] = context["run"]["output_file"]
-                relative_prompt = context["run"]["prompt_file"]
-                prompt_file = Path(doc["project_path"]) / relative_prompt
-                prompt_file.parent.mkdir(parents=True, exist_ok=True)
-                prompt_file.write_bytes(prompt_bytes)
-                run["prompt_file"] = str(prompt_file)
-                invocation_template = context["config"]["templates"]["invocation"]
-                run["invocation_prompt"] = invocation_template.format(**context["run"])
-            control = {"run": run, "events": [], "cancel": threading.Event(), "condition": threading.Condition(),
-                       "process": None, "output_characters": 0, "stream_events": 0, "project_before": before}
-            self.runs[rid] = control
-            self.active[notebook_id] = rid
+            return self._start_run(doc, cell, rid, context, before)
+
+    def _prepare_run(self, doc, cell, rid, context, before=None):
+        folder = self.store.run_path(rid)
+        folder.mkdir()
+        prompt_bytes = context["prompt"].encode("utf-8")
+        (folder / "context.md").write_bytes(prompt_bytes)
+        if before is not None:
+            self.store.atomic_json(folder / "project-before.json", before)
+        run = {"id": rid, "notebook_id": doc["id"], "cell_id": cell["id"],
+               "cell_type": cell["type"], "cell_title": cell["title"],
+               "cell_revision": cell["revision"], "global_revision": doc["global"]["revision"],
+               "status": "running", "started_at": now(), "finished_at": None,
+               "mode": cell["mode"], "output_format": cell["output_format"],
+               "context": context, "outputs": [], "initializer": cell.get("initializer", False),
+               "artifact": str(folder / "output.md"), "error": None, "duration_ms": None,
+               "input_snapshot": copy.deepcopy(cell), "project_path": doc["project_path"],
+               "project_changes": None}
+        if cell["type"] == "order":
+            run["session_name"] = context["run"]["session_name"]
+            run["run_dir"] = context["run"]["run_dir"]
+            run["output_file"] = context["run"]["output_file"]
+            prompt_file = Path(doc["project_path"]) / context["run"]["prompt_file"]
+            prompt_file.parent.mkdir(parents=True, exist_ok=True)
+            prompt_file.write_bytes(prompt_bytes)
+            run["prompt_file"] = str(prompt_file)
+            run["invocation_prompt"] = context["config"]["templates"]["invocation"].format(**context["run"])
+        return run
+
+    def _start_run(self, doc, cell, rid, context, before, operation=None):
+        run = self._prepare_run(doc, cell, rid, context, before)
+        self.pending_contexts.pop((doc["id"], cell["id"]), None)
+        control = {"run": run, "events": [], "cancel": threading.Event(), "condition": threading.Condition(),
+                   "process": None, "output_characters": 0, "stream_events": 0, "project_before": before}
+        self.runs[rid] = control
+        self.active[doc["id"]] = rid
+        if operation:
+            run["operation"] = operation
+            doc.setdefault("operation_ids", []).append(rid)
+        else:
             cell.update(status="running")
             doc["execution_count"] = doc.get("execution_count", 0) + 1
             cell["execution_count"] = doc["execution_count"]
             run["execution_count"] = doc["execution_count"]
             cell["run_ids"].append(rid)
-            doc["revision"] += 1
-            doc["updated_at"] = now()
-            self.store.put(doc)
-            self.store.put_run(run)
-            self.emit(rid, "status", {"status": "running", "message": "输入快照已保存，开始执行。"})
-            worker = threading.Thread(target=self._execute, args=(rid, copy.deepcopy(cell), doc), daemon=True)
-            control["thread"] = worker
-            worker.start()
-            return copy.deepcopy(run)
+        doc["revision"] += 1
+        doc["updated_at"] = now()
+        self.store.put_run(run)
+        self.store.put(doc)
+        self.emit(rid, "status", {"status": "running", "message": "输入快照已保存，开始执行。"})
+        worker = threading.Thread(target=self._execute, args=(rid, copy.deepcopy(cell), doc), daemon=True)
+        control["thread"] = worker
+        worker.start()
+        return copy.deepcopy(run)
+
+    def _check_operation(self, run):
+        doc = self.sync_output_files(run["notebook_id"])
+        operation = run["operation"]
+        if doc["revision"] != operation["revision"]:
+            raise Problem("整理期间文档或 Global 已更新，原单元已保留，请重新整理。", 409)
+        current = {cell["id"]: cell for cell in doc["cells"]}
+        if any(current.get(cell["id"]) != cell for cell in operation["sources"]):
+            raise Problem("整理期间原单元或 output.md 已变化，原单元已保留，请重新整理。", 409)
+        return doc
+
+    def _apply_operation(self, control):
+        run = control["run"]
+        operation = run["operation"]
+        sources = operation["sources"]
+        cells = parse_cells(output_summary(run["outputs"], OUTPUT_LIMIT + 100000), operation["kind"], sources)
+        output_path = Path(run["artifact"])
+        if not output_path.exists():
+            output_path.write_text(output_summary(run["outputs"], OUTPUT_LIMIT + 100000), encoding="utf-8")
+        with self.lock:
+            doc = self._check_operation(run)
+        candidate = replace_cells(doc, sources, cells)
+        staged = []
+        session_ids = set()
+        try:
+            for index, cell in enumerate(cells):
+                if control["cancel"].is_set():
+                    raise Problem("整理已停止，原单元已保留。", 499)
+                rid = uid()
+                context = self._context(candidate, cell["id"], rid)
+                resume = operation.get("resume_session_id")
+                if resume:
+                    notice = (
+                        "\n\n# CastleNotebook / copy split conversation\n"
+                        "这轮只建立拆分后的独立会话，不执行上述指令，不修改任何文件。请仅回复已确认。\n"
+                        "本会话已从原 Order 拆分，完整历史仅供参考。以本文件中的当前单元指令和预期输出为准。\n"
+                        f"本会话当前输入文件：{context['run']['prompt_file']}\n"
+                        f"此后每轮对话只更新本单元的输出文件：{context['run']['output_file']}\n"
+                        "历史中的其他输入/输出路径已失效，不得继续更新原单元或另一个拆分单元的文件。\n"
+                        f"当前已有结论（本轮保持不变）：\n{output_summary(cell['outputs'], OUTPUT_LIMIT + 100000)}\n"
+                    )
+                    context = self._replace_prompt(context, context["prompt"] + notice)
+                child = self._prepare_run(candidate, cell, rid, context)
+                child.update(derived=True, operation_run_id=run["id"],
+                             source_cell_ids=[source["id"] for source in sources])
+                child_control = {"run": child, "events": [], "cancel": control["cancel"],
+                                 "condition": threading.Condition(), "process": None, "owner": control,
+                                 "output_characters": 0, "stream_events": 0}
+                with self.lock:
+                    self.runs[rid] = child_control
+                staged.append(child)
+                self.store.put_run(child)
+                run["staged_run_ids"] = [item["id"] for item in staged]
+                self.store.put_run(run)
+                output = copy.deepcopy(cell["outputs"])
+                output_text = output_summary(output, OUTPUT_LIMIT + 100000)
+                Path(child["artifact"]).write_text(output_text, encoding="utf-8")
+                began = time.monotonic()
+                if resume:
+                    child["resume_session_id"] = resume
+                    self.emit(run["id"], "status", {"message": f"正在复制第 {index + 1}/2 份 Claude 对话…"})
+
+                    def emit_copy(kind, data):
+                        self.emit(rid, kind, data)
+                        if kind in {"log", "tool", "tool_result"}:
+                            self.emit(run["id"], kind, data)
+
+                    self._claude(child_control, {"output_format": "text"}, candidate, emit_copy, use_output_file=False)
+                    session_id = child.get("session_id")
+                    if not session_id or session_id == resume or session_id in session_ids:
+                        raise Problem("Claude 未生成独立的复制会话，原单元已保留。")
+                    session_ids.add(session_id)
+                else:
+                    child.pop("session_name", None)
+                # Session setup must never replace the Agent's reorganized conclusion.
+                Path(child["artifact"]).write_text(output_text, encoding="utf-8")
+                child.update(status="succeeded", outputs=output, finished_at=now(),
+                             duration_ms=round((time.monotonic() - began) * 1000),
+                             output_sha256=hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+                             output_source="restructured", stale=cell["stale"])
+                self.store.put_run(child)
+                self.emit(rid, "finished", {"status": "succeeded", "duration_ms": child["duration_ms"]})
+                history = sources[0]["run_ids"][:] if operation["kind"] == "split" else []
+                cell.update(run_ids=history + [rid], last_run_id=rid, operation_run_id=run["id"])
+            with self.lock:
+                if control["cancel"].is_set():
+                    raise Problem("整理已停止，原单元已保留。", 499)
+                current = self._check_operation(run)
+                self.store.put(replace_cells(current, sources, cells))
+                run["applied_cell_ids"] = [cell["id"] for cell in cells]
+                for source in sources:
+                    self.pending_contexts.pop((doc["id"], source["id"]), None)
+        except BaseException as exc:
+            for child in staged:
+                child_control = self.runs[child["id"]]
+                terminate_tree(child_control["process"])
+                if child["status"] == "running":
+                    child.update(status="cancelled" if control["cancel"].is_set() else "failed",
+                                 error=str(exc), finished_at=now())
+                    self.store.put_run(child)
+            raise
 
     def emit(self, rid, kind, data):
         control = self.runs[rid]
@@ -437,6 +678,8 @@ class Engine:
                 succeeded = self._claude(control, cell, doc, emit)
             if control["cancel"].is_set():
                 raise Problem("执行已停止。", 499)
+            if run.get("operation"):
+                self._apply_operation(control)
             outcome = "succeeded" if succeeded else "failed"
         except BaseException as exc:
             outcome = "cancelled" if control["cancel"].is_set() else "failed"
@@ -465,13 +708,40 @@ class Engine:
                 if reset:
                     self.kernels.pop(doc["id"], None)
                 output_text = output_summary(run["outputs"], OUTPUT_LIMIT + 100000)
-                (self.store.run_path(rid) / "output.md").write_text(output_text, encoding="utf-8")
+                output_path = self.store.run_path(rid) / "output.md"
+                if cell["type"] == "order":
+                    info, file_text = self.read_output_file(rid, doc["project_path"])
+                    if info["state"] == "missing":
+                        try:
+                            # A model-created file wins even if it appears during finalization.
+                            with output_path.open("xb") as stream:
+                                stream.write(output_text.encode("utf-8"))
+                        except FileExistsError:
+                            pass
+                        except OSError as exc:
+                            run.update(status="failed", error=f"无法保存输出文件：{exc}")
+                        info, file_text = self.read_output_file(rid, doc["project_path"])
+                    if file_text is not None:
+                        output_text = file_text
+                        run["outputs"] = [{"kind": cell["output_format"], "text": file_text}]
+                        run["output_source"] = "file"
+                else:
+                    output_path.write_text(output_text, encoding="utf-8")
                 run["output_sha256"] = hashlib.sha256(output_text.encode()).hexdigest()
-                saved = self.store.get(doc["id"])
+                if run.get("operation"):
+                    self.store.put_run(run)
+                    self.active.pop(doc["id"], None)
+                    self.emit(rid, "finished", {"status": run["status"], "duration_ms": run["duration_ms"],
+                                                "error": run["error"], "applied_cell_ids": run.get("applied_cell_ids", [])})
+                    return
+                saved = self.sync_output_files(doc["id"])
                 global_changed = saved["global"]["revision"] != run["global_revision"]
                 files_changed = bool(run["project_changes"] and run["project_changes"]["files"])
-                run["stale"] = bool(reset or global_changed)
-                run["stale_reason"] = "Global 在执行期间发生变化。" if global_changed else ("Python 内核已重置。" if reset else None)
+                upstream_changed = bool(control.get("upstream_changed"))
+                run["stale"] = bool(reset or global_changed or upstream_changed)
+                run["stale_reason"] = ("Global 在执行期间发生变化。" if global_changed else
+                                       "上游 output.md 在执行期间发生变化。" if upstream_changed else
+                                       "Python 内核已重置。" if reset else None)
                 seen = reset
                 for item in saved["cells"]:
                     if item["id"] == cell["id"]:
@@ -487,12 +757,16 @@ class Engine:
                 self.store.put_run(run)
                 self.store.put(saved)
                 self.active.pop(doc["id"], None)
+                if cell["type"] == "order":
+                    self.sync_output_files(doc["id"])
                 self.emit(rid, "finished", {"status": run["status"], "duration_ms": run["duration_ms"], "error": run["error"], "stale": run["stale"], "stale_reason": run["stale_reason"]})
 
-    def _claude(self, control, cell, doc, emit):
+    def _claude(self, control, cell, doc, emit, use_output_file=True):
         run = control["run"]
         args = [*self.claude_command, "-p", run["invocation_prompt"], "-n", run["session_name"],
                 "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+        if run.get("resume_session_id"):
+            args.extend(["--resume", run["resume_session_id"], "--fork-session"])
         run["command"] = args
         emit("log", {"text": f"Claude · 会话 ID{run['id']} · 使用本机配置"})
         process = subprocess.Popen(args, cwd=doc["project_path"], stdin=subprocess.DEVNULL,
@@ -500,6 +774,8 @@ class Engine:
                                    text=True, encoding="utf-8", errors="replace",
                                    env={**os.environ, "PYTHONIOENCODING": "utf-8"}, **spawn_options())
         control["process"] = process
+        if control.get("owner"):
+            control["owner"]["process"] = process
         messages = queue.Queue(maxsize=5000)
         for name in ("stdout", "stderr"):
             threading.Thread(target=pipe_reader, args=(getattr(process, name), messages, name), daemon=True).start()
@@ -571,6 +847,12 @@ class Engine:
         answer = final.get("result")
         if not isinstance(answer, str):
             answer = ""
+        run["cli_output"] = answer
+        file_info, file_text = self.read_output_file(run["id"], doc["project_path"]) if use_output_file else ({}, None)
+        if file_text is not None:
+            answer = file_text
+        elif file_info.get("state") == "unavailable":
+            raise Problem(file_info["error"])
         if len(answer) > OUTPUT_LIMIT:
             raise Problem("Claude 最终输出超过 2 MB 限制。")
         # Preserve the provider's actual result, including rejected final output.
@@ -578,7 +860,7 @@ class Engine:
             run["outputs"] = [{"kind": cell["output_format"], "text": answer}]
             emit("canonical_output", run["outputs"][0])
         if exit_code or final.get("is_error") or final.get("subtype", "success") != "success":
-            detail = final.get("errors") or answer or stderr or "Claude 执行失败。"
+            detail = final.get("errors") or run["cli_output"] or answer or stderr or "Claude 执行失败。"
             raise Problem(f"Claude 未成功完成（{final.get('subtype', 'unknown')}，退出码 {exit_code}）：{short(detail, 2500)}")
         stop_reason = final.get("stop_reason") or last_stop_reason
         run["provider_result"]["stop_reason"] = stop_reason
@@ -636,7 +918,11 @@ class Engine:
             run = self.get_run(rid)
             if run["notebook_id"] != notebook_id:
                 raise Problem("运行不属于该 Notebook。")
-            doc = apply_initialization(self.store.get(notebook_id), run)
+            current = self.sync_output_files(notebook_id)
+            source = next((cell for cell in current["cells"] if cell["id"] == run["cell_id"]), None)
+            if source and source.get("file_output", {}).get("run_id") == rid:
+                run["outputs"] = copy.deepcopy(source["outputs"])
+            doc = apply_initialization(current, run)
             self.store.put(doc)
             return self.document(notebook_id)
 

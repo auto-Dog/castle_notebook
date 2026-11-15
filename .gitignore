@@ -1,4 +1,5 @@
 .castle/
+.castle-notebook/
 tmp/
 __pycache__/
 *.py[cod]

@@ -4,10 +4,13 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const h = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const state = {boot:null, doc:null, selected:null, tab:"context", context:null, contextRequest:0,
   projectRequest:0,
+  outputNotebook:null, outputFingerprint:"", outputInFlight:false, outputDisconnected:false,
   dirty:false, globalDirty:false, documentDirty:false, editSeq:0, savePromise:null, timer:null, live:null, source:null,
   sequence:false, sequenceStop:false, markdownEditing:new Set(), inspectorOpen:false};
 
 const paths = {
+  merge:'m4 4 6 6m10-6-6 6m-2 0v11m-4-4 4 4 4-4',
+  split:'M12 21V10m0 0L5 3m7 7 7-7M5 8V3h5m4 0h5v5',
   plus:'M12 5v14M5 12h14', play:'m8 5 11 7-11 7V5Z', stop:'M6 6h12v12H6z',
   chevron:'m9 5 7 7-7 7', down:'m5 9 7 7 7-7', up:'m5 15 7-7 7 7',
   notebook:'M5 3h14v18H5V3Zm4 0v18M12 8h4m-4 4h4',
@@ -100,6 +103,71 @@ function outputsHTML(outputs) {
   }).join("");
 }
 
+function orderRunId(cell) {
+  return state.live?.cell_id===cell.id && !state.live.operation ? state.live.id : cell.run_ids.at(-1) || cell.last_run_id;
+}
+
+function orderOutputHTML(cell) {
+  const rid=orderRunId(cell);
+  if(!rid)return outputsHTML(cell.outputs);
+  const info=cell.file_output?.run_id===rid ? cell.file_output : null;
+  const outputs=info ? cell.outputs : cell.last_run_id===rid ? cell.outputs : [];
+  const label=state.outputDisconnected ? "连接中断，显示最近内容" : info?.state==="ready" ? "output.md · 实时" :
+    info?.cached ? "输出文件暂不可用，显示 Notebook 快照" : info?.error || "等待 output.md 更新…";
+  return `<div class="file-output-state ${info?.state==="unavailable"||state.outputDisconnected?"error-text":""}"><span>${h(label)}</span><code>${h(info?.path||"output.md")}</code></div>${outputsHTML(outputs)}`;
+}
+
+function updateOrderOutput(cell) {
+  const element=$(`#output-${cell.id}`);
+  const version=JSON.stringify([cell.file_output,orderRunId(cell),state.outputDisconnected]);
+  if(element&&element.dataset.outputVersion!==version){element.innerHTML=orderOutputHTML(cell);element.dataset.outputVersion=version;}
+  const block=$(`#cell-${cell.id} .output-block`);
+  if(block&&orderRunId(cell))block.hidden=false;
+}
+
+async function refreshOrderOutputs() {
+  if(!state.doc||state.outputInFlight||document.hidden)return;
+  const nid=state.doc.id;
+  if(state.outputNotebook!==nid){state.outputNotebook=nid;state.outputFingerprint="";}
+  state.outputInFlight=true;
+  try {
+    const result=await api(`/api/notebooks/${nid}/outputs?after=${encodeURIComponent(state.outputFingerprint)}`);
+    if(state.doc?.id!==nid)return;
+    const recovered=state.outputDisconnected;
+    state.outputDisconnected=false;state.outputFingerprint=result.fingerprint;
+    if(result.changed) {
+      for(const item of result.cells) {
+        const cell=state.doc.cells.find(c=>c.id===item.id&&c.type==="order");
+        if(!cell||orderRunId(cell)!==item.file_output.run_id)continue;
+        cell.outputs=item.outputs;cell.file_output=item.file_output;
+        updateOrderOutput(cell);
+      }
+      for(const id of result.stale_cell_ids) {
+        const cell=state.doc.cells.find(c=>c.id===id);
+        if(!cell||cell.stale)continue;
+        cell.stale=true;
+        const status=$(`[data-status-id="${id}"]`);if(status)status.innerHTML=tagHTML(cell);
+        const block=$(`#cell-${id} .output-block`);if(block) {
+          block.classList.add("stale-output");
+          if(!$(".stale-label",block))$(".output-heading",block)?.insertAdjacentHTML("afterbegin",'<span class="stale-label">上游输出已更新 · 此结果需重新验证</span>');
+        }
+      }
+      state.doc.updated_at=result.updated_at;
+    }
+    if(recovered)state.doc.cells.filter(c=>c.type==="order").forEach(updateOrderOutput);
+  } catch {
+    if(state.doc?.id===nid&&!state.outputDisconnected) {
+      state.outputDisconnected=true;
+      state.doc.cells.filter(c=>c.type==="order").forEach(updateOrderOutput);
+    }
+  } finally {state.outputInFlight=false;}
+}
+
+function startOutputPolling() {
+  const tick=async()=>{await refreshOrderOutputs();setTimeout(tick,1000);};
+  tick();
+}
+
 function pythonHTML(source) {
   const pattern = /#[^\n]*|'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|\b(?:import|from|as|def|return|if|else|elif|for|in|while|class|with|try|except|raise|assert|True|False|None|and|or|not|pass|break|continue|lambda|yield)\b|\b\d+(?:\.\d+)?\b/g;
   let result="", offset=0;
@@ -118,6 +186,7 @@ function shell() {
     <div class="toolbar" role="toolbar" aria-label="Notebook 工具栏"><div class="tool-group"><button class="tool" data-action="save" title="保存 (Ctrl+S)" aria-label="保存 Notebook">${icon("save")}</button></div><div class="tool-group"><button class="tool" data-action="add-default" title="在当前单元下方插入" aria-label="插入单元">${icon("plus")}</button><button class="tool" data-action="delete-selected" title="删除单元" aria-label="删除所选单元">${icon("trash")}</button><button class="tool" data-action="duplicate-selected" title="复制单元" aria-label="复制所选单元">${icon("copy")}</button></div><div class="tool-group"><button class="tool" data-action="up-selected" title="上移" aria-label="上移所选单元">${icon("up")}</button><button class="tool" data-action="down-selected" title="下移" aria-label="下移所选单元">${icon("down")}</button></div><div class="tool-group"><button class="tool run-selected" data-action="run-selected" title="执行 (Shift+Enter)">${icon("play")}<span>运行</span></button><button class="tool" data-action="stop" title="停止" aria-label="停止执行">${icon("stop")}</button><button class="tool" data-action="reset" title="重启内核" aria-label="重启内核">${icon("refresh")}</button></div><select id="cell-type" aria-label="单元类型"><option value="code">Python</option><option value="markdown">Markdown</option><option value="order">Order</option></select><span class="toolbar-spacer"></span><button class="tool inspector-toggle" data-action="inspector" aria-label="切换检查器" title="上下文 / 变量 / 记录">${icon("panel")}</button></div></div>
     <div class="work-content"><main id="notebook" class="notebook" aria-label="Notebook 单元"></main><aside class="inspector" id="inspector" aria-label="调试检查面板"></aside></div></div>`;
   $(".inspector-toggle").insertAdjacentHTML("beforebegin",`<button class="tool project-toggle" data-action="project" id="project-button" title="查看项目文件">${icon("folder")}<span id="project-name">项目</span></button>`);
+  $("#cell-menu").insertAdjacentHTML("beforeend",'<div class="menu-divider"></div><button data-action="merge-selected">Merge AI Cells · 合并</button><button data-action="split-selected">Split AI Cells · 拆分</button>');
   renderAll();
 }
 
@@ -128,6 +197,12 @@ function renderSidebar() {
   document.querySelectorAll('.toolbar [data-action]').forEach(el=>{el.disabled=el.dataset.action==="stop"?!busy():["inspector","save"].includes(el.dataset.action)?false:editing;});
   $("#cell-type").value=currentCell()?.type||"code";$("#cell-type").disabled=editing||!currentCell();
   $("#document-title").disabled=editing;
+  for(const operation of ["merge","split"]) {
+    const button=$(`[data-action="${operation}-selected"]`);
+    button.disabled=editing||currentCell()?.type!=="order"||!state.boot.capabilities.claude||
+      (operation==="merge"&&state.doc.cells.filter(c=>c.type==="order").length<2)||
+      (operation==="split"&&state.doc.cells.length>=100);
+  }
   const project=state.doc?.project_path||state.boot.project_path;
   $("#project-name").textContent=project.split(/[\\/]/).filter(Boolean).at(-1)||"项目";
   $("#project-button").title=`项目目录：${project}`;
@@ -177,10 +252,11 @@ function cellHTML(cell,index) {
     input+=`<div class="order-session"><span class="session-name" title="${h(session?.name || reason)}">${session?.name?`Session Name <code>${h(session.name)}</code>`:"运行后可打开对话"}</span><button class="text-button" data-action="open-session" data-id="${cell.id}" title="${h(canOpen?"在新终端打开此会话":reason)}" ${canOpen?"":"disabled"}>${icon("terminal")}打开对话</button></div>`;
   }
   const count=cell.execution_count||cell.run_ids.length||" ";
-  const hasOutput=live||cell.outputs.length||cell.last_error;
+  const hasOutput=live||cell.outputs.length||cell.last_error||(cell.type==="order"&&orderRunId(cell));
+  const operations=cell.type==="order"?`<button class="icon-btn" data-action="merge-cells" data-id="${cell.id}" title="Merge AI Cells · 合并两个 Order，清空原对话关联" aria-label="Merge AI Cells" ${disabled||!state.boot.capabilities.claude||state.doc.cells.filter(c=>c.type==="order").length<2?"disabled":""}>${icon("merge")}</button><button class="icon-btn" data-action="split-cells" data-id="${cell.id}" title="Split AI Cells · 拆分为两个 Order，复制原对话" aria-label="Split AI Cells" ${disabled||!state.boot.capabilities.claude||state.doc.cells.length>=100?"disabled":""}>${icon("split")}</button>`:"";
   return `<article class="cell ${cell.type}-cell ${state.selected===cell.id?"selected":""}" id="cell-${cell.id}" data-cell-card="${cell.id}" tabindex="0" title="${h(cell.title)} · 更新 ${h(timeText(cell.updated_at,true))}">
-    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${disabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${tagHTML(cell)}</span><button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
-    <div class="output-block ${cell.stale?"stale-output":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span></div><div class="output-content" id="output-${cell.id}">${live?outputsHTML(state.live.outputs):outputsHTML(cell.outputs)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
+    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${disabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${live&&state.live.operation?'<span class="status-tag running"><i class="spinner"></i>整理中</span>':tagHTML(cell)}</span>${operations}<button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
+    <div class="output-block ${cell.stale?"stale-output":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span></div><div class="output-content" id="output-${cell.id}">${cell.type==="order"?orderOutputHTML(cell):live?outputsHTML(state.live.outputs):outputsHTML(cell.outputs)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
 }
 
 function autoSize() {
@@ -246,6 +322,7 @@ function renderVariables() {
 async function renderHistoryList() {
   const cell=currentCell(), body=$("#inspector-body");
   body.innerHTML=`<div class="mini-label">${h(cell.title)} · ${cell.run_ids.length} 次执行</div><p class="inspector-copy">每次执行都有独立的上下文快照、输出文件与事件记录。</p><div id="history-list">${cell.run_ids.length?'<p class="muted">读取记录…</p>':'<div class="inspector-empty">此单元尚未执行。</div>'}</div>`;
+  if(cell.operation_run_id)body.insertAdjacentHTML("afterbegin",`<button class="btn outline small" data-action="view-run" data-id="${cell.operation_run_id}">${icon("eye")}查看 Agent 整理过程</button>`);
   const cid=cell.id;
   try {
     const runs=await Promise.all(cell.run_ids.slice(-20).reverse().map(id=>api(`/api/runs/${id}`)));
@@ -289,6 +366,7 @@ async function save() {
     try {
       const doc=await api(`/api/notebooks/${nid}${globalOnly?"/global":""}`,"PUT",payload);
       if(state.doc.id!==nid) return;
+      state.outputFingerprint="";
       if(seq===state.editSeq) { state.doc=doc;state.dirty=false;state.globalDirty=false;state.documentDirty=false; }
       else {state.doc.revision=doc.revision;state.doc.global.revision=doc.global.revision;}
       const item=state.boot.notebooks.find(n=>n.id===nid);
@@ -324,8 +402,9 @@ async function openNotebook(id) {
 
 function watchRun(run) {
   state.live=run;state.live.outputs=[];state.doc.runtime.active_run_id=run.id;
-  const cell=state.doc.cells.find(c=>c.id===run.cell_id);if(cell){cell.status="running";cell.execution_count=run.execution_count;}
+  const cell=state.doc.cells.find(c=>c.id===run.cell_id);if(cell&&!run.operation){cell.status="running";cell.execution_count=run.execution_count;if(cell.run_ids.at(-1)!==run.id)cell.run_ids.push(run.id);}
   state.selected=run.cell_id;renderAll();
+  state.outputFingerprint="";refreshOrderOutputs();
   let ended=false, lost=false;
   return new Promise((resolve,reject)=>{
     const source=new EventSource(`/api/runs/${run.id}/events`);state.source=source;
@@ -336,11 +415,13 @@ function watchRun(run) {
         const latest=await api(`/api/notebooks/${run.notebook_id}`);
         if(state.globalDirty){latest.global.goal=state.doc.global.goal;latest.global.constraints=state.doc.global.constraints;}
         state.doc=latest;
+        if(final.applied_cell_ids?.length)state.selected=final.applied_cell_ids[0];
         final.stale=Boolean(final.stale||latest.cells.find(c=>c.id===run.cell_id)?.stale);
         state.boot.notebooks=await api("/api/notebooks");
         renderAll();
         if(final.status!=="succeeded") toast(final.error || "执行未完成，请检查输出与运行记录。",true);
-        else if(!state.sequence) toast(final.stale?"Global 已变化，本次结果已标记失效。":"本步执行完成，结果与输入快照已保存。");
+        else if(run.operation) toast(run.operation.kind==="merge"?"Order 已合并，原对话关联已清空。":"Order 已拆分，内容与对话已分别保存。");
+        else if(!state.sequence) toast(final.stale?final.stale_reason||"上游输入已变化，本次结果已标记失效。":"本步执行完成，结果与输入快照已保存。");
         resolve(final);
       } catch(error) {state.doc.runtime.active_run_id=null;renderAll();reject(error);}
     };
@@ -348,11 +429,17 @@ function watchRun(run) {
       if(ended || state.live?.id!==run.id)return;
       const message=JSON.parse(event.data), data=message.data;
       if(message.type==="output") {
+        if(run.cell_type==="order") {
+          state.live.progress=((state.live.progress||"")+(data.text||"")).slice(-500);
+          const trace=$(`#trace-${run.cell_id}`);if(trace)trace.textContent=state.live.progress;
+          return;
+        }
         const previous=state.live.outputs.at(-1);
         if(previous && ["stdout","stderr"].includes(data.kind) && previous.kind===data.kind)previous.text+=data.text||"";
         else state.live.outputs.push(data);
         const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML(state.live.outputs);
       } else if(message.type==="canonical_output") {
+        if(run.cell_type==="order"){state.outputFingerprint="";refreshOrderOutputs();return;}
         state.live.outputs=[data];const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML([data]);
       } else if(message.type==="variables") {
         state.doc.runtime.variables=data.variables;state.doc.runtime.kernel_id=data.kernel_id;
@@ -403,6 +490,18 @@ function newModal() {
 function initModal() {
   showModal("从项目初始化",`<div class="path-block">${icon("folder")}<code>${h(state.boot.project_path)}</code></div><form id="init-form"><label class="modal-label">子目录<input name="relative_path" value="." placeholder="." autocomplete="off"></label><div class="modal-callout">${icon("info")}本次指令要求 Claude 只读分析；生成代码需手动执行。</div>${!state.boot.capabilities.claude?'<p class="error-text">请先安装并登录 Claude Code，再重启服务。</p>':""}<div class="modal-actions"><button class="btn outline" type="button" data-action="scan-project">文件概览</button><button class="btn primary" type="submit" ${!state.boot.capabilities.claude?"disabled":""}>用 Claude 分析</button></div><div id="scan-result"></div></form>`);
 }
+async function cellOperationModal(id,operation) {
+  await flushSave();
+  if(busy()||state.sequence)throw new Error("请等待或停止当前执行后再整理单元。");
+  const cell=state.doc.cells.find(c=>c.id===id);
+  if(cell?.type!=="order")throw new Error("请选择一个 Order 单元。");
+  const merge=operation==="merge", others=state.doc.cells.filter(c=>c.type==="order"&&c.id!==id);
+  if(merge&&!others.length)throw new Error("至少需要两个 Order 单元才能合并。");
+  if(!merge&&state.doc.cells.length>=100)throw new Error("拆分后会超过 100 个单元。");
+  selectCell(id);
+  const index=state.doc.cells.indexOf(cell), next=state.doc.cells.slice(index+1).find(c=>c.type==="order")||others[0];
+  showModal(merge?"Merge AI Cells · 合并 Order":"Split AI Cells · 拆分 Order",`<form id="cell-operation-form" data-id="${id}" data-operation="${operation}"><p>${merge?"Agent 将归纳两个 Order 的指令、预期输出和已有结论，替换原单元，并清空原 AI 对话关联。":"Agent 将内容按任务边界拆成两个连续 Order，为两者复制原 AI 对话，之后可以分别续聊。"}</p><div class="path-block">${icon("order")}<strong>${h(cell.title||`Order ${index+1}`)}</strong></div>${merge?`<label class="modal-label">合并另一个 Order<select name="other_cell_id" aria-label="选择要合并的 Order">${others.map(other=>`<option value="${other.id}" ${other.id===next?.id?"selected":""}>${state.doc.cells.indexOf(other)+1}. ${h(other.title||other.source.slice(0,50))}</option>`).join("")}</select></label>`:!cell.session?.available?'<p class="muted">原单元暂无可恢复的 AI 对话，将拆分内容并分别保存输入、输出文件。</p>':""}<label class="modal-label">整理要求（可选）<textarea name="instructions" aria-label="整理要求" rows="3" maxlength="4000" placeholder="${merge?"例如：归纳成已完成的版本需求，保留验证结论":"例如：分别整理为功能实现和测试验证两个步骤"}"></textarea></label><p class="muted">完成后自动保存。失败或停止时保留原单元。</p><div class="modal-actions"><button class="btn outline" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit" ${state.boot.capabilities.claude?"":"disabled"}>${icon(operation)}调用 Agent ${merge?"合并":"拆分"}</button></div></form>`);
+}
 async function contextModal(id) {
   await flushSave();selectCell(id);
   const context=state.live?.cell_id===id?state.live.context:await api(`/api/notebooks/${state.doc.id}/cells/${id}/context`);
@@ -425,6 +524,8 @@ async function action(name,el) {
   if(name==="file-menu"||name==="cell-menu"){const menu=$(`#${name}`),open=menu.hidden;document.querySelectorAll(".dropdown").forEach(el=>el.hidden=true);menu.hidden=!open;return;}
   if(name==="save"){await flushSave();return toast("已保存。");}
   if(name==="run-selected"){if(state.selected)return runCell(state.selected);return;}
+  if(name==="merge-selected"||name==="split-selected")return cellOperationModal(state.selected,name==="merge-selected"?"merge":"split");
+  if(name==="merge-cells"||name==="split-cells")return cellOperationModal(id,name==="merge-cells"?"merge":"split");
   if(name==="add-default")return action("add",{dataset:{type:currentCell()?.type||"code",insert:true}});
   if(["delete-selected","duplicate-selected","up-selected","down-selected"].includes(name)){
     if(!state.selected)return;
@@ -498,13 +599,16 @@ document.addEventListener("change",event=>{
 });
 document.addEventListener("scroll",event=>{if(event.target.classList?.contains("code-input")){event.target.previousElementSibling.scrollTop=event.target.scrollTop;event.target.previousElementSibling.scrollLeft=event.target.scrollLeft;}},true);
 document.addEventListener("submit",async event=>{
-  if(!["new-form","init-form"].includes(event.target.id))return;
+  if(!["new-form","init-form","cell-operation-form"].includes(event.target.id))return;
   event.preventDefault();const form=event.target, submit=$("button[type=submit]",form);submit.disabled=true;
   try {
     await flushSave();
     if(busy())throw new Error("请等待或停止当前运行后再创建。");
     const values=Object.fromEntries(new FormData(form));
-    if(form.id==="new-form"){
+    if(form.id==="cell-operation-form"){
+      const run=await api(`/api/notebooks/${state.doc.id}/cells/${form.dataset.id}/${form.dataset.operation}`,"POST",{...values,revision:state.doc.revision});
+      $("#modal").close();await watchRun(run);
+    } else if(form.id==="new-form"){
       const doc=await api("/api/notebooks","POST",values);state.boot.notebooks=await api("/api/notebooks");$("#modal").close();await openNotebook(doc.id);
     } else {
       const result=await api("/api/project/initialize","POST",{...values,run:true});state.doc=result.notebook;state.selected=result.run?.cell_id;state.boot.notebooks=await api("/api/notebooks");localStorage.setItem("castle-notebook",state.doc.id);$("#modal").close();renderAll();if(result.run)watchRun(result.run).catch(e=>toast(e.message,true));
@@ -519,6 +623,7 @@ document.addEventListener("keydown",event=>{
   if(event.key==="?" && !["INPUT","TEXTAREA","SELECT"].includes(event.target.tagName))action("help",{});
 });
 window.addEventListener("beforeunload",event=>{if(state.dirty){event.preventDefault();event.returnValue="";}});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){state.outputFingerprint="";refreshOrderOutputs();}});
 $("#modal").addEventListener("click",event=>{if(event.target===$("#modal")){const rect=event.target.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)event.target.close();}});
 
 (async()=>{
@@ -528,6 +633,7 @@ $("#modal").addEventListener("click",event=>{if(event.target===$("#modal")){cons
     const first=state.boot.notebooks.find(n=>n.id===stored) || state.boot.notebooks[0];
     if(first){state.doc=await api(`/api/notebooks/${first.id}`);state.selected=state.doc.cells.find(c=>c.type==="order")?.id||state.doc.cells[0]?.id;}
     shell();
+    startOutputPolling();
     if(state.doc?.runtime.active_run_id){const run=await api(`/api/runs/${state.doc.runtime.active_run_id}`);watchRun(run).catch(e=>toast(e.message,true));}
   } catch(error){$("#app").innerHTML=`<div class="boot error-text">${icon("warning")}<h1>无法打开研究工作台</h1><p>${h(error.message)}</p><a class="btn outline" href="/">重新连接</a></div>`;}
 })();
