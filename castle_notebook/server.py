@@ -2,20 +2,52 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
 from pathlib import Path
 import secrets
 import sys
+import threading
 import time
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 from .core import (Problem, Store, VERSION, ensure_context_config, initialization_notebook,
-                   new_notebook, project_path, read_project_file, scan_project, text_field)
+                   new_notebook, project_path, read_project_asset, read_project_file, scan_project,
+                   text_field)
 from .execution import Engine, resolve_claude
 
 STATIC = Path(__file__).with_name("static")
+# Formula rendering (KaTeX) is vendored on first use. The server fetches it in a
+# background thread the first time a page asks, so the first paint never waits
+# on the network: the frontend loads KaTeX only once /api/math/status says ready.
+# Domestic mirror first (the audience is in mainland China), then public CDNs.
+MATH_VERSION = "0.16.11"
+MATH_MIRRORS = (
+    f"https://registry.npmmirror.com/katex/{MATH_VERSION}/files/dist/",
+    f"https://cdn.jsdelivr.net/npm/katex@{MATH_VERSION}/dist/",
+    f"https://unpkg.com/katex@{MATH_VERSION}/dist/",
+)
+MATH_ASSETS = (
+    "katex.min.js", "katex.min.css",
+    "fonts/KaTeX_AMS-Regular.woff2",
+    "fonts/KaTeX_Caligraphic-Bold.woff2", "fonts/KaTeX_Caligraphic-Regular.woff2",
+    "fonts/KaTeX_Fraktur-Bold.woff2", "fonts/KaTeX_Fraktur-Regular.woff2",
+    "fonts/KaTeX_Main-Bold.woff2", "fonts/KaTeX_Main-BoldItalic.woff2",
+    "fonts/KaTeX_Main-Italic.woff2", "fonts/KaTeX_Main-Regular.woff2",
+    "fonts/KaTeX_Math-BoldItalic.woff2", "fonts/KaTeX_Math-Italic.woff2",
+    "fonts/KaTeX_SansSerif-Bold.woff2", "fonts/KaTeX_SansSerif-Italic.woff2",
+    "fonts/KaTeX_SansSerif-Regular.woff2", "fonts/KaTeX_Script-Regular.woff2",
+    "fonts/KaTeX_Size1-Regular.woff2", "fonts/KaTeX_Size2-Regular.woff2",
+    "fonts/KaTeX_Size3-Regular.woff2", "fonts/KaTeX_Size4-Regular.woff2",
+    "fonts/KaTeX_Typewriter-Regular.woff2",
+)
+MATH_FILES = {name: tuple(base + name for base in MATH_MIRRORS) for name in MATH_ASSETS}
+MATH_ROOT = STATIC / "math"
+MATH_TIMEOUT = 8
+MATH_RETRY = 60.0
 
 
 class App:
@@ -43,6 +75,104 @@ class Server(ThreadingHTTPServer):
     def __init__(self, address, app):
         super().__init__(address, Handler)
         self.app = app
+        self.math = MathAssets()
+
+
+class MathAssets:
+    """Serve KaTeX locally, fetching it once in the background on first request.
+
+    No page ever blocks on the network: the first /api/math/status call only
+    schedules the download and answers immediately, and the frontend retries.
+    """
+
+    def __init__(self, root=MATH_ROOT, files=None, fetch=None):
+        self.root = Path(root)
+        self.files = dict(files if files is not None else MATH_FILES)
+        self.fetch = fetch
+        self.lock = threading.Lock()
+        self.status = {name: self._present(name) for name in self.files}
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="castle-math")
+        self.job = None
+        self.started_at = 0.0
+        self.done = False
+        self.changed = threading.Event()
+
+    def _present(self, name):
+        path = self.root / name
+        return path.is_file() and path.stat().st_size > 0
+
+    def path(self, name):
+        """Resolve a request path inside the asset directory, or None."""
+        target = (self.root / name).resolve()
+        root = self.root.resolve()
+        return target if target == root or root in target.parents else None
+
+    def snapshot(self):
+        with self.lock:
+            primary = "katex.min.js" if "katex.min.js" in self.status else next(iter(self.status), None)
+            return {"ready": all(self.status.values()), "downloading": self.job is not None and not self.done,
+                    "offline": self.done and not self.status.get(primary, True),
+                    "missing": [name for name, ok in self.status.items() if not ok]}
+
+    def start(self):
+        """Kick off the background download; retry coolly after a failed attempt."""
+        with self.lock:
+            if all(self.status.values()):
+                return
+            if self.job is not None and not self.done:
+                return
+            if self.job is not None and time.monotonic() - self.started_at < MATH_RETRY:
+                return
+            self.started_at = time.monotonic()
+            self.done = False
+            self.job = self.pool.submit(self._download)
+
+    def request(self):
+        """Bundle the download trigger with the status read to avoid a poll race."""
+        self.start()
+        return self.snapshot()
+
+    def _download(self):
+        for name, sources in self.files.items():
+            if self.status.get(name):
+                continue
+            data = self._fetch(name, sources if isinstance(sources, (list, tuple)) else (sources,))
+            if not data:
+                continue
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".part")
+            temporary.write_bytes(data)
+            temporary.replace(path)
+            with self.lock:
+                self.status[name] = True
+        with self.lock:
+            self.done = True
+        self.changed.set()
+
+    def _fetch(self, name, sources):
+        for url in sources:
+            if self.fetch:
+                try:
+                    data = self.fetch(url, name)
+                except Exception:
+                    data = None
+                if data:
+                    return data
+            try:
+                request = Request(url, headers={"User-Agent": f"CastleNotebook/{VERSION}"})
+                with urlopen(request, timeout=MATH_TIMEOUT) as response:
+                    return response.read()
+            except Exception:
+                continue
+        return None
+
+    def wait(self, timeout=10.0):
+        """Block up to timeout for the current download to finish (tests)."""
+        deadline = time.monotonic() + timeout
+        while not self.done and time.monotonic() < deadline:
+            self.changed.wait(0.05)
+            self.changed.clear()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -62,14 +192,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: https: http:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 
-    def send_bytes(self, data, content_type, status=200, filename=None):
+    def send_bytes(self, data, content_type, status=200, filename=None, cache="no-store"):
         self.send_response(status)
         self.security_headers()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         if filename:
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
@@ -144,6 +274,10 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         if method == "GET" and parts == ["api", "health"]:
             return self.json({"ok": True, "version": VERSION})
+        if method == "GET" and parts == ["api", "math", "status"]:
+            return self.json(self.server.math.request())
+        if method == "GET" and len(parts) >= 3 and parts[:2] == ["api", "math"] and parts[2] != "status":
+            return self.math_asset("/".join(parts[2:]))
         if method == "GET" and parts == ["api", "bootstrap"]:
             return self.json({"token": self.app.token, "version": VERSION,
                               "project_path": str(self.app.project), "notebooks": self.app.store.list(),
@@ -192,6 +326,11 @@ class Handler(BaseHTTPRequestHandler):
                 doc = self.app.store.get(nid)
                 return self.json(read_project_file(doc["project_path"], query.get("path", [""])[0],
                                                    excluded=(self.app.store.path,)))
+            if parts[3:] == ["asset"] and method == "GET":
+                doc = self.app.store.get(nid)
+                data, content_type = read_project_asset(doc["project_path"], query.get("path", [""])[0],
+                                                        excluded=(self.app.store.path,))
+                return self.send_bytes(data, content_type)
             if len(parts) == 4 and parts[3] == "export" and method == "GET":
                 doc = self.app.engine.sync_output_files(nid)
                 return self.send_bytes(json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"), "application/json; charset=utf-8", filename=f"castle-{doc['id']}.json")
@@ -251,6 +390,21 @@ class Handler(BaseHTTPRequestHandler):
                 content_type = {".js": "text/javascript", ".css": "text/css", ".html": "text/html", ".svg": "image/svg+xml"}.get(path.suffix, mimetypes.guess_type(str(path))[0])
                 return self.send_bytes(path.read_bytes(), content_type + "; charset=utf-8")
         raise Problem("未找到该资源。", 404)
+
+    def math_asset(self, name):
+        math = self.server.math
+        path = math.path(name)
+        if path is None:
+            raise Problem("公式渲染资源路径无效。", 404)
+        if not math.status.get(name):
+            math.start()
+            raise Problem("公式渲染资源正在后台下载，请稍后自动重试。", 404)
+        if not path.is_file():
+            raise Problem("公式渲染资源尚未就绪。", 404)
+        content_type = {"js": "text/javascript", "css": "text/css", "woff2": "font/woff2",
+                        "woff": "font/woff", "ttf": "font/ttf"}.get(path.suffix.lstrip("."), "application/octet-stream")
+        charset = "; charset=utf-8" if content_type.startswith("text/") else ""
+        return self.send_bytes(path.read_bytes(), content_type + charset, cache="public, max-age=86400")
 
     def stream_events(self, rid, after):
         self.app.engine.get_run(rid)

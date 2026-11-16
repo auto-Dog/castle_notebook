@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import http.client
@@ -13,14 +14,15 @@ import time
 import unittest
 from unittest.mock import patch
 
-from castle_notebook.core import (MAX_CONTEXT, Problem, Store, default_context_config, editable_document,
-                                 ensure_context_config, load_context_config, normalize_context_config,
-                                 initialization_notebook, new_cell, new_notebook,
-                                 pack_context, parse_json_output, project_changes, read_project_file,
-                                 scan_project, snapshot_project, validate_order_output)
+from castle_notebook.core import (MAX_CONTEXT, MAX_EMBEDDED_IMAGE_BYTES, Problem, Store,
+                                 default_context_config, editable_document,
+                                 embed_markdown_images, ensure_context_config, load_context_config,
+                                 normalize_context_config, initialization_notebook, new_cell, new_notebook,
+                                 pack_context, parse_json_output, project_changes, read_project_asset,
+                                 read_project_file, scan_project, snapshot_project, validate_order_output)
 from castle_notebook.execution import (Engine, linux_terminal_command, open_claude_terminal,
                                        resolve_claude, spawn_options)
-from castle_notebook.server import App, Server
+from castle_notebook.server import App, MathAssets, Server
 
 FAKE = [sys.executable, str(Path(__file__).with_name("fake_claude.py"))]
 
@@ -312,6 +314,76 @@ class CoreTests(unittest.TestCase):
             self.assertIn("project documentation", result["manifest_excerpt"])
             with self.assertRaises(Problem):
                 scan_project(root, "..")
+
+    def test_project_asset_serves_images_and_rejects_other_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "docs").mkdir()
+            (root / "docs" / "figure.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (root / ".env").write_text("PRIVATE", encoding="utf-8")
+            (root / "evidence").mkdir()
+            (root / "evidence" / "plot.png").write_bytes(b"PNG")
+            (root / "notes.md").write_text("# notes", encoding="utf-8")
+            (root / "outside.png").write_bytes(b"PNG")
+            data, content_type = read_project_asset(root, "docs/figure.png")
+            self.assertEqual((data, content_type), (b"\x89PNG\r\n\x1a\n", "image/png"))
+            for path in ("../outside.png", ".env", "notes.md", "evidence/plot.png", "docs/missing.png"):
+                with self.subTest(path=path), self.assertRaises(Problem):
+                    read_project_asset(root, path, excluded=(root / "evidence",))
+
+    def test_markdown_images_are_embedded_as_notebook_attachments(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "docs").mkdir()
+            figure = b"\x89PNG\r\n\x1a\n"
+            (root / "docs" / "figure.png").write_bytes(figure)
+            cell = new_cell("markdown", "figure", "![预算图](docs/figure.png)")
+            embed_markdown_images([cell], root)
+            name = next(iter(cell["attachments"]))
+            self.assertRegex(name, r"^image-[a-f0-9]{16}\.png$")
+            self.assertEqual(cell["source"], f"![预算图](attachment:{name})")
+            self.assertEqual(base64.b64decode(cell["attachments"][name]["image/png"]), figure)
+            # Saving again is idempotent even if the client still holds the old source.
+            again = copy.deepcopy(cell)
+            again["source"] = "![预算图](docs/figure.png)"
+            embed_markdown_images([again], root)
+            self.assertEqual(again["source"], cell["source"])
+            self.assertEqual(list(again["attachments"]), [name])
+            # Removing the reference removes the stored image.
+            cell["source"] = "没有图片"
+            embed_markdown_images([cell], root)
+            self.assertEqual(cell["attachments"], {})
+            # Remote, data, fenced and escaping references stay literal.
+            untouched = new_cell("markdown", "x", "![a](https://example.com/a.png)\n"
+                                 "![b](data:image/png;base64,iVBORw0KGgo=)\n"
+                                 "```\n![c](docs/figure.png)\n```\n![d](../figure.png)")
+            embed_markdown_images([untouched], root)
+            self.assertEqual(untouched["attachments"], {})
+            self.assertIn("![c](docs/figure.png)", untouched["source"])
+            # Oversized images are left as ordinary project references.
+            (root / "docs" / "big.png").write_bytes(b"x" * (MAX_EMBEDDED_IMAGE_BYTES + 1))
+            big = new_cell("markdown", "x", "![big](docs/big.png)")
+            embed_markdown_images([big], root)
+            self.assertEqual(big["attachments"], {})
+            self.assertEqual(big["source"], "![big](docs/big.png)")
+
+    def test_attachment_payloads_are_validated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            doc = new_notebook(folder)
+            cell = new_cell("markdown", "m", "text")
+            doc["cells"].append(cell)
+
+            def payload(attachments):
+                return {"revision": doc["revision"], "cells": [cell | {"attachments": attachments}]}
+
+            valid = {"image-a.png": {"image/png": base64.b64encode(b"png").decode()}}
+            self.assertEqual(editable_document(doc, payload(valid))["cells"][0]["attachments"], valid)
+            for attachments in ({"../escape.png": {"image/png": "cG5n"}},
+                                {"image-a.png": {"text/html": "cG5n"}},
+                                {"image-a.png": {"image/png": "not base64!"}},
+                                {f"image-{index}.png": {"image/png": "cG5n"} for index in range(21)}):
+                with self.subTest(attachments=attachments), self.assertRaises(Problem):
+                    editable_document(doc, payload(attachments))
 
     def test_workspace_contract_survives_legacy_templates_and_feature_switches(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1065,6 +1137,27 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(error.exception.status, 503)
         self.assertEqual(self.engine.active, {})
 
+    def test_save_embeds_local_markdown_images_and_keeps_them_without_resending_bytes(self):
+        figure = b"\x89PNG\r\n\x1a\n"
+        (self.project / "figure.png").write_bytes(figure)
+        cell = self.add("markdown", "![图](figure.png)")
+        saved = self.engine.save(self.doc["id"], self.engine.document(self.doc["id"]))
+        saved_cell = next(item for item in saved["cells"] if item["id"] == cell["id"])
+        name = next(iter(saved_cell["attachments"]))
+        self.assertEqual(saved_cell["source"], f"![图](attachment:{name})")
+        self.assertEqual(base64.b64decode(saved_cell["attachments"][name]["image/png"]), figure)
+        # Later saves keep the stored attachment; the client never sends image bytes.
+        payload = self.engine.document(self.doc["id"])
+        again = self.engine.save(self.doc["id"], payload)
+        again_cell = next(item for item in again["cells"] if item["id"] == cell["id"])
+        self.assertEqual(again_cell["source"], saved_cell["source"])
+        self.assertEqual(again_cell["attachments"], saved_cell["attachments"])
+        # Removing the image reference prunes the embedded bytes.
+        payload = self.engine.document(self.doc["id"])
+        next(item for item in payload["cells"] if item["id"] == cell["id"])["source"] = "没有图片"
+        pruned = self.engine.save(self.doc["id"], payload)
+        self.assertNotIn("attachments", next(item for item in pruned["cells"] if item["id"] == cell["id"]))
+
     def test_serial_execution_locks_running_cell_but_allows_other_cell_edits(self):
         upstream = self.add("code", "value = 1")
         cell = self.add("order", "FAKE_FILE_WAIT")
@@ -1237,7 +1330,43 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"app.js", body)
         self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+        self.assertIn("img-src 'self' data: https: http:", headers["Content-Security-Policy"])
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+
+    def test_markdown_images_are_served_from_the_notebook_project(self):
+        doc = new_notebook(self.temp.name)
+        self.app.store.put(doc)
+        image = Path(self.temp.name) / "markdown-figure.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n")
+        endpoint = f"/api/notebooks/{doc['id']}/asset"
+        status, headers, body = self.request("GET", endpoint + "?path=markdown-figure.png")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/png")
+        self.assertEqual(body, image.read_bytes())
+        for path in ("../markdown-figure.png", ".castle/notebooks.json", "missing.png"):
+            with self.subTest(path=path):
+                status, _, _ = self.request("GET", endpoint + f"?path={path}")
+                self.assertEqual(status, 404)
+
+    def test_math_bundle_is_served_at_the_paths_the_page_requests(self):
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "fonts").mkdir()
+            (Path(root) / "katex.min.js").write_text("window.katex = {};", encoding="utf-8")
+            (Path(root) / "fonts" / "KaTeX_Main-Regular.woff2").write_bytes(b"wOF2")
+            previous = self.server.math
+            self.server.math = MathAssets(root=root, files={
+                "katex.min.js": "unused", "fonts/KaTeX_Main-Regular.woff2": "unused"})
+            try:
+                status, headers, body = self.request("GET", "/api/math/katex.min.js")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
+                self.assertIn(b"window.katex", body)
+                status, headers, _ = self.request("GET", "/api/math/fonts/KaTeX_Main-Regular.woff2")
+                self.assertEqual(status, 200)
+                self.assertEqual(headers["Content-Type"], "font/woff2")
+                self.assertIsNone(self.server.math.path("../server.py"))
+            finally:
+                self.server.math = previous
 
     def test_context_preview_hot_loads_config_and_reports_invalid_edits(self):
         doc = new_notebook(self.temp.name)

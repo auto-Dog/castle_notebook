@@ -59,6 +59,9 @@ function makeApp() {
     window:{addEventListener(){}}, localStorage:{getItem(){},setItem(){}},
     setTimeout:callback => {timers.set(++nextTimer,callback);return nextTimer;},
     clearTimeout:id => timers.delete(id),
+    requestAnimationFrame:callback => {callback();return 0;},
+    setInterval:() => 0,
+    MutationObserver:class {observe(){}},
     fetch:(path, options={}) => {
       // Leave startup pending so each test controls the document explicitly.
       if (path === "/api/bootstrap") return new Promise(() => {});
@@ -76,8 +79,10 @@ function makeApp() {
   vm.runInContext(source + `
     renderSidebar=()=>{};renderNotebook=()=>{};
     inspectorFrame=()=>renderHooks.inspector?.();
-    refreshOrderOutputs=async()=>{};refreshContext=()=>{};updateOrderInput=()=>{};toast=()=>{};
-    globalThis.app={state,cellLocked,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll};
+    refreshOrderOutputs=async()=>{};refreshContext=()=>{};toast=()=>{};
+    globalThis.app={state,window,cellLocked,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
+      outputsHTML,orderInputMode,updateOrderInput,markdown,inline,mathSpan,splitMath,
+      mathState,mathScript,typeset,startMath};
   `, sandbox);
   const app = sandbox.app, doc = documentFixture();
   app.state.doc = doc;
@@ -96,7 +101,7 @@ function makeApp() {
     assert.fail(`Missing ${method} ${path}; saw ${requests.map(r=>r.method+" "+r.path).join(", ")}`);
   };
   const finishList = async () => (await take("GET","/api/notebooks")).respond([{id:nid,title:doc.title}]);
-  return {app,doc,edit,watch,finish,take,finishList,requests,document,elements,renderHooks};
+  return {app,doc,edit,watch,finish,take,finishList,requests,document,elements,renderHooks,sandbox};
 }
 
 test("only the running cell is locked, including during Run All", () => {
@@ -236,4 +241,196 @@ test("completion rendering restores the editor and cursor after the inspector re
   assert.equal(target.selectionEnd,9);
   assert.equal(target.scrollTop,37);
   assert.equal(details.open,true);
+});
+
+test("order input renders markdown whenever it is not being edited", () => {
+  const env = makeApp(), {app} = env;
+  const order = env.doc.cells[3];
+  order.run_ids = ["r1"];
+  order.source = "# 需求\n\n- 条目一\n- 条目二";
+  assert.equal(app.orderInputMode(order),"preview");
+  const html = app.cellHTML(order,3);
+  assert.match(html, /<div class="order-input-preview markdown"/);
+  assert.match(html, /<h1>需求<\/h1>/);
+  assert.match(html, /<ul><li>条目一<\/li><li>条目二<\/li><\/ul>/);
+  assert.doesNotMatch(html, /<textarea[^>]*id="source-/);
+  app.state.orderEditing.add(order.id);
+  assert.equal(app.orderInputMode(order),"edit");
+  assert.match(app.cellHTML(order,3), /<textarea[^>]*id="source-/);
+  app.state.orderEditing.delete(order.id);
+  assert.match(app.cellHTML(order,3), /<div class="order-input-preview markdown"/);
+});
+
+test("an unrun order still previews its requirement and offers an edit toggle", () => {
+  const env = makeApp(), {app} = env;
+  const order = env.doc.cells[3];
+  order.source = "## 需求\n\n公式 $E = mc^2$ 也应渲染。";
+  assert.equal(order.run_ids.length, 0);
+  assert.equal(app.orderInputMode(order),"preview");
+  const html = app.cellHTML(order,3);
+  assert.match(html, /<div class="order-input-preview markdown"/);
+  assert.match(html, /<h2>需求<\/h2>/);
+  assert.match(html, /<span class="math-tex"/);
+  assert.match(html, /data-action="edit-order"/);
+  assert.doesNotMatch(html, /<textarea[^>]*id="source-/);
+  app.state.orderEditing.add(order.id);
+  assert.equal(app.orderInputMode(order),"edit");
+  const editing = app.cellHTML(order,3);
+  assert.match(editing, /<textarea[^>]*id="source-/);
+  assert.match(editing, /data-action="done-order"/);
+  app.state.orderEditing.delete(order.id);
+  assert.equal(app.orderInputMode(order),"preview");
+});
+
+test("order outputs render markdown evidence carried as json payloads", () => {
+  const {app} = makeApp();
+  const md = app.outputsHTML([{kind:"json",text:"# 板块 01\n\n- **结论**：AUROC 0.610"}]);
+  assert.match(md, /<div class="markdown rendered-output">/);
+  assert.match(md, /<h1>板块 01<\/h1>/);
+  assert.match(md, /<strong>结论<\/strong>/);
+  const fenced = app.outputsHTML([{kind:"json",text:'```json\n{"a":1}\n```'}]);
+  assert.match(fenced, /<pre class="output-text /);
+  assert.doesNotMatch(fenced, /rendered-output/);
+});
+
+test("typeset hands KaTeX the TeX body, never the delimiters", () => {
+  const env = makeApp(), {app} = env;
+  const calls = [];
+  env.sandbox.katex = {render(tex, node, options) { calls.push({tex, display:options.displayMode}); }};
+  app.window.katex = env.sandbox.katex;
+  app.mathState.ready = true;
+  const spans = [
+    {dataset:{tex:"E = mc^2", display:"false"}, removeAttribute(name){delete this.dataset.tex;}},
+    {dataset:{tex:"\\int_0^1 f", display:"true"}, removeAttribute(name){delete this.dataset.tex;}}
+  ];
+  app.typeset({querySelectorAll: () => spans});
+  assert.deepEqual(calls, [{tex:"E = mc^2", display:false}, {tex:"\\int_0^1 f", display:true}]);
+  assert.equal(spans[0].dataset.typeset, "1");
+  assert.equal(spans[0].dataset.tex, undefined);
+  app.mathState.ready = false;
+});
+
+test("display formulas may put the delimiters on their own lines", () => {
+  const {app} = makeApp();
+  const dollars = app.markdown("前文\n\n$$\n\\sum_i x_i\n$$\n\n后文");
+  assert.match(dollars, /data-display="true"/);
+  assert.ok(dollars.includes('data-tex="\n\\sum_i x_i\n"'), dollars);
+  assert.match(dollars, /后文/);
+  const spaced = app.markdown("$$\n  \\frac{1}{2}\n  $$");
+  assert.match(spaced, /data-tex="\n  \\frac\{1\}\{2\}\n  "/);
+  const brackets = app.markdown("\\[\n\\alpha \\ge \\beta\n\\]");
+  assert.match(brackets, /data-display="true"/);
+  assert.ok(brackets.includes("alpha"), brackets);
+  const unclosed = app.markdown("$$\nsum\n\n# 标题");
+  assert.match(unclosed, /<h1>标题<\/h1>/);
+  assert.doesNotMatch(unclosed, /data-tex="[^"]*sum[^"]*标题/);
+});
+
+const formulaCell = (source) => ({...cell(markdownId,"markdown"), source});
+const B = String.fromCharCode(92); // one literal backslash
+
+// Rendered markup for a formula: the KaTeX-ready body stays in data-tex until
+// the engine runs; the delimiters only remain in the visible fallback text.
+const D = "$"; // one dollar sign
+
+test("markdown keeps inline and display formulas as typeset placeholders", () => {
+  const {app} = makeApp();
+  const inline = app.markdown(`风险指标满足 ${D}sigma^2 = ${B}sum x_i${D} 的关系。`);
+  assert.ok(inline.includes(`data-tex="sigma^2 = ${B}sum x_i"`), inline);
+  assert.match(inline, /data-display="false"/);
+  assert.ok(inline.includes(`${D}sigma^2 = ${B}sum x_i${D}`), "fallback keeps the source");
+  assert.doesNotMatch(inline, /<em>/);
+  const display = app.markdown(`${D}${D}${B}int_0^1 f(x)${B},dx = 1${D}${D}`);
+  assert.match(display, /data-display="true"/);
+  assert.ok(display.includes(`data-tex="${B}int_0^1 f(x)${B},dx = 1"`), display);
+  assert.ok(display.includes(`${D}${D}${B}int_0^1 f(x)${B},dx = 1${D}${D}`), display);
+  const bracket = app.markdown(`${B}${B}[ ${B}alpha ${B}ge ${B}beta ${B}${B}]`);
+  assert.match(bracket, /data-display="true"/);
+  assert.ok(bracket.includes(`data-tex=" ${B}alpha ${B}ge ${B}beta ${B}"`), bracket);
+  const paren = app.markdown(`${B}${B}(${B}lambda ${B}${B})`);
+  assert.match(paren, /data-display="false"/);
+});
+
+test("dollar amounts and code spans never become formulas", () => {
+  const {app} = makeApp();
+  assert.doesNotMatch(app.markdown("价格 $100 与 $200 不应渲染。"), /math-tex/);
+  const code = app.markdown("行内 `cost = $5` 保持字面量。");
+  assert.match(code, /<code>cost = \$5<\/code>/);
+  const fenced = app.markdown("```python\nprice = 100 # $100\n```");
+  assert.match(fenced, /<pre><code>price = 100 # \$100<\/code><\/pre>/);
+  assert.doesNotMatch(fenced, /math-tex/);
+});
+
+test("markdown renders images without letting raw HTML through", () => {
+  const {app} = makeApp();
+  const remote = app.markdown("![图](https://example.com/a.png?x=1&y=2)");
+  assert.ok(remote.includes('<img class="markdown-image"'), remote);
+  assert.ok(remote.includes('src="https://example.com/a.png?x=1&amp;y=2"'), remote);
+  assert.ok(remote.includes('alt="图"'), remote);
+  const local = app.markdown("![](docs/ui preview.png)");
+  assert.ok(local.includes(`src="/api/notebooks/${nid}/asset?path=docs%2Fui%20preview.png"`), local);
+  const data = app.markdown("![x](data:image/png;base64,iVBORw0KGgo=)");
+  assert.ok(data.includes('src="data:image/png;base64,iVBORw0KGgo="'), data);
+  const attachments = {"image-abc.png": {"image/png": "iVBORw0KGgo="}};
+  const embedded = app.markdown("![x](attachment:image-abc.png)", attachments);
+  assert.ok(embedded.includes('src="data:image/png;base64,iVBORw0KGgo="'), embedded);
+  assert.doesNotMatch(app.markdown("![x](attachment:missing.png)", attachments), /<img/);
+  assert.doesNotMatch(app.markdown("![x](attachment:image-abc.png)",
+    {"image-abc.png": {"image/svg+xml": "PHN2Zz4="}}), /<img/);
+  const linked = app.markdown("[![x](https://example.com/a.png)](https://example.com)");
+  assert.match(linked, /<a href="https:\/\/example\.com"[^>]*><img class="markdown-image"/);
+  const escaped = app.markdown('![<img src=x onerror=alert(1)>](https://example.com/a.png)');
+  assert.doesNotMatch(escaped, /<img src=x/);
+  assert.match(escaped, /alt="&lt;img src=x onerror=alert\(1\)&gt;"/);
+  for (const source of ["![x](javascript:alert(1))", "![x](../secret.png)", "![x](C:/secret.png)", "![x](file:///etc/passwd)"]) {
+    assert.doesNotMatch(app.markdown(source), /<img/, source);
+  }
+  assert.match(app.markdown("`![x](https://example.com/a.png)`"),
+    /<code>!\[x\]\(https:\/\/example\.com\/a\.png\)<\/code>/);
+  assert.doesNotMatch(app.markdown("```\n![x](https://example.com/a.png)\n```"), /<img/);
+});
+
+test("markdown cell previews render images stored as notebook attachments", () => {
+  const {app, doc} = makeApp();
+  const cell = doc.cells.find(c => c.id === markdownId);
+  cell.source = "![x](attachment:image-a.png)";
+  cell.attachments = {"image-a.png": {"image/png": "iVBORw0KGgo="}};
+  const html = app.cellHTML(cell, doc.cells.indexOf(cell));
+  assert.match(html, /<img class="markdown-image" src="data:image\/png;base64,iVBORw0KGgo="/);
+});
+
+test("mathScript waits for the local status before loading KaTeX", async () => {
+  const env = makeApp(), {app} = env;
+  const loading = app.mathScript();
+  await tick();
+  const status = env.requests.find(r => r.path === "/api/math/status");
+  assert.ok(status, "mathScript must ask this process for readiness");
+  assert.equal(env.requests.some(r => r.path.endsWith("katex.min.js")), false,
+    "no engine fetch before the status says ready");
+  status.respond({ready:false, downloading:true});
+  await loading;
+  assert.equal(app.mathState.ready, false);
+});
+
+test("a ready status loads KaTeX from this process only", async () => {
+  const env = makeApp(), {app} = env;
+  const created = [];
+  const make = tag => {
+    const node = {tag, dataset:{}, setAttribute(){}, removeAttribute(){}};
+    node.onload = node.onerror = null;
+    created.push(node);
+    return node;
+  };
+  env.document.createElement = make;
+  env.document.getElementById = () => null;
+  env.document.head = {appendChild(node) { if (node.onload) node.onload(); }};
+  app.window.katex = {render(){}}; // the engine the served script would define
+  const loading = app.mathScript();
+  await tick();
+  env.requests.find(r => r.path === "/api/math/status").respond({ready:true, downloading:false, missing:[]});
+  await loading;
+  await tick();
+  assert.ok(created.some(node => node.tag === "script" && node.src === "/api/math/katex.min.js"));
+  assert.ok(created.some(node => node.tag === "link" && node.href === "/api/math/katex.min.css"));
+  assert.equal(app.mathState.ready, true);
 });

@@ -1,6 +1,7 @@
 """Notebook documents, deterministic context packing and durable local storage."""
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -11,6 +12,7 @@ import re
 from string import Formatter
 import threading
 from datetime import datetime, timezone
+from urllib.parse import unquote
 import uuid
 
 VERSION = "0.9.0"
@@ -141,6 +143,15 @@ def editable_document(doc, incoming):
                 raise Problem(f"{key} 选项无效。")
             changed |= value != cell[key]
             cell[key] = value
+        # Attachments are presentation-only and never invalidate downstream results.
+        if kind == "markdown":
+            attachments = validate_attachments(item.get("attachments", cell.get("attachments", {})))
+            if attachments:
+                cell["attachments"] = attachments
+            else:
+                cell.pop("attachments", None)
+        else:
+            cell.pop("attachments", None)
         if changed:
             cell["updated_at"] = now()
             cell["revision"] += 1
@@ -150,6 +161,8 @@ def editable_document(doc, incoming):
         if i >= earliest and cell["run_ids"]:
             cell["stale"] = True
         result["cells"].append(cell)
+    if notebook_image_bytes(result["cells"]) > MAX_NOTEBOOK_IMAGE_BYTES:
+        raise Problem(f"Notebook 内嵌图片合计不能超过 {MAX_NOTEBOOK_IMAGE_BYTES // 1024 // 1024} MB。")
     # A removed last cell cannot affect anything before it.
     result["revision"] += 1
     result["updated_at"] = now()
@@ -565,6 +578,140 @@ def read_project_file(project, relative, excluded=()):
     except OSError as exc:
         raise Problem("无法读取项目文件。") from exc
     return {"path": path.relative_to(root).as_posix(), "source": source}
+
+
+IMAGE_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                     ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
+                     ".bmp": "image/bmp", ".svg": "image/svg+xml"}
+MAX_ASSET_BYTES = 20 * 1024 * 1024
+# Embedded images follow the Jupyter attachment format. They live inside the
+# notebook JSON, so saves never resend image bytes; the limits below bound each
+# image and each notebook.
+ATTACHMENT_MEDIA_TYPES = set(IMAGE_MEDIA_TYPES.values()) - {"image/svg+xml"}
+MAX_EMBEDDED_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_NOTEBOOK_IMAGE_BYTES = 100 * 1024 * 1024
+ATTACHMENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+IMAGE_REFERENCE = re.compile(r"!\[([^\]\n]*)\]\(([^\s)]+)\)")
+
+
+def read_project_asset(project, relative, excluded=(), max_bytes=MAX_ASSET_BYTES):
+    root = Path(project).resolve()
+    text_field(relative, "图片路径", 2000)
+    path = root / relative
+    content_type = IMAGE_MEDIA_TYPES.get(path.suffix.lower())
+    excluded = tuple(Path(item).resolve() for item in excluded)
+    if (not content_type or not path.is_relative_to(root)
+            or not _included_project_path(path, root, excluded) or not path.is_file()):
+        raise Problem("找不到可显示的图片。", 404)
+    try:
+        if path.stat().st_size > max_bytes:
+            raise Problem(f"图片超过 {max_bytes // 1024 // 1024} MB 限制。", 413)
+        data = path.read_bytes()
+    except OSError as exc:
+        raise Problem("无法读取项目图片。") from exc
+    return data, content_type
+
+
+def attachment_size(entry):
+    return sum(max(0, len(value) * 3 // 4 - value.count("=")) for value in entry.values())
+
+
+def validate_attachments(value):
+    """Accept only the Jupyter-style {name: {image mime: base64}} shape."""
+    if not isinstance(value, dict) or len(value) > 20:
+        raise Problem("图片附件格式无效。")
+    result = {}
+    for name, entry in value.items():
+        if not isinstance(name, str) or not ATTACHMENT_NAME.fullmatch(name):
+            raise Problem("图片附件名称无效。")
+        if not isinstance(entry, dict) or not entry or set(entry) - ATTACHMENT_MEDIA_TYPES:
+            raise Problem("图片附件类型无效。")
+        for data in entry.values():
+            if (not isinstance(data, str) or not data or len(data) % 4
+                    or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", data)):
+                raise Problem("图片附件内容无效。")
+            if attachment_size(entry) > MAX_EMBEDDED_IMAGE_BYTES:
+                raise Problem(f"单张内嵌图片不能超过 {MAX_EMBEDDED_IMAGE_BYTES // 1024 // 1024} MB。")
+        result[name] = entry
+    return result
+
+
+def notebook_image_bytes(cells):
+    return sum(attachment_size(entry) for cell in cells
+               for entry in ((cell.get("attachments") or {}).values()))
+
+
+def _rewrite_image_line(line, replace):
+    """Rewrite image references outside inline code spans."""
+    pieces = line.split("`")
+    for index in range(0, len(pieces), 2):
+        pieces[index] = IMAGE_REFERENCE.sub(replace, pieces[index])
+    return "`".join(pieces)
+
+
+def _rewrite_markdown_images(source, replace):
+    result, fenced = [], False
+    for line in source.splitlines(keepends=True):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            result.append(line)
+        else:
+            result.append(line if fenced else _rewrite_image_line(line, replace))
+    return "".join(result)
+
+
+def _local_image_path(target):
+    """Return the project-relative path for a target we may embed, else None."""
+    target = target.strip()
+    if not target or target.startswith(("http://", "https://", "data:", "attachment:", "//")):
+        return None
+    if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", target):
+        return None
+    return unquote(target)
+
+
+def embed_markdown_images(cells, project, excluded=(), per_image=MAX_EMBEDDED_IMAGE_BYTES,
+                          total=MAX_NOTEBOOK_IMAGE_BYTES):
+    """Inline local image references into markdown cells as notebook attachments.
+
+    Runs on the incoming save payload: each `![alt](relative/path)` becomes
+    `![alt](attachment:image-<hash>.<ext>)` once the file is read successfully.
+    Missing, escaping, unsupported or oversized files are left untouched, so the
+    renderer can still fall back to the project asset endpoint.
+    """
+    used = notebook_image_bytes(cells)
+    for cell in cells:
+        if cell.get("type") != "markdown" or not isinstance(cell.get("source"), str):
+            continue
+        attachments = copy.deepcopy(cell.get("attachments") or {})
+
+        def replace(match):
+            nonlocal used
+            relative = _local_image_path(match.group(2))
+            if relative is None:
+                return match.group(0)
+            try:
+                data, mime = read_project_asset(project, relative, excluded=excluded, max_bytes=per_image)
+            except Problem:
+                return match.group(0)
+            if mime not in ATTACHMENT_MEDIA_TYPES:
+                return match.group(0)
+            name = f"image-{hashlib.sha256(data).hexdigest()[:16]}{Path(relative).suffix.lower()}"
+            if name not in attachments:
+                if used + len(data) > total:
+                    return match.group(0)
+                attachments[name] = {mime: base64.b64encode(data).decode("ascii")}
+                used += len(data)
+            return f"![{match.group(1)}](attachment:{name})"
+
+        source = _rewrite_markdown_images(cell["source"], replace)
+        # Drop attachments no longer referenced, so removing an image shrinks the notebook.
+        referenced = set(re.findall(r"!\[[^\]\n]*\]\(attachment:([^\s)]+)\)", source))
+        attachments = {name: entry for name, entry in attachments.items() if name in referenced}
+        if source != cell["source"]:
+            cell["source"] = source
+        # An explicit key (even empty) tells editable_document to replace, not keep.
+        cell["attachments"] = attachments
 
 
 def scan_project(root, relative=".", excluded=()):

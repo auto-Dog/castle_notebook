@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 
-from .core import (Problem, apply_initialization, editable_document, now,
+from .core import (Problem, apply_initialization, editable_document, embed_markdown_images, now,
                    load_context_config, output_summary, pack_context, project_changes, scan_project,
                    short, snapshot_project, text_field, uid, validate_order_output)
 from .cell_operations import operation_cell, parse_cells, replace_cells, select_cells
@@ -528,6 +528,16 @@ class Engine:
             sources = {cell["id"]: cell for cell in current["cells"]}
             writes = []
             if isinstance(incoming, dict) and isinstance(incoming.get("cells"), list):
+                # Keep attachments already stored in the notebook, then embed any
+                # new local image references in Markdown sources before validation.
+                for item in incoming["cells"]:
+                    if not isinstance(item, dict):
+                        continue
+                    stored = sources.get(item.get("id"))
+                    if stored and "attachments" not in item and stored.get("attachments"):
+                        item["attachments"] = copy.deepcopy(stored["attachments"])
+                embed_markdown_images(incoming["cells"], current["project_path"],
+                                      excluded=(self.store.path,))
                 for item in incoming["cells"]:
                     if not isinstance(item, dict):
                         continue

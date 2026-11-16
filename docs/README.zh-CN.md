@@ -36,6 +36,10 @@ python -m castle_notebook --project E:\research\my_model --python E:\conda\envs\
 
 Python 和 Claude 都在指定项目目录运行；Python 内核将该目录加入模块搜索路径，可直接导入项目源码。指定 `--python` 时，该解释器也需要安装 IPython（`"路径/python.exe" -m pip install "ipython>=8.18"`）。NumPy、pandas、Matplotlib 使用该解释器已有的安装；它们是可选依赖。调用 `display(df)` 展示表格，`display_markdown(text)` 展示 Markdown；Matplotlib 图像会在执行完成时自动收集。
 
+Markdown 渲染支持单元格内公式：`$…$`、`\(…\)` 为行内公式，`$$…$$`、`\[…\]` 为行间公式（两个 `$$` 可以单独占行）。KaTeX 首次使用时由本地服务在后台从镜像下载（优先 npmmirror，失败回退 jsdelivr、unpkg），页面不会等待下载，就绪前公式暂时显示源码；资源只从 `127.0.0.1` 提供，不向页面注入任何第三方脚本。已下载的文件缓存在安装目录的 `static/math/`，离线时沿用上次下载的副本。
+
+Markdown 预览也支持图片。`![说明](路径)` 的相对路径按 Notebook 所在项目目录解析；保存时，项目内的 PNG/JPEG/GIF/WebP/AVIF/BMP 图片会读取为 base64 附件写入 Notebook（Jupyter attachments 格式），源码改写为 `attachment:image-<hash>.png`，之后即使原文件移动也能显示。单张内嵌图片上限 5 MB，单个 Notebook 合计上限 100 MB；超过限制、位于项目外或读取失败的引用保持原样，仍可通过本地项目图片端点显示。`https://` 远程图片和 `data:image` 内联图片可直接显示（CSP 只放行这两类外部图像源，页面脚本仍只允许同源）。
+
 Python 单元支持 [IPython 语法](https://ipython.readthedocs.io/en/stable/interactive/reference.html#system-shell-access)：`!命令`、`files = !命令` 捕获输出、`$变量` / `{表达式}` 插值，以及 `%pwd`、`%cd`、`%time`、`%%time`、`%%capture`、`%pip` 等魔法命令。普通 Python 与 `!` 可以混写，字符串和注释中的 `!` 不受影响：
 
 ```python
@@ -98,7 +102,7 @@ Notebook 只负责触发与收集，不占有会话。`claude agents` 可查看�
 Windows 和 Linux 下，Order 单元底部显示 **Session Name**、**Background ID** 和实际权限模式。原生后台会话启动后，“打开对话”立即可用，通过 `claude attach <id>` 在新终端进入同一实时对话，执行中也能处理问题；历史 print 会话使用 `claude --resume <session-id> --permission-mode <配置值>`。Linux 优先使用 `TERMINAL`，再自动查找常用终端；无桌面的服务器可直接在自己的终端运行 `claude attach`。未执行或未生成会话时按钮禁用。续聊对 `input.md`、`output.md` 的更新继续同步到对应单元。
 Order 的 Out Cell 以最近一次运行的 `output.md` 为来源，在页面可见时约每秒检查一次变化，实时渲染文件；执行中以及执行完成后的续聊、外部编辑、文件替换都会同步。CLI 进度保留在运行日志中。模型已写出 `output.md` 时，后台直接采用文件，执行结束不会用 CLI 的确认消息覆盖它；模型未写文件时，后台用最终回答创建该文件。
 
-Order 的 Input Cell 同样实时渲染该运行的 `input.md`，支持 Markdown 和任务清单。运行时先将当前指令写入该文件，harness 要求 Claude 在每轮对话结束前更新当前完整需求摘要、已确认约束和完成状态，可替换上一版，因此追加或调整的需求会回到对应 Input Cell。点击“编辑”或双击需求正文可直接修改，保存时同步写回文件；编辑期间文件被模型更新时保留草稿，并提供“使用文件版本”和“用我的版本覆盖文件”。无关字段的自动保存会保留最新文件内容。
+Order 的 Input Cell 同样实时渲染该运行的 `input.md`，支持 Markdown 和任务清单。尚未运行的 Order 也会以 Markdown 预览当前需求（含单元格内公式），不会先显示原始源码。运行时先将当前指令写入该文件，harness 要求 Claude 在每轮对话结束前更新当前完整需求摘要、已确认约束和完成状态，可替换上一版，因此追加或调整的需求会回到对应 Input Cell。点击“编辑”或双击需求正文可直接修改，保存时同步写回文件；编辑期间文件被模型更新时保留草稿，并提供“使用文件版本”和“用我的版本覆盖文件”。无关字段的自动保存会保留最新文件内容。
 
 续聊的最新输入也会缓存到 Notebook，并用于后续上下文和单元合并、拆分。输入更新会使下游结果失效；初始 `.castle/prompts/input<运行ID>.md`、`context.md` 和运行记录中的 `input_snapshot` 保留原始内容。`input.md` 上限为 32000 字符；文件丢失或暂不可读时明确显示 Notebook 快照，恢复后继续同步。旧运行首次读取时自动补建需求文件，通过“打开对话”重新进入旧会话时会一次性告知 Claude 新的文件维护要求。已打开的旧终端需重新打开对话后接收该说明。
 

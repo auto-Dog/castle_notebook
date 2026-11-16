@@ -58,51 +58,197 @@ function toast(message, error=false) {
 }
 
 // A deliberately small, escaped Markdown renderer. Raw HTML is never inserted.
-function inline(text) {
-  const code = [];
-  text = h(text).replace(/`([^`]+)`/g, (_,v) => `\u0000${code.push(`<code>${v}</code>`)-1}\u0000`);
-  text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
-  return text.replace(/\u0000(\d+)\u0000/g, (_,i) => code[Number(i)]);
+// Formulas are lifted out before escaping, then KaTeX replaces the placeholder
+// span once the bundled engine has loaded (see typeset()).
+// Delimiters are recognised literally; lookbehind would reject `\[` itself.
+const MATH_RE = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|(?<![\\\w$])\$([^$\n]+?)\$(?![\w$])/g;
+function splitMath(text) {
+  const parts = [], found = [];
+  let offset = 0;
+  text = String(text); MATH_RE.lastIndex = 0;
+  for (const match of text.matchAll(MATH_RE)) {
+    if (match.index > offset) parts.push({text:text.slice(offset, match.index)});
+    const display = match[1] !== undefined || match[2] !== undefined;
+    const body = match[1] ?? match[2] ?? match[3] ?? match[4];
+    // KaTeX expects the TeX body, never the delimiters that framed it.
+    found.push({tex:body, display});
+    parts.push({tex:found.length - 1}); offset = match.index + match[0].length;
+  }
+  if (offset < text.length) parts.push({text:text.slice(offset)});
+  return {parts, found};
 }
-function markdown(source) {
+// Images stay passive: Jupyter-style attachments embedded in the notebook,
+// remote http(s), inline data:image, or a project-relative file served by
+// /api/notebooks/<id>/asset. Other schemes are left as text.
+const DATA_IMAGE_RE = /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp);base64,[A-Za-z0-9+/=]+$/i;
+const ATTACHMENT_MIME_RE = /^image\/(?:png|jpe?g|gif|webp|avif|bmp)$/i;
+function attachmentURL(name, attachments) {
+  const entry = attachments?.[name];
+  if (!entry || typeof entry !== "object") return null;
+  for (const [mime, data] of Object.entries(entry)) {
+    if (ATTACHMENT_MIME_RE.test(mime) && typeof data === "string" && /^[A-Za-z0-9+/]+={0,2}$/.test(data))
+      return `data:${mime.toLowerCase()};base64,${data}`;
+  }
+  return null;
+}
+function imageURL(source, attachments = {}) {
+  const src = String(source || "").trim().replaceAll("\\", "/");
+  if (!src) return null;
+  if (/^attachment:/i.test(src)) return attachmentURL(src.slice(11), attachments);
+  if (/^https?:\/\/[^\s"<>]+$/i.test(src) || DATA_IMAGE_RE.test(src)) return src;
+  // Absolute, scheme-bearing or escaping paths never reach the project.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(src) || src.startsWith("/") || src.split("/").includes("..")) return null;
+  const id = state.doc?.id;
+  return id ? `/api/notebooks/${encodeURIComponent(id)}/asset?path=${encodeURIComponent(src)}` : null;
+}
+function inline(text, attachments = {}) {
+  const {parts, found} = splitMath(text), tokens = [];
+  const save = html => `\u0000${tokens.push(html) - 1}\u0000`;
+  const esc = value => {
+    // Code spans are lifted first so `![alt](url)` stays literal inside them.
+    let out = String(value).replace(/`([^`]+)`/g, (_,v) => save(`<code>${h(v)}</code>`))
+      .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, src) => {
+        const url = imageURL(src, attachments);
+        if (!url) return match;
+        const label = alt.replace(/\u0000\d+\u0000/g, "");
+        return save(`<img class="markdown-image" src="${h(url)}" alt="${h(label)}" loading="lazy" referrerpolicy="no-referrer">`);
+      });
+    out = h(out).replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
+    return out.replace(/\u0000(\d+)\u0000/g, (_,i) => tokens[Number(i)]);
+  };
+  return parts.map(part => part.tex === undefined ? esc(part.text) : mathSpan(found[part.tex])).join("");
+}
+function mathSpan(source) {
+  const display = source.display ? "true" : "false";
+  const literal = source.display ? `$$${source.tex}$$` : `$${source.tex}$`;
+  return `<span class="math-tex" data-tex="${h(source.tex)}" data-display="${display}">${h(literal)}</span>`;
+}
+function markdown(source, attachments = {}) {
   const lines = String(source).replaceAll("\r", "").split("\n");
   let result = "", i=0;
   while (i < lines.length) {
-    const line = lines[i];
-    if (line.trim().startsWith("```")) {
-      const language = line.trim().slice(3); const code=[]; i++;
+    const line = lines[i], trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      const language = trimmed.slice(3); const code=[]; i++;
       while (i < lines.length && !lines[i].trim().startsWith("```")) code.push(lines[i++]);
       result += `<div class="md-code"><span>${h(language || "code")}</span><pre><code>${h(code.join("\n"))}</code></pre></div>`; i++; continue;
     }
-    if (/^#{1,6}\s/.test(line)) { const level = line.match(/^#+/)[0].length; result += `<h${level}>${inline(line.replace(/^#+\s/, ""))}</h${level}>`; i++; continue; }
-    if (!line.trim()) { i++; continue; }
-    if (/^\s*>/.test(line)) { result += `<blockquote>${inline(line.replace(/^\s*>\s?/, ""))}</blockquote>`; i++; continue; }
+    // Display math delimiters may sit alone on their lines ($$ / $$ or \[ / \]).
+    if (trimmed.startsWith("$$") && trimmed.indexOf("$$", 2) === -1) {
+      const end = mathBlockEnd(lines, i, "$$");
+      if (end !== -1) { result += `<p>${inline(lines.slice(i, end + 1).join("\n"), attachments)}</p>`; i = end + 1; continue; }
+    }
+    if (trimmed.startsWith("\\[") && !trimmed.includes("\\]")) {
+      const end = mathBlockEnd(lines, i, "\\]");
+      if (end !== -1) { result += `<p>${inline(lines.slice(i, end + 1).join("\n"), attachments)}</p>`; i = end + 1; continue; }
+    }
+    if (/^#{1,6}\s/.test(line)) { const level = line.match(/^#+/)[0].length; result += `<h${level}>${inline(line.replace(/^#+\s/, ""), attachments)}</h${level}>`; i++; continue; }
+    if (!trimmed) { i++; continue; }
+    if (/^\s*>/.test(line)) { result += `<blockquote>${inline(line.replace(/^\s*>\s?/, ""), attachments)}</blockquote>`; i++; continue; }
     if (/^\s*([-*]|\d+\.)\s/.test(line)) {
       const ordered = /^\s*\d+\./.test(line); const tag=ordered ? "ol" : "ul"; result+=`<${tag}>`;
       while (i < lines.length && /^\s*([-*]|\d+\.)\s/.test(lines[i])) {
         const item=lines[i++].replace(/^\s*([-*]|\d+\.)\s/, ""), task=item.match(/^\[([ xX])\]\s+(.*)$/);
-        result += task ? `<li class="task-list-item"><input type="checkbox" disabled ${task[1].toLowerCase()==="x"?"checked":""} aria-label="${task[1]===" "?"未完成":"已完成"}">${inline(task[2])}</li>` : `<li>${inline(item)}</li>`;
+        result += task ? `<li class="task-list-item"><input type="checkbox" disabled ${task[1].toLowerCase()==="x"?"checked":""} aria-label="${task[1]===" "?"未完成":"已完成"}">${inline(task[2], attachments)}</li>` : `<li>${inline(item, attachments)}</li>`;
       }
       result += `</${tag}>`; continue;
     }
     if (line.includes("|") && i+1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i+1])) {
       const split = row => row.trim().replace(/^\|/,"").replace(/\|$/,"").split("|");
-      result += `<div class="table-wrap"><table><thead><tr>${split(line).map(v=>`<th>${inline(v.trim())}</th>`).join("")}</tr></thead><tbody>`; i+=2;
-      while(i<lines.length && lines[i].includes("|")) result += `<tr>${split(lines[i++]).map(v=>`<td>${inline(v.trim())}</td>`).join("")}</tr>`;
+      result += `<div class="table-wrap"><table><thead><tr>${split(line).map(v=>`<th>${inline(v.trim(), attachments)}</th>`).join("")}</tr></thead><tbody>`; i+=2;
+      while(i<lines.length && lines[i].includes("|")) result += `<tr>${split(lines[i++]).map(v=>`<td>${inline(v.trim(), attachments)}</td>`).join("")}</tr>`;
       result += "</tbody></table></div>"; continue;
     }
     const para = [line]; i++;
-    while (i<lines.length && lines[i].trim() && !/^(#{1,6}\s|```|\s*[-*>]\s|\s*\d+\.\s)/.test(lines[i])) para.push(lines[i++]);
-    result += `<p>${para.map(inline).join("<br>")}</p>`;
+    while (i<lines.length && lines[i].trim() && !/^(#{1,6}\s|```|\s*[-*>]\s|\s*\d+\.\s|\s*\$\$|\s*\\\[)/.test(lines[i])) para.push(lines[i++]);
+    result += `<p>${para.map(part => inline(part, attachments)).join("<br>")}</p>`;
   }
   return result;
 }
+function mathBlockEnd(lines, start, close) {
+  for (let i = start + 1; i < lines.length; i++) if (lines[i].includes(close)) return i;
+  return -1;
+}
 
-function outputsHTML(outputs) {
+// KaTeX assets are served from this process only after /api/math/status reports
+// ready. Until then the spans above show their source, exactly as before.
+const mathState = {loading:null, ready:false, retryAt:0};
+const MATH_STYLE_ID = "castle-math-style";
+function mathScript() {
+  if (mathState.ready) return Promise.resolve(true);
+  if (mathState.loading) return mathState.loading;
+  mathState.loading = (async () => {
+    const status = await api("/api/math/status").catch(() => null);
+    if (!status?.ready) {
+      // Poll fast while the background download runs; back off when offline.
+      mathState.retryAt = Date.now() + (status?.downloading ? 1500 : 15000);
+      return false;
+    }
+    await loadCss("/api/math/katex.min.css");
+    await loadScript("/api/math/katex.min.js");
+    if (!window.katex) {
+      // A failed asset fetch must not turn the poll into a reload storm.
+      mathState.retryAt = Date.now() + 15000;
+      return false;
+    }
+    mathState.ready = true;
+    return true;
+  })().catch(() => false).finally(() => {mathState.loading = null;});
+  return mathState.loading;
+}
+function loadCss(href) {
+  if (document.getElementById(MATH_STYLE_ID)) return Promise.resolve();
+  return new Promise(resolve => {
+    const link = document.createElement("link");
+    link.id = MATH_STYLE_ID; link.rel = "stylesheet"; link.href = href;
+    link.onload = link.onerror = () => resolve();
+    document.head.appendChild(link);
+  });
+}
+function loadScript(src) {
+  return new Promise(resolve => {
+    const script = document.createElement("script");
+    script.src = src; script.async = true;
+    script.onload = script.onerror = () => resolve();
+    document.head.appendChild(script);
+  });
+}
+function typeset(root=document) {
+  if (!mathState.ready || !window.katex) return;
+  for (const span of root.querySelectorAll(".math-tex:not([data-typeset])")) {
+    try {
+      katex.render(span.dataset.tex || "", span, {displayMode:span.dataset.display==="true", throwOnError:false, output:"html"});
+      span.removeAttribute("data-tex");
+      span.dataset.typeset = "1";
+    } catch { /* keep the literal source visible */ }
+  }
+}
+function scheduleTypeset() {
+  if (mathState.ready) requestAnimationFrame(() => typeset());
+}
+function startMath() {
+  new MutationObserver(scheduleTypeset).observe(document.body, {childList:true, subtree:true});
+  // No request ever blocks first paint: one in-flight check, then a slow poll.
+  const tick = () => {
+    if (mathState.ready || mathState.loading || Date.now() < mathState.retryAt) return;
+    mathScript().then(ok => { if (ok) scheduleTypeset(); });
+  };
+  tick();
+  setInterval(tick, 1500);
+}
+
+function outputsHTML(outputs, attachments = {}) {
   return outputs.map(output => {
-    if (output.kind === "markdown") return `<div class="markdown rendered-output">${markdown(output.text)}</div>`;
+    if (output.kind === "markdown") return `<div class="markdown rendered-output">${markdown(output.text, attachments)}</div>`;
+    if (output.kind === "json") {
+      const text = String(output.text ?? "");
+      const fenced = /^\s*```/.test(text);
+      if (!fenced && !/^[\[{"]/.test(text.trimStart()) && /(^|\n)\s*(#{1,6}\s|[-*+]\s|\d+\.\s|>\s)/.test(text)) {
+        return `<div class="markdown rendered-output">${markdown(text, attachments)}</div>`;
+      }
+    }
     if (output.kind === "image" && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(output.data)) return `<img class="plot" src="${output.data}" alt="Python 图像输出">`;
     if (output.kind === "table") return `<div class="table-wrap"><table><thead><tr>${(output.data?.columns || []).map(v=>`<th>${h(v)}</th>`).join("")}</tr></thead><tbody>${(output.data?.rows || []).map(row=>`<tr>${row.map(v=>`<td>${h(typeof v === "object" && v !== null ? JSON.stringify(v) : v)}</td>`).join("")}</tr>`).join("")}</tbody></table>${output.truncated ? '<p class="muted">仅展示前 100 行、30 列。</p>' : ""}</div>`;
     return `<pre class="output-text ${output.kind === "error" || output.kind === "stderr" ? "error-text" : ""}">${h(output.text)}</pre>`;
@@ -113,16 +259,20 @@ function orderRunId(cell) {
   return state.live?.cell_id===cell.id && !state.live.operation ? state.live.id : cell.run_ids.at(-1) || cell.last_run_id;
 }
 
+// Every Order input is rendered Markdown unless the user is editing it. An
+// unrun Order has nothing to execute yet, but its requirement text is already
+// content worth reading (and formulas worth typesetting), so it previews too.
 function orderInputMode(cell) {
-  return orderRunId(cell)&&!state.orderEditing.has(cell.id) ? "preview" : "edit";
+  return state.orderEditing.has(cell.id) ? "edit" : "preview";
 }
 
 function inputFileStateHTML(cell) {
   const rid=orderRunId(cell), info=cell.file_input?.run_id===rid?cell.file_input:null;
-  if(!rid)return "";
+  const toggle=`<button class="text-button" data-action="${state.orderEditing.has(cell.id)?"done-order":"edit-order"}" data-id="${cell.id}" ${cellLocked(cell.id)?"disabled":""}>${state.orderEditing.has(cell.id)?"完成":"编辑"}</button>`;
+  if(!rid)return toggle;
   const label=state.outputDisconnected?"连接中断，显示最近内容":info?.state==="ready"?"input.md · 实时":
     info?.cached?"需求文件暂不可用，显示 Notebook 快照":info?.error||"等待 input.md…";
-  return `<span>${h(label)}</span><code title="${h(info?.path||"input.md")}">${h(info?.path||"input.md")}</code><button class="text-button" data-action="${state.orderEditing.has(cell.id)?"done-order":"edit-order"}" data-id="${cell.id}" ${cellLocked(cell.id)?"disabled":""}>${state.orderEditing.has(cell.id)?"完成":"编辑"}</button>`;
+  return `<span>${h(label)}</span><code title="${h(info?.path||"input.md")}">${h(info?.path||"input.md")}</code>${toggle}`;
 }
 
 function inputConflictHTML(cell) {
@@ -132,7 +282,7 @@ function inputConflictHTML(cell) {
 }
 
 function orderInputContentHTML(cell) {
-  if(orderInputMode(cell)==="preview")return `<div class="order-input-preview markdown" data-id="${cell.id}" tabindex="0" title="双击编辑当前需求">${cell.source?markdown(cell.source):'<p class="muted">需求文件为空。双击编辑。</p>'}</div>`;
+  if(orderInputMode(cell)==="preview")return `<div class="order-input-preview markdown" data-id="${cell.id}" tabindex="0" title="双击编辑当前需求">${cell.source?markdown(cell.source, cell.attachments):'<p class="muted">需求文件为空。双击编辑。</p>'}</div>`;
   return `<textarea id="source-${cell.id}" class="order-input" data-field="source" data-cell="${cell.id}" aria-label="AI 指令" rows="2" maxlength="32000" placeholder="本步 AI 指令…" ${cellLocked(cell.id)?"disabled":""}>${h(cell.source)}</textarea>`;
 }
 
@@ -148,7 +298,8 @@ function updateOrderInput(cell) {
   if(conflict.innerHTML!==conflictHTML)conflict.innerHTML=conflictHTML;
   conflict.hidden=!conflictHTML;
   const content=$(".order-source-content",root), mode=orderInputMode(cell);
-  if(root.dataset.inputMode!==mode) {root.dataset.inputMode=mode;content.innerHTML=orderInputContentHTML(cell);}
+  const editorMode=root.dataset.editorVersion==="edit"?"edit":"preview";
+  if(root.dataset.inputMode!==mode || editorMode!==mode) {root.dataset.inputMode=mode;content.innerHTML=orderInputContentHTML(cell);}
   else if(mode==="preview") {
     if(root.dataset.sourceVersion!==cell.source)content.innerHTML=orderInputContentHTML(cell);
   } else {
@@ -159,6 +310,9 @@ function updateOrderInput(cell) {
     }
   }
   root.dataset.sourceVersion=cell.source;
+  // Only this function writes this marker: renderAll rebuilds the content from
+  // mode, and a stale edit marker must not survive into the rebuilt element.
+  root.dataset.editorVersion=mode;
   autoSize();
 }
 
@@ -178,12 +332,12 @@ function receiveOrderInput(cell,item) {
 
 function orderOutputHTML(cell) {
   const rid=orderRunId(cell);
-  if(!rid)return outputsHTML(cell.outputs);
+  if(!rid)return outputsHTML(cell.outputs, cell.attachments);
   const info=cell.file_output?.run_id===rid ? cell.file_output : null;
   const outputs=info ? cell.outputs : cell.last_run_id===rid ? cell.outputs : [];
   const label=state.outputDisconnected ? "连接中断，显示最近内容" : info?.state==="ready" ? "output.md · 实时" :
     info?.cached ? "输出文件暂不可用，显示 Notebook 快照" : info?.error || "等待 output.md 更新…";
-  return `<div class="file-output-state ${info?.state==="unavailable"||state.outputDisconnected?"error-text":""}"><span>${h(label)}</span><code>${h(info?.path||"output.md")}</code></div>${outputsHTML(outputs)}`;
+  return `<div class="file-output-state ${info?.state==="unavailable"||state.outputDisconnected?"error-text":""}"><span>${h(label)}</span><code>${h(info?.path||"output.md")}</code></div>${outputsHTML(outputs, cell.attachments)}`;
 }
 
 function updateOrderOutput(cell) {
@@ -327,7 +481,7 @@ function cellHTML(cell,index) {
   if (cell.type === "code") {
     input=`<div class="code-editor"><pre class="code-highlight" aria-hidden="true">${pythonHTML(cell.source)}</pre><textarea class="code-input" data-field="source" data-cell="${cell.id}" spellcheck="false" wrap="off" aria-label="Python 代码" rows="4" ${disabled}>${h(cell.source)}</textarea></div>`;
   } else if (cell.type === "markdown") {
-    input=editing ? `<textarea class="markdown-input" data-field="source" data-cell="${cell.id}" spellcheck="false" aria-label="Markdown 内容" ${disabled}>${h(cell.source)}</textarea>` : `<div class="markdown markdown-preview" data-id="${cell.id}" title="双击编辑 Markdown">${cell.source ? markdown(cell.source) : '<p class="placeholder">Markdown</p>'}</div>`;
+    input=editing ? `<textarea class="markdown-input" data-field="source" data-cell="${cell.id}" spellcheck="false" aria-label="Markdown 内容" ${disabled}>${h(cell.source)}</textarea>` : `<div class="markdown markdown-preview" data-id="${cell.id}" title="双击编辑 Markdown">${cell.source ? markdown(cell.source, cell.attachments) : '<p class="placeholder">Markdown</p>'}</div>`;
   } else {
     input=`<div class="order-body">${orderInputHTML(cell)}<div class="contract-row"><label for="contract-${cell.id}">预期</label><textarea id="contract-${cell.id}" class="contract-input" data-field="expected_output" data-cell="${cell.id}" placeholder="输出契约" aria-label="预期输出" rows="1" maxlength="8000" ${disabled}>${h(cell.expected_output)}</textarea></div><div class="order-options"><span>Claude</span><select aria-label="输出格式" data-field="output_format" data-cell="${cell.id}" ${disabled}>${["markdown","json","text"].map(v=>`<option value="${v}" ${cell.output_format===v?"selected":""}>${v==="markdown"?"Markdown":v==="json"?"JSON":"Text"}</option>`).join("")}</select><button class="text-button" data-action="context" data-id="${cell.id}">上下文</button></div></div>`;
   }
@@ -340,7 +494,7 @@ function cellHTML(cell,index) {
   const operations=cell.type==="order"?`<button class="icon-btn" data-action="merge-cells" data-id="${cell.id}" title="Merge AI Cells · 合并两个 Order，清空原对话关联" aria-label="Merge AI Cells" ${executionDisabled||!state.boot.capabilities.claude||state.doc.cells.filter(c=>c.type==="order").length<2?"disabled":""}>${icon("merge")}</button><button class="icon-btn" data-action="split-cells" data-id="${cell.id}" title="Split AI Cells · 拆分为两个 Order，复制原对话" aria-label="Split AI Cells" ${executionDisabled||!state.boot.capabilities.claude||state.doc.cells.length>=100?"disabled":""}>${icon("split")}</button>`:"";
   return `<article class="cell ${cell.type}-cell ${state.selected===cell.id?"selected":""}" id="cell-${cell.id}" data-cell-card="${cell.id}" tabindex="0" title="${h(cell.title)} · 更新 ${h(timeText(cell.updated_at,true))}">
     <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${executionDisabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${live&&state.live.operation?'<span class="status-tag running"><i class="spinner"></i>整理中</span>':tagHTML(cell)}</span>${operations}<button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
-    <div class="output-block ${cell.stale?"stale-output":""} ${outputExpanded?"output-expanded":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span>${cell.type==="order"?`<button class="output-expand" data-action="toggle-order-output" data-id="${cell.id}" aria-controls="output-${cell.id}" aria-expanded="${outputExpanded}" title="${outputExpanded?"恢复滚动显示":"展开完整输出"}"><span class="output-expand-label">${outputExpanded?"恢复滚动显示":"展开完整输出"}</span></button>`:""}</div><div class="output-content" id="output-${cell.id}">${cell.type==="order"?orderOutputHTML(cell):live?outputsHTML(state.live.outputs):outputsHTML(cell.outputs)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
+    <div class="output-block ${cell.stale?"stale-output":""} ${outputExpanded?"output-expanded":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span>${cell.type==="order"?`<button class="output-expand" data-action="toggle-order-output" data-id="${cell.id}" aria-controls="output-${cell.id}" aria-expanded="${outputExpanded}" title="${outputExpanded?"恢复滚动显示":"展开完整输出"}"><span class="output-expand-label">${outputExpanded?"恢复滚动显示":"展开完整输出"}</span></button>`:""}</div><div class="output-content" id="output-${cell.id}">${cell.type==="order"?orderOutputHTML(cell):live?outputsHTML(state.live.outputs):outputsHTML(cell.outputs, cell.attachments)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
 }
 
 function autoSize() {
@@ -570,6 +724,7 @@ function watchRun(run) {
       } else if(message.type==="canonical_output") {
         if(run.cell_type==="order"){state.outputFingerprint="";refreshOrderOutputs();return;}
         state.live.outputs=[data];const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML([data]);
+        typeset(el || document);
       } else if(message.type==="session") {
         state.live.background_id=data.background_id;state.live.session_id=data.id;
         state.live.provider_permission_mode=data.permission_mode;
@@ -708,6 +863,9 @@ async function action(name,el) {
     if(cellLocked(id))return;
     await flushSave();state.selected=id;
     name==="edit-order"?state.orderEditing.add(id):state.orderEditing.delete(id);
+    // The marker lives on the content root; drop it so updateOrderInput
+    // rebuilds the content even when the mode label already matches.
+    const root=$(`#input-${id}`); if(root)delete root.dataset.editorVersion;
     updateOrderInput(state.doc.cells.find(c=>c.id===id));
     if(name==="edit-order")$(`#source-${id}`)?.focus();
     return;
@@ -725,7 +883,7 @@ async function action(name,el) {
   if(name==="view-run")return viewRun(id);
   if(name==="reset")return showModal("重启 Python 内核",`<p>重启将清空当前共享变量，保留所有历史输出。已有计算结果会标记失效，需从上游重新执行。</p><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn primary" data-action="confirm-reset">${icon("refresh")}重启内核</button></div>`);
   if(name==="confirm-reset"){await flushSave();state.doc=await api(`/api/notebooks/${state.doc.id}/kernel/reset`,"POST",{});$("#modal").close();renderAll();return toast("内核已重启，历史输出已保留。");}
-  if(name==="add")return mutateCells(()=>{const stamp=new Date().toISOString(),kind=el.dataset.type;const cell={id:newId(),type:kind,title:"",source:"",expected_output:"",context_note:"",mode:"llm",output_format:"markdown",created_at:stamp,updated_at:stamp,revision:1,status:"idle",stale:false,outputs:[],run_ids:[]};const at=el.dataset.insert?state.doc.cells.findIndex(c=>c.id===state.selected)+1:state.doc.cells.length;state.doc.cells.splice(at,0,cell);state.selected=cell.id;if(kind==="markdown")state.markdownEditing.add(cell.id);}).then(()=>{$(`#cell-${state.selected}`)?.scrollIntoView({behavior:"smooth",block:"center"});$(`#cell-${state.selected} textarea`)?.focus();});
+  if(name==="add")return mutateCells(()=>{const stamp=new Date().toISOString(),kind=el.dataset.type;const cell={id:newId(),type:kind,title:"",source:"",expected_output:"",context_note:"",mode:"llm",output_format:"markdown",created_at:stamp,updated_at:stamp,revision:1,status:"idle",stale:false,outputs:[],run_ids:[]};const at=el.dataset.insert?state.doc.cells.findIndex(c=>c.id===state.selected)+1:state.doc.cells.length;state.doc.cells.splice(at,0,cell);state.selected=cell.id;if(kind==="markdown")state.markdownEditing.add(cell.id);if(kind==="order")state.orderEditing.add(cell.id);}).then(()=>{$(`#cell-${state.selected}`)?.scrollIntoView({behavior:"smooth",block:"center"});$(`#cell-${state.selected} textarea`)?.focus();});
   if(["move-up","move-down","duplicate"].includes(name))return mutateCells(()=>{const index=state.doc.cells.findIndex(c=>c.id===id);if(name==="duplicate"){const copy=structuredClone(state.doc.cells[index]);Object.assign(copy,{id:newId(),title:copy.title+" · 副本",status:"idle",stale:false,outputs:[],run_ids:[],last_run_id:undefined,last_error:null,initializer:false,applied_run_id:undefined,file_input:undefined,file_output:undefined,input_session_synced:undefined});state.doc.cells.splice(index+1,0,copy);state.selected=copy.id;}else{const to=index+(name==="move-up"?-1:1);if(to>=0 && to<state.doc.cells.length)[state.doc.cells[index],state.doc.cells[to]]=[state.doc.cells[to],state.doc.cells[index]];}});
   if(name==="delete")return showModal("删除这个单元",`<p>将删除当前文档中的「${h(state.doc.cells.find(c=>c.id===id).title)}」。独立运行证据文件仍保存在本地，下游结果会标记失效。</p><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn danger" data-action="confirm-delete" data-id="${id}">删除单元</button></div>`);
   if(name==="confirm-delete"){$("#modal").close();return mutateCells(()=>{state.doc.cells=state.doc.cells.filter(c=>c.id!==id);state.expandedOrderOutputs.delete(id);state.selected=state.doc.cells[0]?.id;});}
@@ -760,7 +918,7 @@ document.addEventListener("input",event=>{
 document.addEventListener("change",event=>{
   if(event.target.id==="cell-type"){
     const kind=event.target.value;
-    mutateCells(()=>{const cell=currentCell();cell.type=kind;if(kind==="markdown")state.markdownEditing.add(cell.id);}).catch(e=>toast(e.message,true));return;
+    mutateCells(()=>{const cell=currentCell();cell.type=kind;if(kind==="markdown")state.markdownEditing.add(cell.id);if(kind==="order")state.orderEditing.add(cell.id);}).catch(e=>toast(e.message,true));return;
   }
   if(event.target.tagName==="SELECT"&&event.target.dataset.field)event.target.dispatchEvent(new Event("input",{bubbles:true}));
 });
@@ -801,6 +959,7 @@ $("#modal").addEventListener("click",event=>{if(event.target===$("#modal")){cons
     if(first){state.doc=await api(`/api/notebooks/${first.id}`);state.selected=state.doc.cells.find(c=>c.type==="order")?.id||state.doc.cells[0]?.id;}
     shell();
     startOutputPolling();
+    startMath();
     if(state.doc?.runtime.active_run_id){const run=await api(`/api/runs/${state.doc.runtime.active_run_id}`);watchRun(run).catch(e=>toast(e.message,true));}
   } catch(error){$("#app").innerHTML=`<div class="boot error-text">${icon("warning")}<h1>无法打开研究工作台</h1><p>${h(error.message)}</p><a class="btn outline" href="/">重新连接</a></div>`;}
 })();
