@@ -47,11 +47,13 @@ python -m castle_notebook --project E:\research\my_model --python E:\conda\envs\
 --port 8765           Local port
 --python PATH         Kernel interpreter (defaults to the Python running the server)
 --claude PATH         Claude executable or npm cli.js
+--codex PATH          Codex executable or npm codex.js
+--provider claude     Default AI provider (claude or codex); each Order cell can override
 --claude-launch-mode background   Native background (default); "print" is the legacy non-interactive mode
---claude-permission-mode auto     Claude auto-approval (default); escalate in terminal when needed
+--claude-permission-mode auto     Claude auto-approval (default); escalate in terminal when needed; Codex maps this to its sandbox
 --data-dir PATH       Document & evidence directory (defaults to <project>/.castle)
 --code-timeout 60     Max seconds for Python execution
---agent-timeout 240   Max seconds for print-mode Claude; native background has no limit
+--agent-timeout 240   Max seconds for print-mode Claude and Codex; native background has no limit
 --empty               Do not auto-create the first example
 ```
 

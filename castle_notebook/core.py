@@ -15,8 +15,9 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 import uuid
 
-VERSION = "0.9.0"
+VERSION = "0.9.6"
 CELL_TYPES = {"code", "markdown", "order"}
+AI_PROVIDERS = ("claude", "codex")
 ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
 MAX_CONTEXT = 48000
 
@@ -59,6 +60,7 @@ def new_cell(kind="order", title="", source="", expected_output=""):
     return {"id": uid(), "type": kind, "title": title,
             "source": source, "expected_output": expected_output,
             "output_format": "markdown", "context_note": "", "mode": "llm",
+            "provider": "default",
             "created_at": stamp, "updated_at": stamp, "revision": 1,
             "status": "idle", "stale": False, "outputs": [], "run_ids": []}
 
@@ -137,7 +139,8 @@ def editable_document(doc, incoming):
             changed |= value != cell[key]
             cell[key] = value
         for key, allowed, default in (("mode", {"llm", "agent"}, "llm"),
-                                      ("output_format", {"markdown", "json", "text"}, "markdown")):
+                                      ("output_format", {"markdown", "json", "text"}, "markdown"),
+                                      ("provider", {"default", *AI_PROVIDERS}, "default")):
             value = item.get(key, default)
             if value not in allowed:
                 raise Problem(f"{key} 选项无效。")
@@ -432,7 +435,7 @@ def validate_order_output(answer, output_format):
         r"(?:function_calls|tool_calls?|invoke)\b)", candidate, re.IGNORECASE)
     if protocol:
         raise Problem("模型返回了未执行的工具调用协议，未形成最终结论。"
-                      "请检查 Claude CLI 所用模型或网关的工具协议兼容性；原始输出已保留。")
+                      "请检查 AI CLI 所用模型或网关的工具协议兼容性；原始输出已保留。")
     if output_format == "json":
         parse_json_output(answer)
 

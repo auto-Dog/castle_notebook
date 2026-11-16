@@ -148,7 +148,7 @@ class BackgroundTests(unittest.TestCase):
 
     def test_hook_ignores_subagent_completion(self):
         folder = self.project / "hook events"
-        result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "castle_notebook/claude_hook.py"), str(folder)],
+        result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "castle_notebook/providers/claude_hook.py"), str(folder)],
                                 input=json.dumps({"hook_event_name": "Stop", "agent_id": "child", "last_assistant_message": "Wrong answer"}),
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -156,7 +156,7 @@ class BackgroundTests(unittest.TestCase):
 
     def test_hook_preserves_utf8_chinese_stop_message(self):
         folder = self.project / "hook events"
-        result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "castle_notebook/claude_hook.py"), str(folder)],
+        result = subprocess.run([sys.executable, str(Path(__file__).parents[1] / "castle_notebook/providers/claude_hook.py"), str(folder)],
                                 input=json.dumps({"hook_event_name": "Stop", "last_assistant_message": "写入和读回均成功"}, ensure_ascii=False).encode("utf-8"),
                                 capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)

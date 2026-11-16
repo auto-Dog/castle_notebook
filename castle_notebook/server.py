@@ -17,7 +17,9 @@ from urllib.request import Request, urlopen
 from .core import (Problem, Store, VERSION, ensure_context_config, ensure_settings,
                    initialization_notebook, new_notebook, project_path, read_project_asset,
                    read_project_file, scan_project, settings_summary, text_field)
-from .execution import Engine, resolve_claude
+from .execution import Engine
+from .providers.claude import resolve_claude
+from .providers.codex import resolve_codex
 
 STATIC = Path(__file__).with_name("static")
 # Formula rendering (KaTeX) is vendored on first use. The server fetches it in a
@@ -53,7 +55,8 @@ MATH_RETRY = 60.0
 class App:
     def __init__(self, project, data_dir=None, python=None, claude_command=None,
                  seed=True, code_timeout=60, agent_timeout=240,
-                 claude_launch_mode="background", claude_permission_mode="auto"):
+                 claude_launch_mode="background", claude_permission_mode="auto",
+                 provider="claude", codex_command=None):
         self.project = Path(project).resolve()
         if not self.project.is_dir():
             raise Problem("项目目录不存在。")
@@ -62,7 +65,7 @@ class App:
         self.context_config_path = ensure_context_config(self.project)
         self.settings_path = ensure_settings(self.project)
         self.engine = Engine(self.store, python, claude_command, code_timeout, agent_timeout,
-                             claude_launch_mode, claude_permission_mode)
+                             claude_launch_mode, claude_permission_mode, provider, codex_command)
         if seed and not self.store.list():
             self.store.put(new_notebook(self.project, template="quant"))
 
@@ -284,7 +287,9 @@ class Handler(BaseHTTPRequestHandler):
                               "project_path": str(self.app.project), "notebooks": self.app.store.list(),
                               "context_config_path": str(self.app.context_config_path),
                               "settings": settings_summary(self.app.project),
-                              "capabilities": {"claude": bool(self.app.engine.claude_command),
+                              "capabilities": {"claude": bool(self.app.engine.providers["claude"].command),
+                                               "codex": bool(self.app.engine.providers["codex"].command),
+                                               "default_provider": self.app.engine.default_provider,
                                                "python": self.app.engine.python,
                                                "claude_launch_mode": self.app.engine.claude_launch_mode,
                                                "claude_permission_mode": self.app.engine.claude_permission_mode,
@@ -307,8 +312,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(scan_project(self.app.project, self.body().get("relative_path", "."), excluded=(self.app.store.path,)))
         if parts == ["api", "project", "initialize"] and method == "POST":
             body = self.body()
-            if body.get("run", True) and not self.app.engine.claude_command:
-                raise Problem("初始化项目需要 Claude CLI。请安装并登录 Claude Code 后重启服务。", 503)
+            if body.get("run", True) and not self.app.engine.providers[self.app.engine.default_provider].command:
+                raise Problem("初始化项目需要 AI CLI（Claude 或 Codex）。请安装并登录后重启服务。", 503)
             scan = scan_project(self.app.project, body.get("relative_path", "."), excluded=(self.app.store.path,))
             doc = initialization_notebook(scan)
             self.app.store.put(doc)
@@ -450,28 +455,36 @@ def main():
     parser.add_argument("--data-dir", help="Notebook 与运行证据的存储目录，默认 <project>/.castle")
     parser.add_argument("--python", default=sys.executable, help="Python 内核解释器，可指定研究环境")
     parser.add_argument("--claude", help="Claude 可执行文件或 npm cli.js 路径")
+    parser.add_argument("--codex", help="Codex 可执行文件或 npm codex.js 路径")
+    parser.add_argument("--provider", choices=("claude", "codex"), default="claude",
+                        help="Order 单元的默认 AI 提供商；单元内可单独切换")
     parser.add_argument("--claude-launch-mode", choices=("background", "print"), default="background",
-                        help="Claude 启动模式：原生后台（默认，可在 claude agents 查看）或非交互流式")
+                        help="Claude 启动模式：原生后台（默认，可在 claude agents 查看）或非交互流式；Codex 始终为流式子进程")
     parser.add_argument("--claude-permission-mode", default="auto",
                         choices=("bypassPermissions", "auto", "acceptEdits", "default", "plan", "dontAsk"),
-                        help="Claude 权限模式，默认 auto 自动审批；需要处理时可进入后台对话")
+                        help="AI 权限模式，默认 auto 自动审批；Codex 映射为沙箱策略（default/plan 只读，bypassPermissions 跳过沙箱）")
     parser.add_argument("--empty", action="store_true", help="不创建首次启动示例")
     parser.add_argument("--code-timeout", type=int, default=60)
-    parser.add_argument("--agent-timeout", type=int, default=240, help="print 模式 Claude 执行秒数上限；原生后台会话不设执行期限")
+    parser.add_argument("--agent-timeout", type=int, default=240, help="Claude print 模式与 Codex 执行秒数上限；Claude 原生后台会话不设执行期限")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or not 1 <= args.code_timeout <= 3600 or not 1 <= args.agent_timeout <= 3600:
         parser.error("端口必须为 1–65535，超时必须为 1–3600 秒。")
     if args.claude and not resolve_claude(args.claude):
         parser.error("无法解析 Claude 可执行文件；请直接指定 .exe、Unix executable 或 cli.js。")
+    if args.codex and not resolve_codex(args.codex):
+        parser.error("无法解析 Codex 可执行文件；请直接指定 .exe、Unix executable 或 codex.js。")
     app = App(args.project, args.data_dir, args.python, resolve_claude(args.claude),
               not args.empty, args.code_timeout, args.agent_timeout,
-              args.claude_launch_mode, args.claude_permission_mode)
+              args.claude_launch_mode, args.claude_permission_mode,
+              args.provider, resolve_codex(args.codex))
     try:
         server = Server(("127.0.0.1", args.port), app)
     except OSError as exc:
         app.close()
         parser.exit(1, f"无法启动端口 {args.port}：{exc}\n")
-    print(f"\n  CastleNotebook {VERSION}\n  Local:   http://127.0.0.1:{args.port}\n  Project: {app.project}\n  Python:  {app.engine.python}\n  Claude:  {'available' if app.engine.claude_command else 'not found'}\n", flush=True)
+    claude_state = "available" if app.engine.providers["claude"].command else "not found"
+    codex_state = "available" if app.engine.providers["codex"].command else "not found"
+    print(f"\n  CastleNotebook {VERSION}\n  Local:    http://127.0.0.1:{args.port}\n  Project:  {app.project}\n  Python:   {app.engine.python}\n  Claude:   {claude_state}\n  Codex:    {codex_state}\n  Provider: {app.engine.default_provider} (default)\n", flush=True)
     try:
         server.serve_forever(poll_interval=0.3)
     except KeyboardInterrupt:

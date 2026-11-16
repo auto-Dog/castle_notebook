@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "castle-notebook"
-version = "0.9.0"
+version = "0.9.6"
 description = "A local, inspectable AI-assisted notebook for algorithm and quantitative research."
 readme = "README.en.md"
 requires-python = ">=3.10"
