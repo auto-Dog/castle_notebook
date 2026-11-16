@@ -16,10 +16,12 @@ from unittest.mock import patch
 
 from castle_notebook.core import (MAX_CONTEXT, MAX_EMBEDDED_IMAGE_BYTES, Problem, Store,
                                  default_context_config, editable_document,
-                                 embed_markdown_images, ensure_context_config, load_context_config,
-                                 normalize_context_config, initialization_notebook, new_cell, new_notebook,
+                                 embed_markdown_images, ensure_context_config, ensure_settings,
+                                 load_context_config, load_settings, normalize_context_config,
+                                 normalize_settings, initialization_notebook, new_cell, new_notebook,
                                  pack_context, parse_json_output, project_changes, read_project_asset,
-                                 read_project_file, scan_project, snapshot_project, validate_order_output)
+                                 read_project_file, scan_project, settings_summary, snapshot_project,
+                                 validate_order_output)
 from castle_notebook.execution import (Engine, linux_terminal_command, open_claude_terminal,
                                        resolve_claude, spawn_options)
 from castle_notebook.server import App, MathAssets, Server
@@ -291,6 +293,30 @@ class CoreTests(unittest.TestCase):
                         {"templates": {"global": "{unknown}"}}):
             with self.subTest(invalid=invalid), self.assertRaises(Problem):
                 normalize_context_config(invalid)
+
+    def test_settings_default_to_confirmation_and_fail_safe(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = ensure_settings(folder)
+            self.assertEqual(path, Path(folder).resolve() / ".castle" / "settings.json")
+            self.assertEqual(load_settings(folder), {"version": 1, "confirm_order_run": True})
+            path.write_text('{"confirm_order_run": false}', encoding="utf-8")
+            self.assertFalse(load_settings(folder)["confirm_order_run"])
+            overview = settings_summary(folder)
+            self.assertFalse(overview["confirm_order_run"])
+            self.assertIsNone(overview["error"])
+            path.write_text('{"confirm_order_run": "false"}', encoding="utf-8")
+            with self.assertRaisesRegex(Problem, "settings.json"):
+                load_settings(folder)
+            # A broken settings file must never disable the safety prompt.
+            overview = settings_summary(folder)
+            self.assertTrue(overview["confirm_order_run"])
+            self.assertIn("confirm_order_run", overview["error"])
+
+    def test_settings_reject_unknown_options_and_versions(self):
+        for invalid in ([], {"unknown": True}, {"version": 2}, {"version": True},
+                        {"confirm_order_run": 1}):
+            with self.subTest(invalid=invalid), self.assertRaises(Problem):
+                normalize_settings(invalid)
 
     def test_protocol_only_output_is_not_a_final_answer(self):
         for answer in ('<｜｜DSML｜｜ calls>bad</｜｜DSML｜｜ calls>',
@@ -1324,8 +1350,11 @@ class HTTPTests(unittest.TestCase):
     def test_bootstrap_static_and_security_headers(self):
         status, headers, body = self.request("GET", "/api/bootstrap")
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["token"], self.app.token)
-        self.assertEqual(json.loads(body)["context_config_path"], str(self.app.context_config_path))
+        payload = json.loads(body)
+        self.assertEqual(payload["token"], self.app.token)
+        self.assertEqual(payload["context_config_path"], str(self.app.context_config_path))
+        self.assertEqual(payload["settings"], {"path": str(self.app.settings_path),
+                                               "confirm_order_run": True, "error": None})
         status, headers, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn(b"app.js", body)

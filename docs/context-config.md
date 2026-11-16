@@ -1,6 +1,6 @@
 # 上下文与 harness prompt 配置
 
-编辑研究项目中的 `.castle/context.json`。服务首次启动时生成默认配置；保存后，下次点击“上下文”或运行单元就会重新读取，无需重启。正在执行的单元继续使用启动时的配置快照。
+编辑研究项目中的 `.castle/context.json`。运行 Order 前的确认弹窗由另一个文件 `.castle/settings.json` 控制（`"confirm_order_run": false` 可关闭），不在本配置内。服务首次启动时生成默认配置；保存后，下次点击“上下文”或运行单元就会重新读取，无需重启。正在执行的单元继续使用启动时的配置快照。
 
 配置分为 `features`、`limits`、`templates` 三部分。所有开关默认开启；未填写的配置项使用默认值。JSON 使用 `true` / `false`，不支持注释。
 

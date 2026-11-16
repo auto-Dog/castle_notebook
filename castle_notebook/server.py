@@ -14,9 +14,9 @@ import time
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from .core import (Problem, Store, VERSION, ensure_context_config, initialization_notebook,
-                   new_notebook, project_path, read_project_asset, read_project_file, scan_project,
-                   text_field)
+from .core import (Problem, Store, VERSION, ensure_context_config, ensure_settings,
+                   initialization_notebook, new_notebook, project_path, read_project_asset,
+                   read_project_file, scan_project, settings_summary, text_field)
 from .execution import Engine, resolve_claude
 
 STATIC = Path(__file__).with_name("static")
@@ -60,6 +60,7 @@ class App:
         self.token = secrets.token_urlsafe(32)
         self.store = Store(data_dir or self.project / ".castle")
         self.context_config_path = ensure_context_config(self.project)
+        self.settings_path = ensure_settings(self.project)
         self.engine = Engine(self.store, python, claude_command, code_timeout, agent_timeout,
                              claude_launch_mode, claude_permission_mode)
         if seed and not self.store.list():
@@ -282,6 +283,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"token": self.app.token, "version": VERSION,
                               "project_path": str(self.app.project), "notebooks": self.app.store.list(),
                               "context_config_path": str(self.app.context_config_path),
+                              "settings": settings_summary(self.app.project),
                               "capabilities": {"claude": bool(self.app.engine.claude_command),
                                                "python": self.app.engine.python,
                                                "claude_launch_mode": self.app.engine.claude_launch_mode,

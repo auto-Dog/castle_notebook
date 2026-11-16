@@ -52,7 +52,11 @@ function makeApp() {
   const renderHooks = {};
   const document = {activeElement:null, querySelector:selector => elements.get(selector) || null,
     querySelectorAll:() => [], addEventListener:(name, callback) => listeners.set(name, callback)};
-  elements.set("#modal", {open:false, addEventListener(){}});
+  const modal = {open:false, innerHTML:"", className:"", closeListeners:[],
+    addEventListener(name, callback){if(name === "close")this.closeListeners.push(callback);},
+    showModal(){this.open = true;},
+    close(){if(!this.open)return;this.open = false;this.closeListeners.splice(0).forEach(callback=>callback());}};
+  elements.set("#modal", modal);
   let nextTimer = 0;
   const sandbox = {
     document, renderHooks, structuredClone,
@@ -82,7 +86,8 @@ function makeApp() {
     refreshOrderOutputs=async()=>{};refreshContext=()=>{};toast=()=>{};
     globalThis.app={state,window,cellLocked,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
       outputsHTML,orderInputMode,updateOrderInput,markdown,inline,mathSpan,splitMath,
-      mathState,mathScript,typeset,startMath};
+      mathState,mathScript,typeset,startMath,runCell,confirmOrderRun,settleOrderRunConfirm,
+      orderRunConfirmationEnabled,orderRunConfirmBody};
   `, sandbox);
   const app = sandbox.app, doc = documentFixture();
   app.state.doc = doc;
@@ -128,6 +133,52 @@ test("only the running cell is locked, including during Run All", () => {
   assert.equal(app.cellLocked(codeId),true);
   app.state.live = null; // Reconnecting to an active run must not expose its input.
   assert.equal(app.cellLocked(runningId),true);
+});
+
+test("an Order run waits for the confirmation dialog before starting", async () => {
+  const env = makeApp(), {app} = env;
+  app.state.boot.settings = {confirm_order_run:true};
+  const pending = app.runCell(orderId);
+  await tick(); await tick();
+  assert.equal(env.elements.get("#modal").open,true);
+  assert.equal(env.requests.filter(request => request.method === "POST").length,0);
+  app.settleOrderRunConfirm(false);
+  const result = await pending;
+  assert.equal(result.status,"cancelled");
+  assert.equal(result.cancelled,true);
+  assert.equal(result.cell_id,orderId);
+  assert.equal(env.requests.filter(request => request.method === "POST").length,0);
+});
+
+test("the confirmation names the software, configured modes and target Order", async () => {
+  const env = makeApp(), {app,doc} = env;
+  Object.assign(app.state.boot.capabilities,{claude:true,claude_launch_mode:"print",
+    claude_permission_mode:"default"});
+  doc.cells[3].title = "审阅假设与下一步";
+  const body = app.orderRunConfirmBody(doc.cells[3]);
+  assert.match(body,/Claude Code/);
+  assert.match(body,/print 非交互/);
+  assert.match(body,/default（逐项询问）/);
+  assert.match(body,/审阅假设与下一步/);
+  assert.match(body,/output\.md/);
+});
+
+test("confirming starts the run, and settings can disable the prompt", async () => {
+  const env = makeApp(), {app} = env;
+  app.state.boot.settings = {confirm_order_run:true};
+  let pending = app.runCell(orderId);
+  await tick(); await tick();
+  app.settleOrderRunConfirm(true);
+  let request = await env.take("POST",`/api/notebooks/${nid}/cells/${orderId}/run`);
+  request.respond({error:"test stop"},500);
+  await assert.rejects(pending,/test stop/);
+
+  app.state.boot.settings = {confirm_order_run:false};
+  pending = app.runCell(orderId);
+  request = await env.take("POST",`/api/notebooks/${nid}/cells/${orderId}/run`);
+  assert.equal(env.elements.get("#modal").open,false);
+  request.respond({error:"test stop"},500);
+  await assert.rejects(pending,/test stop/);
 });
 
 test("completion rebases unsaved edits without replacing model-written requirements", async () => {

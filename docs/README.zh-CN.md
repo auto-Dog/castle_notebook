@@ -60,6 +60,16 @@ files = !dir
 3. 选择单元，点击“运行”，或按 `Ctrl+Enter`。`Shift+Enter` 执行并选择下一单元；Markdown 双击编辑、执行后预览。
 4. 点击右上角检查器图标，检查上下文、变量与执行记录。Order 的“上下文”按钮展示即将发送的完整文本；运行历史保存实际发送时的快照。
 
+Order 是覆盖式 AI 重跑，因此每次运行前都会弹窗确认：列出所用软件（Claude Code）、启动方式与权限模式（例如“原生后台 · auto（自动审批）”）以及目标 Order，并提示本次会覆盖现有 `output.md`、对话关联和下游结果。点击“继续运行”后才向服务发起执行；取消、关闭弹窗或按 Esc 都不会启动。该防呆提示可在启动服务所在项目的 `.castle/settings.json` 中关闭：
+
+```json
+{
+  "confirm_order_run": false
+}
+```
+
+设置缺失或文件格式错误时默认保持开启，避免误操作；可在“本地运行环境”中查看当前状态和文件路径。开启时，运行全部也会在每个 Order 执行前询问。
+
 例如，在项目中已有 `model.py` 时，Order 可以要求“修复 `model.py` 的边界处理，并运行相关测试”；下一 Python 单元用 `from model import predict` 调用实际实现。Output 收集最终回答及执行期间真实新增、修改、删除的项目文件，不将回答中的代码片段视为已落盘的开发成果。失败或停止执行后，已发生的文件修改也会保留并收集。
 
 每次 AI 输入都包含项目目录、有限文件概览与项目工作要求；现有 `.castle/context.json` 的自定义模板也会补入该说明。开发步骤应报告修改路径、已执行验证和未完成事项；只读分析及初始化仍遵循其只读要求。项目文件内容作为数据读取，不替代 Global 和当前任务。
@@ -126,6 +136,7 @@ Notebook 文档和运行证据默认位于启动项目的 `.castle/`，已加入
 ```text
 .castle/
   context.json              # 上下文功能开关、harness 模板与字符预算
+  settings.json             # 运行确认等界面安全开关
   prompts/input<run-id>.md   # Claude 自行读取的完整输入
   notebooks/<notebook-id>.json
   runs/<run-id>/

@@ -75,6 +75,16 @@ For the complete Chinese documentation (workflow, Claude integration, save & rep
 3. Select a cell and click **Run**, or press `Ctrl+Enter`. `Shift+Enter` runs and selects the next cell; Markdown cells are edited by double-clicking and previewed after execution.
 4. Click the inspector icon in the top-right to inspect context, variables, and execution history. An Order's **Context** button shows the full text that will be sent; run history stores a snapshot of what was actually sent.
 
+Because an Order run overwrites AI output, every run first opens a confirmation dialog naming the software (Claude Code), the configured launch and permission modes (for example "native background · auto (auto-approval)"), and the target Order, and warning that the existing `output.md`, conversation link, and downstream results will be replaced. Execution starts only after **Continue**; cancelling, closing the dialog, or pressing Esc starts nothing. Disable this guard in the launched project's `.castle/settings.json`:
+
+```json
+{
+  "confirm_order_run": false
+}
+```
+
+A missing or malformed file keeps the prompt enabled to stay fail-safe; the current state and file path appear in **Local runtime environment**. While enabled, Run All also asks before each Order.
+
 For example, if `model.py` already exists in your project, an Order can ask to "fix boundary handling in `model.py` and run the relevant tests"; the next Python cell calls the real implementation via `from model import predict`. Output collects the final answer plus project files that were genuinely added, modified, or deleted during execution — code snippets in an answer are not treated as landed development. File modifications that occurred before a failure or stop are retained and collected.
 
 Every AI input includes the project directory, a bounded file overview, and project work guidelines; any custom template in the existing `.castle/context.json` is merged in as well. Development steps should report modified paths, validations performed, and outstanding items; read-only analysis and initialization still honor their read-only requirements. Project file contents are read as data and do not replace Global or the current task.
@@ -145,6 +155,7 @@ Notebook documents and run evidence default to the `.castle/` directory of the l
 ```text
 .castle/
   context.json              # Context feature flags, harness templates & character budgets
+  settings.json             # UI safety switches such as run confirmation
   prompts/input<run-id>.md   # Full input Claude reads itself
   notebooks/<notebook-id>.json
   runs/<run-id>/

@@ -34,6 +34,10 @@ const icon = (name, cls="") => `<svg class="icon ${cls}" viewBox="0 0 24 24" fil
 const timeText = (value, full=false) => value ? new Date(value).toLocaleString("zh-CN", full ? {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false} : {hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}) : "—";
 const typeLabel = {code:"PYTHON", markdown:"MARKDOWN", order:"ORDER"};
 const statusLabel = {idle:"待执行", running:"执行中", succeeded:"已完成", failed:"执行失败", cancelled:"已停止", interrupted:"已中断"};
+const launchModeLabel = {background:"原生后台", print:"print 非交互"};
+const permissionModeLabel = {bypassPermissions:"bypassPermissions（跳过审批）", auto:"auto（自动审批）",
+  acceptEdits:"acceptEdits（自动接受编辑）", default:"default（逐项询问）",
+  plan:"plan（只读规划）", dontAsk:"dontAsk（不主动询问）"};
 const busy = () => Boolean(state.live || state.doc?.runtime?.active_run_id || state.runRefresh);
 const cellLocked = id => Boolean(state.live?.operation || state.live?.cell_id===id ||
   (state.doc?.runtime?.active_run_id && !state.live));
@@ -744,7 +748,55 @@ function watchRun(run) {
   });
 }
 
-async function runCell(id) {
+// An Order run always replaces what the cell currently shows, so it gets a
+// deliberate, mode-aware confirmation. The switch lives in .castle/settings.json.
+function orderRunConfirmationEnabled() {
+  return state.boot?.settings?.confirm_order_run !== false;
+}
+function orderRunModeText() {
+  const capabilities=state.boot?.capabilities||{};
+  const launch=launchModeLabel[capabilities.claude_launch_mode]||capabilities.claude_launch_mode||"默认启动方式";
+  const permission=permissionModeLabel[capabilities.claude_permission_mode]||capabilities.claude_permission_mode||"默认权限模式";
+  return `${launch} · ${permission}`;
+}
+function orderRunTarget(cell) {
+  const title=String(cell.title||"").trim();
+  if(title)return title;
+  const index=state.doc?.cells.findIndex(item=>item.id===cell.id)??-1;
+  return index>=0?`Order ${index+1}`:"当前 Order";
+}
+function orderRunConfirmBody(cell) {
+  const rerun=Boolean(cell.run_ids?.length||cell.last_run_id);
+  return `<p class="modal-description">是否采用 <strong>Claude Code</strong> 的 <strong>${h(orderRunModeText())}</strong> 模式运行「<strong>${h(orderRunTarget(cell))}</strong>」？</p><div class="modal-callout">${icon("warning")}<span>${rerun?"这是覆盖式 AI 重跑：运行会重新生成并覆盖该单元现有的 output.md 与对话关联，下游结果会被标记失效。":"运行会启动一次 AI 会话，并把结果写入该单元的 output.md。"}</span></div><p class="muted">可在启动项目的 <code>.castle/settings.json</code> 中设置 <code>"confirm_order_run": false</code> 关闭此提示。</p><div class="modal-actions"><button class="btn outline" data-action="cancel-order-run">取消</button><button class="btn primary" data-action="confirm-order-run">${icon("play")}继续运行</button></div>`;
+}
+let pendingOrderRunConfirm=null;
+function settleOrderRunConfirm(value) {
+  const resolve=pendingOrderRunConfirm;
+  pendingOrderRunConfirm=null;
+  const modal=$("#modal");
+  if(modal?.open)modal.close();
+  if(resolve)resolve(value);
+}
+function confirmOrderRun(cell) {
+  if(!orderRunConfirmationEnabled())return Promise.resolve(true);
+  if(pendingOrderRunConfirm)settleOrderRunConfirm(false);
+  const modal=$("#modal");
+  showModal("运行 Order 单元", orderRunConfirmBody(cell));
+  return new Promise(resolve=>{
+    pendingOrderRunConfirm=resolve;
+    modal.addEventListener("close",()=>{
+      if(pendingOrderRunConfirm===resolve)settleOrderRunConfirm(false);
+    },{once:true});
+  });
+}
+
+async function runCell(id, options={}) {
+  await flushSave();
+  if(busy())throw new Error("请先等待或停止当前单元。");
+  const cell=state.doc.cells.find(item=>item.id===id);
+  if(cell?.type==="order" && options.confirm!==false && !(await confirmOrderRun(cell)))
+    return {status:"cancelled",cancelled:true,cell_id:id};
+  // A dialog may stay open while output polling refreshes the document.
   await flushSave();
   if(busy())throw new Error("请先等待或停止当前单元。");
   const run=await api(`/api/notebooks/${state.doc.id}/cells/${id}/run`,"POST",{});
@@ -827,6 +879,8 @@ async function action(name,el) {
   if(name==="select")return selectCell(id,true);
   if(name==="scroll-global")return $("#global-cell")?.scrollIntoView({behavior:"smooth"});
   if(name==="close-modal")return $("#modal").close();
+  if(name==="confirm-order-run")return settleOrderRunConfirm(true);
+  if(name==="cancel-order-run")return settleOrderRunConfirm(false);
   if(name==="tab"){state.tab=el.dataset.tab;return inspectorFrame();}
   if(name==="project"){state.tab="project";state.inspectorOpen=true;$(".workspace").classList.add("inspector-open");return inspectorFrame();}
   if(name==="refresh-project")return renderProject();
@@ -889,7 +943,7 @@ async function action(name,el) {
   if(name==="confirm-delete"){$("#modal").close();return mutateCells(()=>{state.doc.cells=state.doc.cells.filter(c=>c.id!==id);state.expandedOrderOutputs.delete(id);state.selected=state.doc.cells[0]?.id;});}
   if(name==="apply-init"){await flushSave();state.doc=await api(`/api/notebooks/${state.doc.id}/apply-init`,"POST",{run_id:id});renderAll();return toast("项目已拆分为独立单元。检查代码后再逐步运行。");}
   if(name==="scan-project"){el.disabled=true;try{const result=await api("/api/project/scan","POST",{relative_path:$("#init-form input[name=relative_path]").value});$("#scan-result").innerHTML=`<p class="muted">${result.files.length} 个文件${result.truncated?" · 概览已截断":""}</p><pre>${h(result.files.join("\n"))}</pre><p class="muted">${h(result.policy)}</p>`;}finally{el.disabled=false;}return;}
-  if(name==="environment")return showModal("本地运行环境",`<div class="environment-details"><label>项目工作目录</label><code>${h(state.doc?.project_path||state.boot.project_path)}</code><label>Python 内核</label><code>${h(state.boot.capabilities.python)}</code><label>Claude CLI</label><p>${state.boot.capabilities.claude?'<span class="status-tag succeeded">已检测到</span> 运行时沿用本机 Claude 的模型、工具、权限与登录配置。':'<span class="status-tag failed">未检测到</span> 安装并登录后，重启本服务。'}</p><label>执行上限</label><p>Python ${state.boot.capabilities.code_timeout} 秒 · Claude ${state.boot.capabilities.agent_timeout} 秒</p></div><p class="muted">切换研究环境：启动服务时指定 <code>--python &lt;解释器路径&gt;</code>。初始化其他项目：使用 <code>--project &lt;项目目录&gt;</code>。</p>`);
+  if(name==="environment")return showModal("本地运行环境",`<div class="environment-details"><label>项目工作目录</label><code>${h(state.doc?.project_path||state.boot.project_path)}</code><label>Python 内核</label><code>${h(state.boot.capabilities.python)}</code><label>Claude CLI</label><p>${state.boot.capabilities.claude?'<span class="status-tag succeeded">已检测到</span> 运行时沿用本机 Claude 的模型、工具、权限与登录配置。':'<span class="status-tag failed">未检测到</span> 安装并登录后，重启本服务。'}</p><label>Order 运行确认</label><p>${state.boot.settings?.confirm_order_run===false?'<span class="status-tag succeeded">已关闭</span> 可在 <code>'+h(state.boot.settings.path)+'</code> 中重新开启。':'<span class="status-tag succeeded">已开启</span> 运行 Order 前询问软件、模式与目标单元。'}${state.boot.settings?.error?`<br><span class="error-text">${h(state.boot.settings.error)}</span>`:""}</p><label>执行上限</label><p>Python ${state.boot.capabilities.code_timeout} 秒 · Claude ${state.boot.capabilities.agent_timeout} 秒</p></div><p class="muted">切换研究环境：启动服务时指定 <code>--python &lt;解释器路径&gt;</code>。初始化其他项目：使用 <code>--project &lt;项目目录&gt;</code>。</p>`);
   if(name==="help")return showModal("把端到端过程，拆成可控的每一步",`<div class="help-steps"><div><b>01</b><section><h3>用 Global 约束全局</h3><p>写清目的、数据口径和执行边界。修改后，下游旧结果会标记失效。</p></section></div><div><b>02</b><section><h3>用单元推进研究</h3><p>Markdown 记录假设，Python 运行真实代码，Order 把精简上文与输出契约发送给 Claude。Python 单元共享变量。</p></section></div><div><b>03</b><section><h3>先检查，再决定下一步</h3><p>在检查器查看完整输入、有效结果和变量。每次执行都有独立的输入、输出与事件文件，代码建议由你检查后执行。</p></section></div></div><div class="shortcut-list"><span>执行并选择下一个单元<kbd>Shift + Enter</kbd></span><span>执行当前单元<kbd>Ctrl + Enter</kbd></span><span>立即保存<kbd>Ctrl + S</kbd></span><span>代码缩进<kbd>Tab</kbd></span></div>`);
 }
 

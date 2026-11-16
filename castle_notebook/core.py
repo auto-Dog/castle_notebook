@@ -255,6 +255,55 @@ def load_context_config(project):
         raise Problem(f"无法加载上下文配置 {path}：{exc}") from exc
 
 
+def default_settings():
+    return {"version": 1, "confirm_order_run": True}
+
+
+def normalize_settings(value):
+    if not isinstance(value, dict) or set(value) - {"version", "confirm_order_run"}:
+        raise Problem("运行设置必须为 JSON 对象，只支持 version 与 confirm_order_run。")
+    version = value.get("version", 1)
+    if type(version) is not int or version != 1:
+        raise Problem("运行设置 version 必须为 1。")
+    confirm = value.get("confirm_order_run", True)
+    if type(confirm) is not bool:
+        raise Problem("运行设置 confirm_order_run 必须为 true 或 false。")
+    return {"version": 1, "confirm_order_run": confirm}
+
+
+def ensure_settings(project):
+    path = Path(project).resolve() / ".castle" / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8", newline="\n") as stream:
+            json.dump(default_settings(), stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+    except FileExistsError:
+        pass
+    return path
+
+
+def load_settings(project):
+    path = ensure_settings(project)
+    try:
+        if path.stat().st_size > 64000:
+            raise Problem("运行设置文件超过 64 KB。")
+        return normalize_settings(json.loads(path.read_text(encoding="utf-8-sig")))
+    except (OSError, ValueError, Problem) as exc:
+        raise Problem(f"无法加载运行设置 {path}：{exc}") from exc
+
+
+def settings_summary(project):
+    """Expose the UI safety switch without letting a broken file block startup."""
+    path = ensure_settings(project)
+    try:
+        settings = load_settings(project)
+        return {"path": str(path), "confirm_order_run": settings["confirm_order_run"], "error": None}
+    except Problem as exc:
+        # Fail safe: an invalid file keeps the confirmation prompt enabled.
+        return {"path": str(path), "confirm_order_run": True, "error": str(exc)}
+
+
 def pack_context(doc, cell_id, variables=None, config=None, project_scan=None, run_info=None):
     index = next((i for i, c in enumerate(doc["cells"]) if c["id"] == cell_id), None)
     if index is None:
