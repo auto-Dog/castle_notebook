@@ -260,6 +260,8 @@ def pack_context(doc, cell_id, variables=None, config=None, project_scan=None, r
     project_block = (
         "## Project workspace / 项目工作区\n"
         f"项目根目录与执行工作目录：{project['project_path']}\n"
+        f"当前 Notebook 文件路径：{Path(project['project_path']) / '.castle' / 'notebooks' / (doc['id'] + '.json')}\n"
+        "当当前 Order 明确要求修改 Notebook 时，可直接更新上述文件。\n"
         "Notebook 是此项目的可视化交互界面；项目源码、测试和数据文件是实际工作对象。\n"
         "Python 单元与代理使用同一项目目录，验证可导入项目模块；.castle 保存 Notebook 和执行证据。\n"
          "\n\n")
@@ -586,7 +588,7 @@ def initialization_notebook(scan):
     doc = new_notebook(scan["project_path"], Path(scan["project_path"]).name + " · 项目拆解")
     doc["global"].update(goal="在已有代码项目中建立 Notebook 交互界面。先识别项目目标、源码入口、输入和验证方法。", constraints="本次初始化只读取项目，不更改源文件。将项目工作拆分为小而可验证的步骤；不要自动执行生成的代码。不要读取凭据或私密配置。")
     inventory = new_cell("markdown", "项目快照", "## 项目文件概览\n\n```text\n" + "\n".join(scan["files"]) + "\n```\n\n" + scan["manifest_excerpt"] + ("\n\n目录已截断。" if scan["truncated"] else ""))
-    order = new_cell("order", "初始化 / 拆分项目", "只读分析当前项目和上游目录快照，提出全局目的、约束及 3–8 个独立调试单元。Notebook 是交互界面，核心实现保留在项目源码中。优先覆盖：源码入口、最小输入、调用现有模块、边界断言、项目开发或修复步骤。Python 单元优先导入和验证真实项目模块，不要将项目实现复制进 Notebook。需要开发的 Order 应明确待修改的项目文件和验证方法。本次只读限制仅适用于初始化；返回的长期约束应支持用户后续显式运行的开发步骤。仅返回 JSON 对象。生成的单元由用户审查后手动执行，本次禁止更改文件、网络调用或交易下单。", '{"goal":"项目目的", "constraints":"全局约束", "cells":[{"type":"markdown|code|order", "title":"单元标题", "source":"内容或代码", "expected_output":"Order 的预期结果"}]}')
+    order = new_cell("order", "初始化 / 拆分项目", "只读分析当前项目和上游目录快照，提出全局目的、约束及 3–8 个独立调试单元。Notebook 是交互界面，核心实现保留在项目源码中。优先覆盖：环境部署（Python块）、源码入口（Python块）、最小demo（Python块）、批量运行或测试（Python块）；以及该文件夹下项目的几个主要板块开发情况（每个板块一个Order块）、从历史对话jsonl中提取出来的几个主要在做的需求（每类需求放一个Order块，历史对话通常在.claude或claude软件空间内本项目）。Python 单元优先导入和验证真实项目模块，不要将项目实现复制进 Notebook。需要开发的 Order 应明确待修改的项目文件和验证方法。本次只读限制仅适用于初始化；返回的长期约束应支持用户后续显式运行的开发步骤。仅返回 JSON 对象。生成的单元由用户审查后手动执行，本次禁止更改文件、网络调用或交易下单。最终，更新内容写入本笔记本并做json校验", '{"goal":"项目目的", "constraints":"全局约束", "cells":[{"type":"markdown|code|order", "title":"单元标题", "source":"内容或代码", "expected_output":"Order 的预期结果"}]}')
     order.update(output_format="json", mode="agent", initializer=True)
     doc["cells"] = [inventory, order]
     return doc
