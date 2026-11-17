@@ -206,6 +206,57 @@ class OrderInputTests(unittest.TestCase):
         self.assertEqual(current["file_input"]["run_id"], latest["id"])
         self.assertEqual(current["source"], "续聊中演变的需求")
 
+    def test_unrun_order_board_displays_external_trial_files_and_polls_changes(self):
+        cell = self.add("运行前的原始需求")
+        downstream = self.execute(self.add("下游验证"))
+        board = self.store.board_path(cell["id"])
+        board.mkdir(parents=True)
+        (board / "input.md").write_text("# 外部试跑后的完整需求", encoding="utf-8")
+        (board / "output.md").write_text("# 试跑结论\n\n第一版", encoding="utf-8")
+        current = self.engine.document(self.doc["id"])["cells"][0]
+        self.assertEqual(current["source"], "# 外部试跑后的完整需求")
+        self.assertEqual(current["file_input"]["run_id"], cell["id"])
+        self.assertEqual(current["file_input"]["state"], "ready")
+        self.assertEqual(current["outputs"][0]["text"], "# 试跑结论\n\n第一版")
+        self.assertEqual(current["file_output"]["run_id"], cell["id"])
+        poll = self.engine.order_outputs(self.doc["id"])
+        self.assertEqual(poll["cells"][0]["id"], cell["id"])
+        (board / "output.md").write_text("# 试跑结论\n\n第二版", encoding="utf-8")
+        after = self.engine.order_outputs(self.doc["id"], poll["fingerprint"])
+        self.assertTrue(after["changed"])
+        self.assertEqual(after["cells"][0]["outputs"][0]["text"], "# 试跑结论\n\n第二版")
+        self.assertIn(downstream["cell_id"], after["stale_cell_ids"])
+        self.assertFalse(self.engine.order_outputs(self.doc["id"], after["fingerprint"])["changed"])
+
+    def test_unrun_order_editor_save_writes_board_input_file(self):
+        cell = self.add("初始需求")
+        payload = self.engine.document(self.doc["id"])
+        payload["cells"][0].update(source="## 手写需求摘要", input_edited=True)
+        saved = self.engine.save(self.doc["id"], payload)
+        board = self.store.board_path(cell["id"])
+        self.assertEqual((board / "input.md").read_text(encoding="utf-8"), "## 手写需求摘要")
+        self.assertEqual(saved["cells"][0]["file_input"]["run_id"], cell["id"])
+        self.assertEqual(saved["cells"][0]["file_input"]["state"], "ready")
+        (board / "output.md").write_text("外部试跑结论", encoding="utf-8")
+        current = self.engine.document(self.doc["id"])["cells"][0]
+        self.assertEqual(current["outputs"][0]["text"], "外部试跑结论")
+        self.assertEqual(current["source"], "## 手写需求摘要")
+
+    def test_finished_run_mirrors_files_to_board_and_run_files_stay_canonical(self):
+        cell = self.add("检查现有问题")
+        run = self.execute(cell)
+        board = self.store.board_path(cell["id"])
+        self.assertEqual((board / "input.md").read_bytes(), self.input_path(run).read_bytes())
+        self.assertEqual((board / "output.md").read_bytes(),
+                         (self.store.run_path(run["id"]) / "output.md").read_bytes())
+        (board / "output.md").write_text("展板上的外部改动", encoding="utf-8")
+        current = self.engine.document(self.doc["id"])["cells"][0]
+        self.assertEqual(current["file_output"]["run_id"], run["id"])
+        self.assertNotIn("展板上的外部改动", current["outputs"][0]["text"])
+        (self.store.run_path(run["id"]) / "output.md").write_text("运行目录的更新", encoding="utf-8")
+        current = self.engine.document(self.doc["id"])["cells"][0]
+        self.assertEqual(current["outputs"][0]["text"], "运行目录的更新")
+
     def test_legacy_run_is_seeded_once_and_resume_informs_only_its_session(self):
         cell = self.add()
         run = self.execute(cell)

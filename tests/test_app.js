@@ -392,6 +392,24 @@ test("an unrun order still previews its requirement and offers an edit toggle", 
   assert.equal(app.orderInputMode(order),"preview");
 });
 
+test("an unrun order displays board files written by an external trial run", () => {
+  const env = makeApp(), {app} = env;
+  const order = env.doc.cells[3];
+  order.source = "# 外部试跑需求";
+  order.file_input = {run_id:order.id, path:`.castle/cells/${order.id}/input.md`, state:"ready", sha256:"in"};
+  order.file_output = {run_id:order.id, path:`.castle/cells/${order.id}/output.md`, state:"ready", sha256:"out"};
+  order.outputs = [{kind:"markdown", text:"# 试跑结论"}];
+  const html = app.cellHTML(order,3);
+  assert.match(html, /input\.md · 实时/);
+  assert.match(html, /output\.md · 实时/);
+  assert.match(html, /<h1>外部试跑需求<\/h1>/);
+  assert.match(html, /<h1>试跑结论<\/h1>/);
+  assert.doesNotMatch(html, /class="output-block[^"]*"[^>]*hidden/);
+  const empty = app.cellHTML(env.doc.cells[0],0);
+  assert.match(empty, /等待 input\.md…/);
+  assert.match(empty, /等待 output\.md 更新…/);
+});
+
 test("order outputs render markdown evidence carried as json payloads", () => {
   const {app} = makeApp();
   const md = app.outputsHTML([{kind:"json",text:"# 板块 01\n\n- **结论**：AUROC 0.610"}]);

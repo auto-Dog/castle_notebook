@@ -479,6 +479,9 @@ class Store:
     def run_path(self, run_id):
         return self.path / "runs" / check_id(run_id)
 
+    def board_path(self, cell_id):
+        return self.path / "cells" / check_id(cell_id)
+
     def get_run(self, run_id):
         path = self.run_path(run_id) / "run.json"
         with self.lock:

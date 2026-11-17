@@ -270,7 +270,9 @@ function outputsHTML(outputs, attachments = {}) {
 
 function orderRunId(cell) {
   const live=liveFor(cell.id);
-  return live && !live.operation ? live.id : cell.run_ids.at(-1) || cell.last_run_id;
+  if(live && !live.operation)return live.id;
+  // Unrun Orders display their board directory; backend metadata uses the cell id.
+  return cell.run_ids.at(-1) || cell.last_run_id || cell.id;
 }
 
 // Every Order input is rendered Markdown unless the user is editing it. An

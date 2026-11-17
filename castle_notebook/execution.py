@@ -389,13 +389,24 @@ class Engine:
 
     def read_output_file(self, rid, project):
         """Read only the output belonging to a known run, with a bounded payload."""
-        return self._read_cell_file(rid, project, "output.md", OUTPUT_LIMIT, "输出", "2 MB 显示上限")
+        return self._read_cell_file(self.store.run_path(rid), rid, project, "output.md", OUTPUT_LIMIT, "输出", "2 MB 显示上限")
 
     def read_input_file(self, rid, project):
-        return self._read_cell_file(rid, project, "input.md", INPUT_LIMIT * 4, "需求输入", "32000 字符上限", INPUT_LIMIT)
+        return self._read_cell_file(self.store.run_path(rid), rid, project, "input.md", INPUT_LIMIT * 4, "需求输入", "32000 字符上限", INPUT_LIMIT)
 
-    def _read_cell_file(self, rid, project, filename, byte_limit, label_name, limit_name, character_limit=None):
-        path = self.store.run_path(rid) / filename
+    def read_board_file(self, cell_id, project, filename):
+        board = self.store.board_path(cell_id)
+        if filename == "input.md":
+            return self._read_cell_file(board, cell_id, project, filename, INPUT_LIMIT * 4, "需求输入", "32000 字符上限", INPUT_LIMIT)
+        return self._read_cell_file(board, cell_id, project, filename, OUTPUT_LIMIT, "输出", "2 MB 显示上限")
+
+    def _current_input_file(self, cell, project):
+        if cell["run_ids"]:
+            return self.read_input_file(cell["run_ids"][-1], project)
+        return self.read_board_file(cell["id"], project, "input.md")
+
+    def _read_cell_file(self, folder, rid, project, filename, byte_limit, label_name, limit_name, character_limit=None):
+        path = folder / filename
         try:
             label = Path(os.path.relpath(path, project)).as_posix()
         except ValueError:
@@ -441,11 +452,21 @@ class Engine:
             changed = False
             first_changed = len(doc["cells"])
             for index, cell in enumerate(doc["cells"]):
-                if cell["type"] != "order" or not cell["run_ids"]:
+                if cell["type"] != "order":
                     continue
-                rid = cell["run_ids"][-1]
-                run = self.get_run(rid)
-                input_info, source = self._seed_input_file(doc, cell, run)
+                if cell["run_ids"]:
+                    rid = cell["run_ids"][-1]
+                    run = self.get_run(rid)
+                    input_info, source = self._seed_input_file(doc, cell, run)
+                    info, value = self.read_output_file(rid, doc["project_path"])
+                    output_kind = run["output_format"]
+                else:
+                    # Unrun cells are display boards: files written by external
+                    # trial runs must appear without starting a run.
+                    rid = cell["id"]
+                    input_info, source = self.read_board_file(cell["id"], doc["project_path"], "input.md")
+                    info, value = self.read_board_file(cell["id"], doc["project_path"], "output.md")
+                    output_kind = cell["output_format"]
                 if source is not None and source != cell["source"]:
                     cell.update(source=source, revision=cell["revision"] + 1, updated_at=now())
                     first_changed = min(first_changed, index)
@@ -456,12 +477,11 @@ class Engine:
                 if input_info != cell.get("file_input"):
                     cell["file_input"] = input_info
                     changed = True
-                info, value = self.read_output_file(rid, doc["project_path"])
                 previous_info = cell.get("file_output") or {}
                 cache_matches = previous_info.get("run_id") == rid or cell.get("last_run_id") == rid
                 outputs = cell["outputs"] if cache_matches else []
                 if value is not None:
-                    outputs = [{"kind": run["output_format"], "text": value}]
+                    outputs = [{"kind": output_kind, "text": value}]
                 else:
                     info["cached"] = bool(outputs)
                     if outputs:
@@ -495,7 +515,7 @@ class Engine:
             cells = [{"id": cell["id"], "source": cell["source"], "revision": cell["revision"],
                       "updated_at": cell["updated_at"], "file_input": cell["file_input"],
                       "outputs": cell["outputs"], "file_output": cell["file_output"]}
-                     for cell in doc["cells"] if cell["type"] == "order" and cell["run_ids"]]
+                     for cell in doc["cells"] if cell["type"] == "order"]
             stale_ids = [cell["id"] for cell in doc["cells"] if cell["stale"]]
             signature = [[cell["id"], cell["file_input"], cell["revision"], cell["file_output"]] for cell in cells]
             fingerprint = hashlib.sha256(json.dumps([signature, stale_ids], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -593,21 +613,23 @@ class Engine:
                     if changed_indices and min(changed_indices) < active_index:
                         upstream.append(active)
             for cell, value, expected in writes:
-                info, _ = self.read_input_file(cell["run_ids"][-1], current["project_path"])
+                info, _ = self._current_input_file(cell, current["project_path"])
                 if info["state"] == "unavailable" or info["sha256"] != expected:
                     raise Problem("需求文件在保存期间发生变化，请重新检查后保存。", 409)
-                path = self.store.run_path(cell["run_ids"][-1]) / "input.md"
+                folder = self.store.run_path(cell["run_ids"][-1]) if cell["run_ids"] else self.store.board_path(cell["id"])
+                folder.mkdir(parents=True, exist_ok=True)
+                path = folder / "input.md"
                 temporary = path.with_name(f".input-{uid()}.tmp")
                 try:
                     temporary.write_bytes(value.encode("utf-8"))
-                    info, _ = self.read_input_file(cell["run_ids"][-1], current["project_path"])
+                    info, _ = self._current_input_file(cell, current["project_path"])
                     if info["state"] == "unavailable" or info["sha256"] != expected:
                         raise Problem("需求文件在保存期间发生变化，请重新检查后保存。", 409)
                     os.replace(temporary, path)
                 finally:
                     temporary.unlink(missing_ok=True)
                 updated = next(item for item in doc["cells"] if item["id"] == cell["id"])
-                updated["file_input"] = self.read_input_file(cell["run_ids"][-1], current["project_path"])[0]
+                updated["file_input"] = self._current_input_file(cell, current["project_path"])[0]
             self.store.put(doc)
             for active in upstream:
                 active["upstream_changed"] = True
@@ -971,6 +993,15 @@ class Engine:
                         output_text = file_text
                         run["outputs"] = [{"kind": cell["output_format"], "text": file_text}]
                         run["output_source"] = "file"
+                    board = self.store.board_path(cell["id"])
+                    try:
+                        board.mkdir(parents=True, exist_ok=True)
+                        for name in ("input.md", "output.md"):
+                            source = self.store.run_path(rid) / name
+                            if source.is_file() and not source.is_symlink():
+                                (board / name).write_bytes(source.read_bytes())
+                    except OSError:
+                        pass
                 else:
                     output_path.write_text(output_text, encoding="utf-8")
                 run["output_sha256"] = hashlib.sha256(output_text.encode()).hexdigest()
