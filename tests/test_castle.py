@@ -1341,28 +1341,17 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(self.store.get(doc["id"])["cells"][0]["stale"])
         self.assertEqual(self.engine.get_run(run["id"])["status"], "succeeded")
 
-    def test_initialization_validates_then_adds_unexecuted_cells_once(self):
+    def test_initialization_builds_manual_order_with_project_history_prompt(self):
         doc = initialization_notebook(scan_project(self.project))
-        self.store.put(doc)
-        run = wait_run(self.engine, self.engine.start(doc["id"], doc["cells"][-1]["id"])["id"])
-        applied = self.engine.apply_init(doc["id"], run["id"])
-        self.assertEqual(applied["global"]["goal"], "拆解现有算法")
-        self.assertEqual(len(applied["cells"]), 5)
-        self.assertTrue(all(c["status"] == "idle" for c in applied["cells"][2:]))
-        self.assertEqual(self.engine.runtime(doc["id"])["state"], "cold")
-        with self.assertRaises(Problem):
-            self.engine.apply_init(doc["id"], run["id"])
-
-    def test_initialization_uses_latest_visible_output_file(self):
-        doc = initialization_notebook(scan_project(self.project))
-        self.store.put(doc)
-        run = wait_run(self.engine, self.engine.start(doc["id"], doc["cells"][-1]["id"])["id"])
-        updated = json.loads(Path(run["artifact"]).read_text(encoding="utf-8"))
-        updated["goal"] = "采用文件中的最新目标"
-        Path(run["artifact"]).write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
-        applied = self.engine.apply_init(doc["id"], run["id"])
-        self.assertEqual(applied["global"]["goal"], updated["goal"])
-        self.assertNotEqual(json.loads(self.engine.get_run(run["id"])["outputs"][0]["text"])["goal"], updated["goal"])
+        self.assertEqual([c["type"] for c in doc["cells"]], ["markdown", "order"])
+        order = doc["cells"][-1]
+        self.assertEqual(order["mode"], "agent")
+        self.assertEqual(order["output_format"], "markdown")
+        self.assertNotIn("initializer", order)
+        self.assertIn(doc["project_path"], order["source"])
+        self.assertIn("~/.claude/projects/", order["source"])
+        self.assertIn("≤5 个 AI Order 板块", order["source"])
+        self.assertTrue(order["expected_output"].strip())
 
 
 class HTTPTests(unittest.TestCase):
@@ -1433,6 +1422,18 @@ class HTTPTests(unittest.TestCase):
         final = json.loads(body)
         self.assertEqual(final["runtime"]["active_runs"], [])
         self.assertEqual(final["cells"][2]["source"], "value = 2")
+
+    def test_project_initialize_creates_notebook_without_running(self):
+        status, _, body = self.request("POST", "/api/project/initialize", {"relative_path": "."})
+        self.assertEqual(status, 201)
+        payload = json.loads(body)
+        self.assertNotIn("run", payload)
+        doc = payload["notebook"]
+        order = doc["cells"][-1]
+        self.assertEqual(order["type"], "order")
+        self.assertEqual(order["status"], "idle")
+        self.assertIn(doc["project_path"], order["source"])
+        self.assertEqual(doc["runtime"]["active_runs"], [])
 
     def test_bootstrap_static_and_security_headers(self):
         status, headers, body = self.request("GET", "/api/bootstrap")

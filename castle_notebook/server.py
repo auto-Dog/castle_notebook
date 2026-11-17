@@ -307,13 +307,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(scan_project(self.app.project, self.body().get("relative_path", "."), excluded=(self.app.store.path,)))
         if parts == ["api", "project", "initialize"] and method == "POST":
             body = self.body()
-            if body.get("run", True) and not self.app.engine.claude_command:
-                raise Problem("初始化项目需要 Claude CLI。请安装并登录 Claude Code 后重启服务。", 503)
             scan = scan_project(self.app.project, body.get("relative_path", "."), excluded=(self.app.store.path,))
             doc = initialization_notebook(scan)
             self.app.store.put(doc)
-            run = self.app.engine.start(doc["id"], doc["cells"][-1]["id"]) if body.get("run", True) else None
-            return self.json({"notebook": self.app.engine.document(doc["id"]), "run": run}, 201)
+            return self.json({"notebook": self.app.engine.document(doc["id"])}, 201)
         if len(parts) >= 3 and parts[:2] == ["api", "notebooks"]:
             nid = parts[2]
             if len(parts) == 3:
