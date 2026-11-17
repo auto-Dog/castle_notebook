@@ -228,6 +228,20 @@ class OrderInputTests(unittest.TestCase):
         self.assertIn(downstream["cell_id"], after["stale_cell_ids"])
         self.assertFalse(self.engine.order_outputs(self.doc["id"], after["fingerprint"])["changed"])
 
+    def test_legacy_cells_board_migrates_into_runs_namespace(self):
+        cell = self.add("迁移前的外部试跑需求")
+        legacy = self.store.path / "cells" / cell["id"]
+        legacy.mkdir(parents=True)
+        (legacy / "input.md").write_text("# 旧展板需求", encoding="utf-8")
+        (legacy / "output.md").write_text("# 旧展板结论", encoding="utf-8")
+        reopened = Store(self.store.path)
+        self.assertFalse((self.store.path / "cells").exists())
+        board = reopened.board_path(cell["id"])
+        self.assertEqual((board / "input.md").read_text(encoding="utf-8"), "# 旧展板需求")
+        current = self.engine.document(self.doc["id"])["cells"][0]
+        self.assertEqual(current["source"], "# 旧展板需求")
+        self.assertEqual(current["outputs"][0]["text"], "# 旧展板结论")
+
     def test_unrun_order_editor_save_writes_board_input_file(self):
         cell = self.add("初始需求")
         payload = self.engine.document(self.doc["id"])

@@ -1583,6 +1583,63 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["files"], [])
 
+    def test_import_creates_a_local_copy_and_leaves_the_source_untouched(self):
+        source = new_notebook(self.temp.name, "Exported notebook", "quant")
+        source["title"] = "Exported notebook"
+        source["project_path"] = "/somewhere/else"
+        order = source["cells"][-1]
+        order.update(status="succeeded", stale=True, run_ids=["abcdefabcdef"], last_run_id="abcdefabcdef",
+                     outputs=[{"kind": "markdown", "text": "old evidence"}],
+                     file_input={"run_id": "abcdefabcdef", "path": "in.md", "state": "ready", "sha256": "x"},
+                     file_output={"run_id": "abcdefabcdef", "path": "out.md", "state": "ready", "sha256": "y"})
+        markdown = source["cells"][0]
+        markdown["source"] = "![figure](attachment:figure.png)"
+        markdown["attachments"] = {"figure.png": {"image/png": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()}}
+        self.app.store.put(source)
+        before = copy.deepcopy(source)
+        status, _, body = self.request("POST", "/api/notebooks/import", {"notebook": source})
+        self.assertEqual(status, 201)
+        doc = json.loads(body)
+        self.assertNotEqual(doc["id"], source["id"])
+        self.assertEqual(doc["title"], "Exported notebook · 副本")
+        self.assertEqual(doc["project_path"], str(Path(self.temp.name).resolve()))
+        self.assertEqual(doc["global"]["goal"], source["global"]["goal"])
+        self.assertEqual(doc["global"]["constraints"], source["global"]["constraints"])
+        self.assertEqual([c["type"] for c in doc["cells"]], [c["type"] for c in source["cells"]])
+        self.assertEqual(doc["cells"][0]["attachments"], markdown["attachments"])
+        copied = doc["cells"][-1]
+        self.assertNotEqual(copied["id"], order["id"])
+        self.assertEqual(copied["source"], order["source"])
+        self.assertEqual(copied["expected_output"], order["expected_output"])
+        self.assertEqual(copied["status"], "idle")
+        self.assertFalse(copied["stale"])
+        self.assertEqual(copied["outputs"], [])
+        self.assertEqual(copied["run_ids"], [])
+        self.assertNotIn("last_run_id", copied)
+        self.assertEqual(copied["file_input"]["state"], "missing")
+        self.assertEqual(copied["file_output"]["state"], "missing")
+        self.assertEqual(self.app.store.get(source["id"]), before)
+        status, _, body = self.request("GET", f"/api/notebooks/{doc['id']}/export")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["id"], doc["id"])
+
+    def test_import_binds_subdirectory_and_rejects_invalid_payloads(self):
+        project = Path(self.temp.name) / "import_target"
+        project.mkdir()
+        source = new_notebook(self.temp.name, "Bound import")
+        status, _, body = self.request("POST", "/api/notebooks/import",
+                                       {"notebook": source, "relative_path": "import_target"})
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body)["project_path"], str(project.resolve()))
+        self.assertEqual(self.request("POST", "/api/notebooks/import", {}, token=False)[0], 403)
+        for payload in ({"notebook": None},
+                        {"notebook": {"title": "missing parts"}},
+                        {"notebook": {"global": {}, "cells": [{"type": "unknown"}]}},
+                        {"notebook": {"global": {}, "cells": [new_cell("code")] * 101}},
+                        {"notebook": source, "relative_path": ".."}):
+            with self.subTest(payload=payload):
+                self.assertEqual(self.request("POST", "/api/notebooks/import", payload)[0], 400)
+
     def test_open_session_requires_token_and_uses_saved_name_and_project(self):
         _, _, body = self.request("POST", "/api/notebooks", {"title": "Session integration"})
         doc = json.loads(body)

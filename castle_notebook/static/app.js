@@ -432,7 +432,7 @@ function pythonHTML(source) {
 function shell() {
   $("#app").innerHTML = `<div class="workspace">
     <header class="topbar"><div class="header-inner"><a class="brand" href="/" aria-label="CastleNotebook 首页"><img src="/logo.svg" alt="" width="29" height="29"><span>CastleNotebook</span></a><input id="document-title" class="notebook-title" data-field="title" aria-label="Notebook 标题" maxlength="200"><span id="save-state" class="save-state">已保存</span><span class="app-version">0.9.6</span></div></header>
-    <div class="command-area"><nav class="menubar" aria-label="Notebook 菜单"><div class="menu-wrap"><button data-action="file-menu">文件</button><div id="file-menu" class="dropdown" hidden><button data-action="new">新建 Notebook</button><button data-action="init">从项目初始化…</button><a id="export-link" download>下载 Notebook</a><div class="menu-divider"></div><div id="notebook-list"></div></div></div><button data-action="add-default">插入</button><div class="menu-wrap"><button data-action="cell-menu">单元</button><div id="cell-menu" class="dropdown" hidden><button data-action="run-selected">运行当前</button><button data-action="run-all">运行全部</button></div></div><button data-action="reset">内核</button><button data-action="help">帮助</button><span class="menu-spacer"></span><button class="kernel-state" data-action="environment" id="kernel-state">Python 3 <span class="kernel-dot"></span></button></nav>
+    <div class="command-area"><nav class="menubar" aria-label="Notebook 菜单"><div class="menu-wrap"><button data-action="file-menu">文件</button><div id="file-menu" class="dropdown" hidden><button data-action="new">新建 Notebook</button><button data-action="init">从项目初始化…</button><button data-action="import">从文件导入…</button><a id="export-link" download>下载 Notebook</a><div class="menu-divider"></div><div id="notebook-list"></div></div></div><button data-action="add-default">插入</button><div class="menu-wrap"><button data-action="cell-menu">单元</button><div id="cell-menu" class="dropdown" hidden><button data-action="run-selected">运行当前</button><button data-action="run-all">运行全部</button></div></div><button data-action="reset">内核</button><button data-action="help">帮助</button><span class="menu-spacer"></span><button class="kernel-state" data-action="environment" id="kernel-state">Python 3 <span class="kernel-dot"></span></button></nav>
     <div class="toolbar" role="toolbar" aria-label="Notebook 工具栏"><div class="tool-group"><button class="tool" data-action="save" title="保存 (Ctrl+S)" aria-label="保存 Notebook">${icon("save")}</button></div><div class="tool-group"><button class="tool" data-action="add-default" title="在当前单元下方插入" aria-label="插入单元">${icon("plus")}</button><button class="tool" data-action="delete-selected" title="删除单元" aria-label="删除所选单元">${icon("trash")}</button><button class="tool" data-action="duplicate-selected" title="复制单元" aria-label="复制所选单元">${icon("copy")}</button></div><div class="tool-group"><button class="tool" data-action="up-selected" title="上移" aria-label="上移所选单元">${icon("up")}</button><button class="tool" data-action="down-selected" title="下移" aria-label="下移所选单元">${icon("down")}</button></div><div class="tool-group"><button class="tool run-selected" data-action="run-selected" title="执行 (Shift+Enter)">${icon("play")}<span>运行</span></button><button class="tool" data-action="stop" title="停止" aria-label="停止执行">${icon("stop")}</button><button class="tool" data-action="reset" title="重启内核" aria-label="重启内核">${icon("refresh")}</button></div><select id="cell-type" aria-label="单元类型"><option value="code">Python</option><option value="markdown">Markdown</option><option value="order">Order</option></select><span class="toolbar-spacer"></span><button class="tool inspector-toggle" data-action="inspector" aria-label="切换检查器" title="上下文 / 变量 / 记录">${icon("panel")}</button></div></div>
     <div class="work-content"><main id="notebook" class="notebook" aria-label="Notebook 单元"></main><aside class="inspector" id="inspector" aria-label="调试检查面板"></aside></div></div>`;
   $(".inspector-toggle").insertAdjacentHTML("beforebegin",`<button class="tool project-toggle" data-action="project" id="project-button" title="查看项目文件">${icon("folder")}<span id="project-name">项目</span></button>`);
@@ -892,6 +892,11 @@ function newModal() {
   const relative=project.startsWith(root+"\\")||project.startsWith(root+"/")?project.slice(root.length+1):".";
   showModal("新建 Notebook",`<form id="new-form"><div class="path-block">${icon("folder")}<code>${h(root)}</code></div><label class="modal-label">项目子目录<input name="relative_path" value="${h(relative)}" placeholder="." autocomplete="off"></label><label class="modal-label">标题<input name="title" placeholder="未命名 Notebook" maxlength="200" autocomplete="off"></label><fieldset class="template-grid"><legend>模板</legend><label class="template-option"><input type="radio" name="template" value="blank" checked><span>${icon("notebook")}<strong>空白</strong><small>自定义单元</small></span></label><label class="template-option"><input type="radio" name="template" value="quant"><span>${icon("code")}<strong>金融研究</strong><small>合成数据</small></span></label><label class="template-option"><input type="radio" name="template" value="algorithm"><span>${icon("terminal")}<strong>算法验证</strong><small>边界断言</small></span></label></fieldset><button class="btn primary full" type="submit">创建</button></form>`);
 }
+function importModal() {
+  const root=state.boot.project_path, project=state.doc?.project_path||root;
+  const relative=project.startsWith(root+"\\")||project.startsWith(root+"/")?project.slice(root.length+1):".";
+  showModal("从文件导入 Notebook",`<div class="path-block">${icon("folder")}<code>${h(project)}</code></div><form id="import-form" data-relative="${h(relative)}"><label class="modal-label">Notebook 文件（.json）<input type="file" name="file" accept=".json,application/json" required></label><div class="modal-callout">${icon("info")}<span>导入会在当前项目下创建一个副本，原始笔记本文件不会被改动。副本不携带执行记录，单元需重新运行；如需导出，请使用「下载 Notebook」。</span></div><button class="btn primary full" type="submit">导入副本</button></form>`);
+}
 function initModal() {
   showModal("从项目初始化",`<div class="path-block">${icon("folder")}<code>${h(state.boot.project_path)}</code></div><form id="init-form"><label class="modal-label">子目录<input name="relative_path" value="." placeholder="." autocomplete="off"></label><div class="modal-callout">${icon("info")}将生成一个初始化 Order 单元，由你手动运行；AI 会归类历史对话需求并直接改写本 notebook。</div><div class="modal-actions"><button class="btn outline" type="button" data-action="scan-project">文件概览</button><button class="btn primary" type="submit">生成初始化 Order</button></div><div id="scan-result"></div></form>`);
 }
@@ -964,6 +969,7 @@ async function action(name,el) {
   }
   if(name==="new")return newModal();
   if(name==="init")return initModal();
+  if(name==="import")return importModal();
   if(name==="open")return openNotebook(id);
   if(name==="select")return selectCell(id,true);
   if(name==="scroll-global")return $("#global-cell")?.scrollIntoView({behavior:"smooth"});
@@ -1100,7 +1106,7 @@ document.addEventListener("change",event=>{
 });
 document.addEventListener("scroll",event=>{if(event.target.classList?.contains("code-input")){event.target.previousElementSibling.scrollTop=event.target.scrollTop;event.target.previousElementSibling.scrollLeft=event.target.scrollLeft;}},true);
 document.addEventListener("submit",async event=>{
-  if(!["new-form","init-form","cell-operation-form"].includes(event.target.id))return;
+  if(!["new-form","init-form","import-form","cell-operation-form"].includes(event.target.id))return;
   event.preventDefault();const form=event.target, submit=$("button[type=submit]",form);submit.disabled=true;
   try {
     await flushSave();
@@ -1111,6 +1117,15 @@ document.addEventListener("submit",async event=>{
       $("#modal").close();await watchRun(run);
     } else if(form.id==="new-form"){
       const doc=await api("/api/notebooks","POST",values);state.boot.notebooks=await api("/api/notebooks");$("#modal").close();await openNotebook(doc.id);
+    } else if(form.id==="import-form"){
+      const file=form.elements.file.files[0];
+      if(!file)throw new Error("请选择要导入的 Notebook JSON 文件。");
+      if(file.size>120000000)throw new Error("文件超过 120 MB 导入上限。");
+      let notebook;
+      try{notebook=JSON.parse(await file.text());}catch{throw new Error("文件不是有效的 JSON，请选择「下载 Notebook」导出的文件。");}
+      const doc=await api("/api/notebooks/import","POST",{notebook,relative_path:form.dataset.relative});
+      state.boot.notebooks=await api("/api/notebooks");$("#modal").close();await openNotebook(doc.id);
+      toast("已导入副本。原始笔记本不会被改动；如需导出，请使用「下载 Notebook」。");
     } else {
       const result=await api("/api/project/initialize","POST",values);state.doc=result.notebook;state.selected=state.doc.cells[state.doc.cells.length-1]?.id;state.boot.notebooks=await api("/api/notebooks");localStorage.setItem("castle-notebook",state.doc.id);$("#modal").close();renderAll();toast("已生成初始化 Order，请运行该单元，由 AI 归类需求并改写 notebook。");
     }

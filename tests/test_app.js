@@ -62,6 +62,7 @@ function makeApp() {
   const sandbox = {
     document, renderHooks, structuredClone,
     window:{addEventListener(){}}, localStorage:{getItem(){},setItem(){}},
+    FormData:class {constructor(){} [Symbol.iterator](){return [][Symbol.iterator]();}},
     setTimeout:callback => {timers.set(++nextTimer,callback);return nextTimer;},
     clearTimeout:id => timers.delete(id),
     requestAnimationFrame:callback => {callback();return 0;},
@@ -84,12 +85,12 @@ function makeApp() {
   vm.runInContext(source + `
     renderSidebar=()=>{};renderNotebook=()=>{};
     inspectorFrame=()=>renderHooks.inspector?.();
-    refreshOrderOutputs=async()=>{};refreshContext=()=>{};toast=()=>{};
+    refreshOrderOutputs=async()=>{};refreshContext=()=>{};toast=(message,error)=>renderHooks.toast?.(message,error);
     globalThis.app={state,window,cellLocked,canRun,anyBusy,codeBusy,liveFor,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
       outputsHTML,orderInputMode,updateOrderInput,markdown,inline,mathSpan,splitMath,
       mathState,mathScript,typeset,startMath,runCell,confirmOrderRun,settleOrderRunConfirm,
       orderRunConfirmationEnabled,orderRunConfirmBody,action,openCustomSession,orderSessionHTML,
-      liveSession,providerName};
+      liveSession,providerName,importModal};
   `, sandbox);
   const app = sandbox.app, doc = documentFixture();
   app.state.doc = doc;
@@ -108,7 +109,7 @@ function makeApp() {
     assert.fail(`Missing ${method} ${path}; saw ${requests.map(r=>r.method+" "+r.path).join(", ")}`);
   };
   const finishList = async () => (await take("GET","/api/notebooks")).respond([{id:nid,title:doc.title}]);
-  return {app,doc,edit,watch,finish,take,finishList,requests,streams,document,elements,renderHooks,sandbox};
+  return {app,doc,edit,watch,finish,take,finishList,requests,streams,document,elements,renderHooks,sandbox,listeners};
 }
 
 test("only the running cell is locked, including during Run All", () => {
@@ -397,8 +398,8 @@ test("an unrun order displays board files written by an external trial run", () 
   const env = makeApp(), {app} = env;
   const order = env.doc.cells[3];
   order.source = "# 外部试跑需求";
-  order.file_input = {run_id:order.id, path:`.castle/cells/${order.id}/input.md`, state:"ready", sha256:"in"};
-  order.file_output = {run_id:order.id, path:`.castle/cells/${order.id}/output.md`, state:"ready", sha256:"out"};
+  order.file_input = {run_id:order.id, path:`.castle/runs/${order.id}/input.md`, state:"ready", sha256:"in"};
+  order.file_output = {run_id:order.id, path:`.castle/runs/${order.id}/output.md`, state:"ready", sha256:"out"};
   order.outputs = [{kind:"markdown", text:"# 试跑结论"}];
   const html = app.cellHTML(order,3);
   assert.match(html, /input\.md · 实时/);
@@ -644,4 +645,53 @@ test("custom open-session binds a directory, searches by keyword and date, then 
   again.respond({session_id:"s1",title:"量化回测讨论",directory:"C:\\chats",messages:[],truncated:false});
   await reopening;
   assert.match(modal.innerHTML,/该会话暂无可显示的文本消息/);
+});
+
+test("import uploads the exported file as a copy and promises the source stays untouched", async () => {
+  const env = makeApp(), {app,doc,take,elements,listeners} = env;
+  app.state.boot.project_path = "/project";
+  const toasts = [];
+  env.renderHooks.toast = (message,error) => toasts.push({message,error});
+  app.importModal();
+  const modal = elements.get("#modal");
+  assert.equal(modal.open,true);
+  assert.match(modal.innerHTML,/type="file"/);
+  assert.match(modal.innerHTML,/原始笔记本文件不会被改动/);
+  assert.match(modal.innerHTML,/下载 Notebook/);
+  const exported = structuredClone(doc);
+  const submitButton = {disabled:false};
+  const form = {id:"import-form",dataset:{relative:"."},
+    elements:{file:{files:[{size:1234,text:async()=>JSON.stringify(exported)}]}},
+    querySelector:()=>submitButton};
+  const submitting = listeners.get("submit")({target:form,preventDefault(){}});
+  const upload = await take("POST","/api/notebooks/import");
+  assert.deepEqual(upload.body.notebook,exported);
+  assert.equal(upload.body.relative_path,".");
+  const copyId = "eeeeeeeeeeee";
+  const copy = documentFixture();
+  copy.id = copyId;
+  copy.title = doc.title + " · 副本";
+  upload.respond({id:copyId,title:copy.title});
+  (await take("GET","/api/notebooks")).respond([{id:copyId,title:copy.title}]);
+  (await take("GET",`/api/notebooks/${copyId}`)).respond(copy);
+  await submitting;
+  assert.equal(app.state.doc.id,copyId);
+  assert.equal(modal.open,false);
+  assert.equal(submitButton.disabled,false);
+  assert.ok(toasts.some(({message})=>/原始笔记本不会被改动/.test(message)&&/下载 Notebook/.test(message)));
+});
+
+test("import rejects a file that is not valid JSON before any upload", async () => {
+  const env = makeApp(), {app,elements,listeners} = env;
+  app.state.boot.project_path = "/project";
+  const toasts = [];
+  env.renderHooks.toast = (message,error) => toasts.push({message,error});
+  app.importModal();
+  const form = {id:"import-form",dataset:{relative:"."},
+    elements:{file:{files:[{size:10,text:async()=>"not json"}]}},
+    querySelector:()=>({disabled:false})};
+  await listeners.get("submit")({target:form,preventDefault(){}});
+  assert.equal(env.requests.filter(request=>request.method==="POST").length,0);
+  assert.ok(toasts.some(({message,error})=>error&&/不是有效的 JSON/.test(message)));
+  assert.equal(elements.get("#modal").open,true);
 });

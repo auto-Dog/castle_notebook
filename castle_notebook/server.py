@@ -16,9 +16,9 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .core import (Problem, Store, VERSION, ensure_context_config, ensure_settings,
-                   initialization_notebook, load_settings, new_notebook, project_path,
-                   read_project_asset, read_project_file, scan_project, settings_summary,
-                   text_field)
+                   imported_notebook, initialization_notebook, load_settings, new_notebook,
+                   project_path, read_project_asset, read_project_file, scan_project,
+                   settings_summary, text_field)
 from .execution import Engine
 from .providers.claude import resolve_claude
 from .providers.codex import resolve_codex
@@ -217,14 +217,14 @@ class Handler(BaseHTTPRequestHandler):
     def json(self, data, status=200):
         self.send_bytes(json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
-    def body(self):
+    def body(self, limit=4500000):
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
             raise Problem("Content-Length 无效。") from exc
-        if not 0 <= length <= 4500000:
+        if not 0 <= length <= limit:
             self.close_connection = True
-            raise Problem("请求体超过 4.5 MB 限制。", 413)
+            raise Problem(f"请求体超过 {limit / 1000000:g} MB 限制。", 413)
         if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
             raise Problem("请求需要 application/json。", 415)
         try:
@@ -314,6 +314,15 @@ class Handler(BaseHTTPRequestHandler):
                 doc = new_notebook(project, text_field(body.get("title", "未命名 Notebook"), "标题", 200), template)
                 self.app.store.put(doc)
                 return self.json(self.app.engine.document(doc["id"]), 201)
+        if parts == ["api", "notebooks", "import"] and method == "POST":
+            # Exported notebooks carry embedded images, so the import payload
+            # may exceed the regular edit limit (100 MB of images plus JSON).
+            body = self.body(120000000)
+            project = project_path(self.app.project, body.get("relative_path", "."))
+            ensure_context_config(project)
+            doc = imported_notebook(body.get("notebook"), project)
+            self.app.store.put(doc)
+            return self.json(self.app.engine.document(doc["id"]), 201)
         if parts == ["api", "project", "scan"] and method == "POST":
             return self.json(scan_project(self.app.project, self.body().get("relative_path", "."), excluded=(self.app.store.path,)))
         if parts == ["api", "project", "initialize"] and method == "POST":

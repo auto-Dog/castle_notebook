@@ -92,6 +92,36 @@ def new_notebook(project, title="未命名 Notebook", template="blank"):
     return doc
 
 
+def imported_notebook(incoming, project):
+    """A local copy of an exported notebook: new ids, bound to this project.
+
+    Execution evidence (runs, sessions, outputs) belongs to the source store and
+    is never carried over, so the copy starts idle instead of claiming results
+    that were not produced here.
+    """
+    if (not isinstance(incoming, dict) or not isinstance(incoming.get("cells"), list)
+            or not isinstance(incoming.get("global"), dict)):
+        raise Problem("导入文件不是有效的 Notebook 导出 JSON（需要 global 与 cells）。")
+    title = text_field(incoming.get("title", ""), "标题", 200).strip() or "未命名 Notebook"
+    doc = new_notebook(project, title[:190] + " · 副本")
+    cells = []
+    for item in incoming["cells"]:
+        if not isinstance(item, dict):
+            raise Problem("单元格式无效。")
+        entry = {"id": uid(), "type": item.get("type")}
+        for key in ("title", "source", "expected_output", "context_note"):
+            entry[key] = item.get(key, "")
+        for key in ("mode", "output_format", "provider", "attachments"):
+            if key in item:
+                entry[key] = item[key]
+        cells.append(entry)
+    payload = {"revision": doc["revision"], "title": doc["title"],
+               "global": {"goal": incoming["global"].get("goal", ""),
+                          "constraints": incoming["global"].get("constraints", "")},
+               "cells": cells}
+    return editable_document(doc, payload)
+
+
 def editable_document(doc, incoming):
     """Only accept editable fields; execution evidence is server-owned."""
     if not isinstance(incoming, dict):
@@ -450,6 +480,14 @@ class Store:
         self.lock = threading.RLock()
         (self.path / "notebooks").mkdir(parents=True, exist_ok=True)
         (self.path / "runs").mkdir(exist_ok=True)
+        legacy = self.path / "cells"
+        if legacy.is_dir():
+            for board in legacy.iterdir():
+                target = self.path / "runs" / board.name
+                if board.is_dir() and not target.exists():
+                    board.rename(target)
+            if not any(legacy.iterdir()):
+                legacy.rmdir()
 
     def atomic_json(self, path, value):
         path = Path(path)
@@ -487,7 +525,9 @@ class Store:
         return self.path / "runs" / check_id(run_id)
 
     def board_path(self, cell_id):
-        return self.path / "cells" / check_id(cell_id)
+        # Unrun Orders keep their display board in the runs namespace, keyed by
+        # cell id; only real runs carry a run.json.
+        return self.run_path(cell_id)
 
     def get_run(self, run_id):
         path = self.run_path(run_id) / "run.json"
