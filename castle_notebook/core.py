@@ -15,8 +15,9 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 import uuid
 
-VERSION = "0.9.5"
+VERSION = "0.9.6"
 CELL_TYPES = {"code", "markdown", "order"}
+AI_PROVIDERS = ("claude", "codex", "custom")
 ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
 MAX_CONTEXT = 48000
 
@@ -59,6 +60,7 @@ def new_cell(kind="order", title="", source="", expected_output=""):
     return {"id": uid(), "type": kind, "title": title,
             "source": source, "expected_output": expected_output,
             "output_format": "markdown", "context_note": "", "mode": "llm",
+            "provider": "default",
             "created_at": stamp, "updated_at": stamp, "revision": 1,
             "status": "idle", "stale": False, "outputs": [], "run_ids": []}
 
@@ -137,11 +139,12 @@ def editable_document(doc, incoming):
             changed |= value != cell[key]
             cell[key] = value
         for key, allowed, default in (("mode", {"llm", "agent"}, "llm"),
-                                      ("output_format", {"markdown", "json", "text"}, "markdown")):
+                                      ("output_format", {"markdown", "json", "text"}, "markdown"),
+                                      ("provider", {"default", *AI_PROVIDERS}, "default")):
             value = item.get(key, default)
             if value not in allowed:
                 raise Problem(f"{key} 选项无效。")
-            changed |= value != cell[key]
+            changed |= value != cell.get(key, default)
             cell[key] = value
         # Attachments are presentation-only and never invalidate downstream results.
         if kind == "markdown":
@@ -256,19 +259,22 @@ def load_context_config(project):
 
 
 def default_settings():
-    return {"version": 1, "confirm_order_run": True}
+    return {"version": 1, "confirm_order_run": True, "custom_sessions_dir": ""}
 
 
 def normalize_settings(value):
-    if not isinstance(value, dict) or set(value) - {"version", "confirm_order_run"}:
-        raise Problem("运行设置必须为 JSON 对象，只支持 version 与 confirm_order_run。")
+    if not isinstance(value, dict) or set(value) - {"version", "confirm_order_run", "custom_sessions_dir"}:
+        raise Problem("运行设置必须为 JSON 对象，只支持 version、confirm_order_run 与 custom_sessions_dir。")
     version = value.get("version", 1)
     if type(version) is not int or version != 1:
         raise Problem("运行设置 version 必须为 1。")
     confirm = value.get("confirm_order_run", True)
     if type(confirm) is not bool:
         raise Problem("运行设置 confirm_order_run 必须为 true 或 false。")
-    return {"version": 1, "confirm_order_run": confirm}
+    sessions_dir = value.get("custom_sessions_dir", "")
+    if not isinstance(sessions_dir, str) or len(sessions_dir) > 4000:
+        raise Problem("运行设置 custom_sessions_dir 必须为不超过 4000 字符的路径字符串。")
+    return {"version": 1, "confirm_order_run": confirm, "custom_sessions_dir": sessions_dir}
 
 
 def ensure_settings(project):
@@ -298,10 +304,11 @@ def settings_summary(project):
     path = ensure_settings(project)
     try:
         settings = load_settings(project)
-        return {"path": str(path), "confirm_order_run": settings["confirm_order_run"], "error": None}
+        return {"path": str(path), "confirm_order_run": settings["confirm_order_run"],
+                "custom_sessions_dir": settings["custom_sessions_dir"], "error": None}
     except Problem as exc:
         # Fail safe: an invalid file keeps the confirmation prompt enabled.
-        return {"path": str(path), "confirm_order_run": True, "error": str(exc)}
+        return {"path": str(path), "confirm_order_run": True, "custom_sessions_dir": "", "error": str(exc)}
 
 
 def pack_context(doc, cell_id, variables=None, config=None, project_scan=None, run_info=None):
@@ -432,7 +439,7 @@ def validate_order_output(answer, output_format):
         r"(?:function_calls|tool_calls?|invoke)\b)", candidate, re.IGNORECASE)
     if protocol:
         raise Problem("模型返回了未执行的工具调用协议，未形成最终结论。"
-                      "请检查 Claude CLI 所用模型或网关的工具协议兼容性；原始输出已保留。")
+                      "请检查 AI CLI 所用模型或网关的工具协议兼容性；原始输出已保留。")
     if output_format == "json":
         parse_json_output(answer)
 
@@ -789,7 +796,7 @@ def initialization_notebook(scan):
     inventory = new_cell("markdown", "项目快照", "## 项目文件概览\n\n```text\n" + "\n".join(scan["files"]) + "\n```\n\n" + scan["manifest_excerpt"] + ("\n\n目录已截断。" if scan["truncated"] else ""))
     order = new_cell("order", "初始化 / 需求归类",
                      "进行项目notebook初始化：把 `~/.claude/projects/{" + scan["project_path"] + "}/*.jsonl` 的对话（本次对话除外）"
-                     "需求进行需求归类，按**时间**、**目的**归类，合并成 **≤5 个 AI Order 板块**，直接改写本 notebook。"
+                     "需求进行需求归类，按**时间**、**目的**归类，合并成 **≤5 个 AI Order 板块**，直接改写本 notebook。",
                      "markdown：Input Cell 高度概括各需求板块；需求与运行结果详情写入对应 Output Cell。")
     order.update(mode="agent")
     doc["cells"] = [inventory, order]

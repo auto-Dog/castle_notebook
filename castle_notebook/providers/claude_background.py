@@ -8,7 +8,8 @@ import subprocess
 import sys
 import time
 
-from .core import Problem, short
+from ..core import Problem, short
+from .base import finalize
 
 
 HOOKS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
@@ -17,8 +18,8 @@ HOOKS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
 
 def cli(engine, control, args, project, *, interruptible=True, timeout=20):
     # Import lazily to share the same cross-platform process lifecycle helpers.
-    from .execution import spawn_options, terminate_tree
-    process = subprocess.Popen([*engine.claude_command, *args], cwd=project,
+    from ..execution import spawn_options, terminate_tree
+    process = subprocess.Popen([*engine.providers["claude"].command, *args], cwd=project,
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8", errors="replace", **spawn_options())
     if interruptible:
@@ -95,7 +96,7 @@ def execute(engine, control, cell, doc, emit, use_output_file):
     if run.get("resume_session_id"):
         args.extend(["--resume", run["resume_session_id"], "--fork-session"])
     if not control.get("resume_background"):
-        run.update(command=[*engine.claude_command, *args], claude_launch_mode="background",
+        run.update(command=[*engine.providers["claude"].command, *args], claude_launch_mode="background",
                    requested_permission_mode=engine.claude_permission_mode)
         engine.store.put_run(run)
     emit("log", {"text": f"Claude · {run['session_name']} · 原生后台 · 权限 {run.get('requested_permission_mode')}"})
@@ -189,8 +190,8 @@ def execute(engine, control, cell, doc, emit, use_output_file):
                         raise Problem("Claude 后台已结束但未收到最终结果（Stop hook）。请检查 hooks 配置或用 --claude-launch-mode print。")
                     final = {"session_id": run.get("session_id"), "result": answer, "subtype": "success",
                              "stop_reason": "tool_use" if pending else "end_turn", "permission_denials": denied}
-                    result = engine._finish_claude(control, cell, doc, emit, final, 0, "", pending,
-                                                   final["stop_reason"], use_output_file)
+                    result = finalize(engine, control, cell, doc, emit, final, 0, "", pending,
+                                      final["stop_reason"], use_output_file, "Claude")
                     return result
             else:
                 missing_since = missing_since or time.monotonic()

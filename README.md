@@ -42,13 +42,21 @@ python -m castle_notebook --project E:\research\my_model --python E:\conda\envs\
 --port 8765           本机端口
 --python PATH         内核解释器，默认启动服务的 Python
 --claude PATH         Claude 可执行文件或 npm cli.js
+--codex PATH          Codex 可执行文件或 npm codex.js
+--provider claude     默认 AI 提供商（claude、codex 或 custom）；Order 单元可单独覆盖
 --claude-launch-mode background   原生后台（默认）；print 为旧版非交互模式
---claude-permission-mode auto   Claude 自动审批（默认），需要时进入终端处理
+--claude-permission-mode auto   Claude 自动审批（默认），需要时进入终端处理；Codex 按此映射沙箱
 --data-dir PATH       文档与证据目录，默认 <project>/.castle
 --code-timeout 60     Python 执行秒数上限
---agent-timeout 240   print 模式 Claude 执行秒数上限；原生后台不设期限
+--agent-timeout 240   print 模式 Claude 与 Codex 执行秒数上限；原生后台不设期限
 --empty               不自动创建首次示例
 ```
+
+### Custom 提供商（外部 AI 对话）
+
+`--provider custom` 不启动任何 AI 进程：运行 Order 只生成 `input.md` 与上下文快照，然后等待你在外部 AI（如 Qoder、Claude 网页版）中完成对话并把结果写入该运行的 `output.md`，Castle 自动收集为正式输出。停止等待不会删除已写入的文件。
+
+点击 Order 的「打开对话」可在弹窗中绑定一个会话目录（例如 Qoder 的 `~/.qoder-cn/projects/<项目>`），按聊天关键词与日期搜索原始会话并绑定到单元，之后直接查看完整对话记录。默认不绑定任何目录，也不读取任何外部文件；只允许读取界面中明确绑定的目录。
 
 ## 测试
 

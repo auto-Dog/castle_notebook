@@ -88,7 +88,8 @@ function makeApp() {
     globalThis.app={state,window,cellLocked,canRun,anyBusy,codeBusy,liveFor,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
       outputsHTML,orderInputMode,updateOrderInput,markdown,inline,mathSpan,splitMath,
       mathState,mathScript,typeset,startMath,runCell,confirmOrderRun,settleOrderRunConfirm,
-      orderRunConfirmationEnabled,orderRunConfirmBody};
+      orderRunConfirmationEnabled,orderRunConfirmBody,action,openCustomSession,orderSessionHTML,
+      liveSession,providerName};
   `, sandbox);
   const app = sandbox.app, doc = documentFixture();
   app.state.doc = doc;
@@ -561,4 +562,86 @@ test("a ready status loads KaTeX from this process only", async () => {
   assert.ok(created.some(node => node.tag === "script" && node.src === "/api/math/katex.min.js"));
   assert.ok(created.some(node => node.tag === "link" && node.href === "/api/math/katex.min.css"));
   assert.equal(app.mathState.ready, true);
+});
+
+test("custom provider renders its own session row, options and run confirmation", () => {
+  const env = makeApp(), {app,doc} = env;
+  Object.assign(app.state.boot.capabilities,{custom:true});
+  const order = doc.cells[3];
+  order.provider = "custom";
+  order.run_ids = ["r1"];
+  order.session = {provider:"custom",available:true,reason:"",id:null,name:null,bound:false};
+  const html = app.cellHTML(order,3);
+  assert.match(html,/<option value="custom"[^>]*selected/);
+  const sessionButton = html.match(/<button[^>]*data-action="open-session"[\s\S]*?<\/button>/)[0];
+  assert.match(sessionButton,/打开对话/);
+  assert.doesNotMatch(sessionButton,/disabled/);
+  assert.match(html.match(/<button[^>]*data-action="merge-cells"[^>]*>/)[0],/disabled/);
+  assert.match(html.match(/<button[^>]*data-action="split-cells"[^>]*>/)[0],/disabled/);
+  assert.match(html,/运行后绑定外部对话/);
+  const body = app.orderRunConfirmBody(order);
+  assert.match(body,/Custom（外部 AI）/);
+  assert.match(body,/等待写入 output\.md/);
+  const live = app.liveSession({provider:"custom",session_name:"IDx",session_id:null});
+  assert.equal(live.available,true);
+});
+
+test("custom open-session binds a directory, searches by keyword and date, then reads the transcript", async () => {
+  const env = makeApp(), {app,doc,elements,take} = env;
+  Object.assign(app.state.boot.capabilities,{custom:true});
+  app.state.boot.settings = {confirm_order_run:false,custom_sessions_dir:""};
+  const order = doc.cells[3];
+  order.provider = "custom";
+  order.run_ids = ["r1"];
+  order.session = {provider:"custom",available:true,reason:"",id:null,name:null,bound:false};
+  const modal = elements.get("#modal");
+  await app.openCustomSession(orderId);
+  assert.match(modal.innerHTML,/绑定外部对话目录/);
+  elements.set("#custom-dir-path",{value:"C:\\chats"});
+  const binding = app.action("custom-bind-dir",{dataset:{id:orderId}});
+  const dirRequest = await take("PUT","/api/custom/directory");
+  assert.deepEqual(dirRequest.body,{path:"C:\\chats"});
+  dirRequest.respond({path:"settings.json",confirm_order_run:false,custom_sessions_dir:"C:\\chats"});
+  await binding;
+  assert.match(modal.innerHTML,/custom-keyword/);
+  assert.match(modal.innerHTML,/更换目录/);
+  elements.set("#custom-keyword",{value:"量化"});
+  elements.set("#custom-date-from",{value:"2026-11-10"});
+  elements.set("#custom-date-to",{value:"2026-11-17"});
+  const results = {innerHTML:""};
+  elements.set("#custom-results",results);
+  const searching = app.action("custom-search",{dataset:{id:orderId},disabled:false});
+  const searchRequest = await take("POST","/api/custom/sessions/search");
+  assert.deepEqual(searchRequest.body,{keyword:"量化",date_from:"2026-11-10",date_to:"2026-11-17"});
+  searchRequest.respond({directory:"C:\\chats",sessions:[{session_id:"s1",title:"量化回测讨论",
+    started_at:"2026-11-10T12:00:00Z",updated_at:"2026-11-10T13:00:00Z",messages:4,matches:2,
+    snippet:"…量化…"}],truncated:false});
+  await searching;
+  assert.match(results.innerHTML,/量化回测讨论/);
+  assert.match(results.innerHTML,/data-session="s1"/);
+  app.state.lives.set("r1",{id:"r1",cell_id:orderId,cell_type:"order",provider:"custom",outputs:[],session_id:null,session_name:null});
+  const bindingSession = app.action("custom-bind-session",{dataset:{id:orderId,session:"s1"}});
+  const bindRequest = await take("POST",`/api/notebooks/${nid}/cells/${orderId}/custom-session`);
+  assert.deepEqual(bindRequest.body,{session_id:"s1"});
+  const updated = structuredClone(doc);
+  updated.cells[3].session = {provider:"custom",available:true,id:"s1",name:"量化回测讨论",bound:true};
+  bindRequest.respond(updated);
+  const transcriptRequest = await take("GET","/api/custom/sessions/s1/transcript");
+  transcriptRequest.respond({session_id:"s1",title:"量化回测讨论",directory:"C:\\chats",
+    messages:[{role:"user",text:"帮我写量化框架",at:"2026-11-10T12:00:00Z"},
+              {role:"assistant",text:"好的。",at:"2026-11-10T12:01:00Z"}],truncated:false});
+  await bindingSession;
+  assert.equal(app.state.lives.get("r1").session_id,"s1","binding during a run must sync the live session row");
+  assert.equal(app.state.lives.get("r1").session_name,"量化回测讨论");
+  assert.match(app.orderSessionHTML(app.liveSession(app.state.lives.get("r1")),orderId),/已绑定/);
+  app.state.lives.delete("r1");
+  assert.match(modal.innerHTML,/帮我写量化框架/);
+  assert.match(modal.innerHTML,/重新搜索绑定/);
+  assert.equal(app.state.doc.cells[3].session.id,"s1");
+  // A bound cell opens its transcript directly, without another search.
+  const reopening = app.openCustomSession(orderId);
+  const again = await take("GET","/api/custom/sessions/s1/transcript");
+  again.respond({session_id:"s1",title:"量化回测讨论",directory:"C:\\chats",messages:[],truncated:false});
+  await reopening;
+  assert.match(modal.innerHTML,/该会话暂无可显示的文本消息/);
 });

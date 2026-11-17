@@ -223,14 +223,14 @@ class CellOperationTests(unittest.TestCase):
                 source = self.add("整理时应检查原内容", execute=True)
                 initial = self.store.get(self.doc["id"])
                 began, release = threading.Event(), threading.Event()
-                invoke = self.engine._claude
+                invoke = self.engine.providers["claude"].execute
 
                 def paused(*args, **kwargs):
                     began.set()
                     release.wait(5)
                     return invoke(*args, **kwargs)
 
-                with patch.object(self.engine, "_claude", side_effect=paused):
+                with patch.object(self.engine.providers["claude"], "execute", side_effect=paused):
                     run = self.transform(source, "split")
                     self.assertTrue(began.wait(5))
                     if change == "global":

@@ -20,8 +20,10 @@ from .core import (Problem, apply_initialization, editable_document, embed_markd
                    load_context_config, output_summary, pack_context, project_changes, scan_project,
                    short, snapshot_project, text_field, uid, validate_order_output)
 from .cell_operations import operation_cell, parse_cells, replace_cells, select_cells
+from .providers import create_providers
+from .providers.base import OUTPUT_LIMIT
+from .providers.custom import read_transcript
 
-OUTPUT_LIMIT = 2000000
 INPUT_LIMIT = 32000
 
 LINUX_TERMINALS = (
@@ -77,32 +79,6 @@ def pipe_reader(stream, messages, channel="stdout"):
         messages.put((channel, None))
 
 
-def resolve_claude(override=None):
-    if override:
-        expanded = Path(override).expanduser()
-        candidate = str(expanded) if expanded.is_file() else shutil.which(override)
-    else:
-        candidate = shutil.which("claude")
-    if not candidate:
-        return None
-    path = Path(candidate)
-    # npm shims on Windows invoke cmd.exe; use the actual executable instead.
-    if path.suffix.lower() in {".cmd", ".bat", ".ps1"}:
-        package = path.parent / "node_modules" / "@anthropic-ai" / "claude-code"
-        binary = package / "bin" / "claude.exe"
-        if binary.is_file():
-            return [str(binary)]
-        entry = package / "cli.js"
-        node = shutil.which("node")
-        if entry.is_file() and node:
-            return [node, str(entry)]
-        return None
-    if path.suffix == ".js":
-        node = shutil.which("node")
-        return [node, str(path)] if node and path.is_file() else None
-    return [str(path)] if path.is_file() else None
-
-
 def linux_terminal_command(command):
     """Wrap an argv for a visible Linux terminal without invoking a shell."""
     candidates = []
@@ -134,29 +110,6 @@ def linux_terminal_command(command):
     return None
 
 
-def session_details(run=None):
-    name = run.get("session_name") if run else None
-    command = run.get("command", []) if run else []
-    if not name and "-n" in command and command.index("-n") + 1 < len(command):
-        name = command[command.index("-n") + 1]
-    session_id = (run.get("session_id") or run.get("provider_result", {}).get("session_id")) if run else None
-    if not run or run["cell_type"] != "order":
-        reason = "请先运行此 Order 单元，再打开对话。"
-    elif run.get("derived") and not session_id:
-        reason = "此整理单元暂无 AI 对话；运行后可打开新对话。"
-    elif run["status"] == "running" and not run.get("background_id"):
-        reason = "请等待或停止本次执行后再打开对话。"
-    elif not name or "--no-session-persistence" in command:
-        reason = "此历史运行未保存 Claude 会话，请重新运行 Order 单元。"
-    elif not session_id and not run.get("background_id"):
-        reason = "本次执行未生成可恢复的 Claude 会话，请重新运行 Order 单元。"
-    else:
-        reason = ""
-    return {"name": name, "id": session_id, "available": not reason, "reason": reason,
-            "background_id": run.get("background_id") if run else None,
-            "permission_mode": run.get("provider_permission_mode") if run else None}
-
-
 def open_claude_terminal(command, project):
     if os.name == "nt":
         launcher = command
@@ -171,12 +124,12 @@ def open_claude_terminal(command, project):
             )
         options = {"start_new_session": True}
     else:
-        raise Problem("在新终端打开 Claude 对话目前支持 Windows 和 Linux。", 503)
+        raise Problem("在新终端打开 AI 对话目前支持 Windows 和 Linux。", 503)
     try:
         # A visible console is intentional: the user continues the conversation here.
         process = subprocess.Popen(launcher, cwd=project, **options)
     except OSError as exc:
-        raise Problem(f"无法打开 Claude 对话终端：{exc}", 503) from exc
+        raise Problem(f"无法打开 AI 对话终端：{exc}", 503) from exc
     threading.Thread(target=process.wait, daemon=True).start()
 
 
@@ -245,10 +198,14 @@ class Kernel:
 
 class Engine:
     def __init__(self, store, python=None, claude_command=None, code_timeout=60, agent_timeout=240,
-                 claude_launch_mode="background", claude_permission_mode="auto"):
+                 claude_launch_mode="background", claude_permission_mode="auto",
+                 provider="claude", codex_command=None):
         self.store = store
         self.python = python or sys.executable
-        self.claude_command = claude_command if claude_command is not None else resolve_claude()
+        self.providers = create_providers(claude_command, codex_command)
+        if provider not in self.providers:
+            raise Problem("AI 提供商必须为 claude、codex 或 custom。")
+        self.default_provider = provider
         self.code_timeout = code_timeout
         self.agent_timeout = agent_timeout
         if claude_launch_mode not in {"background", "print"}:
@@ -263,6 +220,23 @@ class Engine:
         self.kernels = {}
         self.pending_contexts = {}
         self.recover()
+
+    @property
+    def claude_command(self):
+        return self.providers["claude"].command
+
+    @claude_command.setter
+    def claude_command(self, value):
+        self.providers["claude"].command = value
+
+    def provider_for(self, item):
+        name = item.get("provider") if item else None
+        if not name:
+            # Runs recorded before multi-provider support were all Claude.
+            name = "claude" if item and "cell_type" in item else self.default_provider
+        elif name == "default":
+            name = self.default_provider
+        return self.providers[name]
 
     def recover(self):
         # A persisted output is evidence, never proof a new process has its variables.
@@ -384,7 +358,7 @@ class Engine:
             for cell in doc["cells"]:
                 if cell["type"] == "order":
                     run = self.get_run(cell["run_ids"][-1]) if cell["run_ids"] else None
-                    cell["session"] = session_details(run)
+                    cell["session"] = self.provider_for(run or cell).session_details(run)
             return doc | {"runtime": self.runtime(notebook_id)}
 
     def read_output_file(self, rid, project):
@@ -531,18 +505,17 @@ class Engine:
             if not cell:
                 raise Problem("单元不存在。", 404)
             if cell["type"] != "order":
-                raise Problem("只有 Order 单元可以打开 Claude 对话。")
+                raise Problem("只有 Order 单元可以打开 AI 对话。")
             run = self.get_run(cell["run_ids"][-1]) if cell["run_ids"] else None
-            session = session_details(run)
+            provider = self.provider_for(run or cell)
+            if provider.name == "custom":
+                raise Problem("Custom 对话请在界面弹窗中绑定并查看。")
+            session = provider.session_details(run)
             if not session["available"]:
                 raise Problem(session["reason"], 409)
-            if not self.claude_command:
-                raise Problem("未发现 Claude CLI。请安装并登录 Claude Code 后重启服务。", 503)
-            # Headless (-p) sessions are excluded from Claude's interactive name search.
-            # Resume the exact saved UUID while keeping Session Name as the display label.
-            command = ([*self.claude_command, "attach", session["background_id"]] if session["background_id"]
-                       else [*self.claude_command, "--resume", session["id"],
-                             "--permission-mode", self.claude_permission_mode])
+            if not provider.command:
+                raise Problem(f"未发现 {provider.label} CLI。请安装并登录后重启服务。", 503)
+            command = provider.terminal_command(self, session, run)
             legacy_notice = not run.get("input_file") and cell.get("input_session_synced") != session["id"]
             if legacy_notice:
                 command.append(
@@ -554,6 +527,28 @@ class Engine:
                 cell["input_session_synced"] = session["id"]
                 self.store.put(doc)
             return {"session_name": session["name"]}
+
+    def bind_custom_session(self, notebook_id, cell_id, session_id):
+        with self.lock:
+            doc = self.sync_output_files(notebook_id)
+            cell = next((c for c in doc["cells"] if c["id"] == cell_id), None)
+            if not cell or cell["type"] != "order":
+                raise Problem("只有 Order 单元可以绑定外部对话。")
+            if not cell["run_ids"]:
+                raise Problem("请先运行此 Order 单元，再绑定外部对话。", 409)
+            run = self.get_run(cell["run_ids"][-1])
+            provider = self.provider_for(run)
+            if provider.name != "custom":
+                raise Problem("只有 Custom 提供商的运行可以绑定外部对话。")
+            transcript = read_transcript(provider.sessions_dir, session_id)
+            # An active run keeps its own in-memory copy; update it so the
+            # worker's later persistence does not drop the binding.
+            control = self.runs.get(run["id"])
+            target = control["run"] if control else run
+            target["session_id"] = session_id
+            target["session_name"] = transcript["title"] or session_id
+            self.store.put_run(target)
+            return self.document(notebook_id)
 
     def save(self, notebook_id, payload):
         with self.lock:
@@ -679,9 +674,13 @@ class Engine:
                 raise Problem("文档已更新，请刷新后再整理单元。", 409)
             sources = select_cells(doc, cell_id, operation, payload.get("other_cell_id"))
             instructions = text_field(payload.get("instructions", ""), "整理要求", 4000)
-            if not self.claude_command:
-                raise Problem("合并和拆分需要 Claude CLI，请安装并登录后重启服务。", 503)
+            provider = self.provider_for(sources[0])
+            if provider.name == "custom":
+                raise Problem("Custom 提供商的对话在外部 AI 中进行，暂不支持合并与拆分。")
+            if not provider.command:
+                raise Problem(f"合并和拆分需要 {provider.label} CLI，请安装并登录后重启服务。", 503)
             cell = operation_cell(operation, sources, instructions)
+            cell["provider"] = provider.name
             rid = uid()
             context = self._context(doc | {"cells": [cell]}, cell["id"], rid)
             # The restructuring contract must survive custom prompt feature switches.
@@ -690,7 +689,8 @@ class Engine:
             details = {"kind": operation, "sources": sources, "revision": doc["revision"] + 1,
                        "instructions": instructions}
             if operation == "split" and sources[0]["run_ids"]:
-                session = session_details(self.get_run(sources[0]["run_ids"][-1]))
+                source_run = self.get_run(sources[0]["run_ids"][-1])
+                session = self.provider_for(source_run).session_details(source_run)
                 if session["available"]:
                     details["resume_session_id"] = session["id"]
             return self._start_run(doc, cell, rid, context, None, details)
@@ -723,8 +723,10 @@ class Engine:
                 raise Problem("请先填写单元内容。")
             if cell["type"] == "order" and not cell["expected_output"].strip():
                 raise Problem("Order 单元必须填写预期输出契约。")
-            if cell["type"] == "order" and not self.claude_command:
-                raise Problem("未发现 Claude CLI。请安装并登录 Claude Code，随后重启服务；Python 与 Markdown 单元仍可独立使用。", 503)
+            if cell["type"] == "order":
+                provider = self.provider_for(cell)
+                if not provider.available:
+                    raise Problem(f"未发现 {provider.label} CLI。请安装并登录后重启服务；Python 与 Markdown 单元仍可独立使用。", 503)
             key = (notebook_id, cell_id)
             rid = self.pending_contexts.get(key) or uid()
             context = self._context(doc, cell_id, rid)
@@ -748,6 +750,7 @@ class Engine:
                "input_snapshot": copy.deepcopy(cell), "project_path": doc["project_path"],
                "project_changes": None}
         if cell["type"] == "order":
+            run["provider"] = self.provider_for(cell).name
             run["session_name"] = context["run"]["session_name"]
             run["run_dir"] = context["run"]["run_dir"]
             run["output_file"] = context["run"]["output_file"]
@@ -804,6 +807,8 @@ class Engine:
         operation = run["operation"]
         sources = operation["sources"]
         cells = parse_cells(output_summary(run["outputs"], OUTPUT_LIMIT + 100000), operation["kind"], sources)
+        for cell in cells:
+            cell["provider"] = run.get("provider", self.default_provider)
         output_path = Path(run["artifact"])
         if not output_path.exists():
             output_path.write_text(output_summary(run["outputs"], OUTPUT_LIMIT + 100000), encoding="utf-8")
@@ -849,17 +854,18 @@ class Engine:
                 began = time.monotonic()
                 if resume:
                     child["resume_session_id"] = resume
-                    self.emit(run["id"], "status", {"message": f"正在复制第 {index + 1}/2 份 Claude 对话…"})
+                    provider = self.provider_for(child)
+                    self.emit(run["id"], "status", {"message": f"正在复制第 {index + 1}/2 份 {provider.label} 对话…"})
 
                     def emit_copy(kind, data):
                         self.emit(rid, kind, data)
                         if kind in {"log", "tool", "tool_result"}:
                             self.emit(run["id"], kind, data)
 
-                    self._claude(child_control, {"output_format": "text"}, candidate, emit_copy, use_output_file=False)
+                    provider.execute(self, child_control, {"output_format": "text"}, candidate, emit_copy, use_output_file=False)
                     session_id = child.get("session_id")
                     if not session_id or session_id == resume or session_id in session_ids:
-                        raise Problem("Claude 未生成独立的复制会话，原单元已保留。")
+                        raise Problem(f"{provider.label} 未生成独立的复制会话，原单元已保留。")
                     session_ids.add(session_id)
                 else:
                     child.pop("session_name", None)
@@ -935,7 +941,7 @@ class Engine:
                 if not succeeded:
                     run["error"] = "Python 执行失败，查看 traceback。失败前的变量赋值仍可能存在。"
             else:
-                succeeded = self._claude(control, cell, doc, emit)
+                succeeded = self.provider_for(run).execute(self, control, cell, doc, emit)
             if control["cancel"].is_set():
                 raise Problem("执行已停止。", 499)
             if run.get("operation"):
@@ -1038,128 +1044,6 @@ class Engine:
                     self.sync_output_files(doc["id"])
                 self.emit(rid, "finished", {"status": run["status"], "duration_ms": run["duration_ms"], "error": run["error"], "stale": run["stale"], "stale_reason": run["stale_reason"]})
 
-    def _claude(self, control, cell, doc, emit, use_output_file=True):
-        if self.claude_launch_mode == "background" or control.get("resume_background"):
-            from .claude_background import execute
-            return execute(self, control, cell, doc, emit, use_output_file)
-        run = control["run"]
-        args = [*self.claude_command, "-p", run["invocation_prompt"], "-n", run["session_name"],
-                "--permission-mode", self.claude_permission_mode,
-                "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
-        if run.get("resume_session_id"):
-            args.extend(["--resume", run["resume_session_id"], "--fork-session"])
-        run.update(command=args, claude_launch_mode="print", requested_permission_mode=self.claude_permission_mode)
-        emit("log", {"text": f"Claude · 会话 ID{run['id']} · 权限 {self.claude_permission_mode}"})
-        process = subprocess.Popen(args, cwd=doc["project_path"], stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, encoding="utf-8", errors="replace",
-                                   env={**os.environ, "PYTHONIOENCODING": "utf-8"}, **spawn_options())
-        control["process"] = process
-        if control.get("owner"):
-            control["owner"]["process"] = process
-        messages = queue.Queue(maxsize=5000)
-        for name in ("stdout", "stderr"):
-            threading.Thread(target=pipe_reader, args=(getattr(process, name), messages, name), daemon=True).start()
-        started = time.monotonic()
-        final = None
-        ended = set()
-        stderr = ""
-        partial_seen = False
-        pending_tools = set()
-        last_stop_reason = None
-        while len(ended) < 2:
-            if control["cancel"].is_set():
-                raise Problem("Claude 执行已停止。", 499)
-            if time.monotonic() - started > self.agent_timeout:
-                raise Problem(f"Claude 执行超过 {self.agent_timeout} 秒，已停止。", 408)
-            try:
-                channel, line = messages.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if line is None:
-                ended.add(channel)
-                continue
-            if channel == "stderr":
-                stderr = (stderr + line)[-16000:]
-                emit("log", {"text": short(line, 2000)})
-                continue
-            try:
-                event = json.loads(line)
-            except ValueError:
-                emit("log", {"text": short(line, 2000)})
-                continue
-            kind = event.get("type")
-            if kind == "system" and event.get("subtype") == "init":
-                run["session_id"] = event.get("session_id")
-                run["provider_model"] = event.get("model")
-                run["provider_tools"] = event.get("tools", [])
-                run["provider_permission_mode"] = event.get("permissionMode")
-                emit("log", {"text": f"模型：{event.get('model', '未知')} · 可用工具：{', '.join(event.get('tools', [])) or '无'}"})
-            elif kind == "stream_event":
-                nested = event.get("event", {})
-                delta = nested.get("delta", {})
-                if nested.get("type") == "message_start":
-                    last_stop_reason = None
-                elif nested.get("type") == "message_delta" and delta.get("stop_reason"):
-                    last_stop_reason = delta["stop_reason"]
-                if nested.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
-                    partial_seen = True
-                    emit("output", {"kind": "stdout", "text": delta.get("text", "")})
-            elif kind == "assistant":
-                last_stop_reason = event.get("message", {}).get("stop_reason") or last_stop_reason
-                for block in event.get("message", {}).get("content", []):
-                    if block.get("type") == "tool_use":
-                        emit("tool", {"name": block.get("name"), "input": short(json.dumps(block.get("input", {}), ensure_ascii=False), 1200)})
-                        pending_tools.add(block.get("id"))
-                    elif block.get("type") == "text" and not partial_seen:
-                        emit("output", {"kind": "stdout", "text": block.get("text", "")})
-            elif kind == "user":
-                for block in event.get("message", {}).get("content", []):
-                    if block.get("type") == "tool_result":
-                        pending_tools.discard(block.get("tool_use_id"))
-                        emit("tool_result", {"tool_use_id": block.get("tool_use_id"),
-                                             "is_error": bool(block.get("is_error"))})
-            elif kind == "result":
-                final = event
-        exit_code = process.wait(timeout=5)
-        if not final:
-            raise Problem(f"Claude 未返回最终结果（退出码 {exit_code}）。{short(stderr, 1000)} 请检查 claude auth status。")
-        return self._finish_claude(control, cell, doc, emit, final, exit_code, stderr,
-                                   pending_tools, last_stop_reason, use_output_file)
-
-    def _finish_claude(self, control, cell, doc, emit, final, exit_code, stderr,
-                       pending_tools, last_stop_reason, use_output_file):
-        run = control["run"]
-        run["provider_result"] = {k: final[k] for k in ("session_id", "num_turns", "total_cost_usd", "usage", "subtype", "permission_denials", "stop_reason", "is_error") if k in final}
-        run["session_id"] = final.get("session_id") or run.get("session_id")
-        answer = final.get("result")
-        if not isinstance(answer, str):
-            answer = ""
-        run["cli_output"] = answer
-        file_info, file_text = self.read_output_file(run["id"], doc["project_path"]) if use_output_file else ({}, None)
-        if file_text is not None:
-            answer = file_text
-        elif file_info.get("state") == "unavailable":
-            raise Problem(file_info["error"])
-        if len(answer) > OUTPUT_LIMIT:
-            raise Problem("Claude 最终输出超过 2 MB 限制。")
-        # Preserve the provider's actual result, including rejected final output.
-        if answer.strip():
-            run["outputs"] = [{"kind": cell["output_format"], "text": answer}]
-            emit("canonical_output", run["outputs"][0])
-        if exit_code or final.get("is_error") or final.get("subtype", "success") != "success":
-            detail = final.get("errors") or run["cli_output"] or answer or stderr or "Claude 执行失败。"
-            raise Problem(f"Claude 未成功完成（{final.get('subtype', 'unknown')}，退出码 {exit_code}）：{short(detail, 2500)}")
-        stop_reason = final.get("stop_reason") or last_stop_reason
-        run["provider_result"]["stop_reason"] = stop_reason
-        if pending_tools or stop_reason in {"tool_use", "max_tokens", "pause_turn"}:
-            raise Problem(f"模型尚未完成最终回答（停止原因：{stop_reason or '工具调用未返回'}），原始输出已保留。")
-        if final.get("permission_denials"):
-            names = ", ".join(dict.fromkeys(item.get("tool_name", "未知") for item in final["permission_denials"]))
-            raise Problem(f"Claude 工具权限被拒绝（{names}），本次任务未完整执行；原始输出已保留。请检查权限模式或打开对话处理。")
-        validate_order_output(answer, cell["output_format"])
-        return True
-
     def get_run(self, rid):
         with self.lock:
             return copy.deepcopy(self.runs[rid]["run"]) if rid in self.runs else self.store.get_run(rid)
@@ -1219,7 +1103,9 @@ class Engine:
         for rid in [rid for rids in list(self.active.values()) for rid in rids]:
             try:
                 control = self.runs[rid]
-                if control["run"].get("claude_launch_mode") == "background" or self.claude_launch_mode == "background" and control["run"]["cell_type"] == "order":
+                if control["run"].get("provider") == "custom":
+                    self.cancel(rid)
+                elif control["run"].get("claude_launch_mode") == "background" or self.claude_launch_mode == "background" and control["run"]["cell_type"] == "order":
                     control["detach"].set()
                 else:
                     self.cancel(rid)

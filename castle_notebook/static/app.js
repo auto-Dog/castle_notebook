@@ -38,6 +38,13 @@ const launchModeLabel = {background:"原生后台", print:"print 非交互"};
 const permissionModeLabel = {bypassPermissions:"bypassPermissions（跳过审批）", auto:"auto（自动审批）",
   acceptEdits:"acceptEdits（自动接受编辑）", default:"default（逐项询问）",
   plan:"plan（只读规划）", dontAsk:"dontAsk（不主动询问）"};
+const codexSandboxLabel = {bypassPermissions:"跳过沙箱", auto:"workspace-write（自动审批）",
+  acceptEdits:"workspace-write（自动审批）", dontAsk:"workspace-write（自动审批）",
+  default:"只读沙箱", plan:"只读沙箱"};
+// Old documents and cells may lack provider; they always follow the server default.
+const providerLabel = name => name==="codex"?"Codex":name==="claude"?"Claude":name==="custom"?"Custom":String(name||"AI");
+const providerName = cell => {const raw=cell?.provider||"default";return raw==="default"?(state.boot?.capabilities?.default_provider||"claude"):raw;};
+const providerAvailable = cell => Boolean(state.boot?.capabilities?.[providerName(cell)]);
 const liveFor = id => [...state.lives.values()].find(run => run.cell_id===id) || null;
 const activeRuns = () => state.doc?.runtime?.active_runs || [];
 const anyBusy = () => Boolean(state.lives.size || activeRuns().length || state.runRefresh);
@@ -424,7 +431,7 @@ function pythonHTML(source) {
 
 function shell() {
   $("#app").innerHTML = `<div class="workspace">
-    <header class="topbar"><div class="header-inner"><a class="brand" href="/" aria-label="CastleNotebook 首页"><img src="/logo.svg" alt="" width="29" height="29"><span>CastleNotebook</span></a><input id="document-title" class="notebook-title" data-field="title" aria-label="Notebook 标题" maxlength="200"><span id="save-state" class="save-state">已保存</span><span class="app-version">0.9</span></div></header>
+    <header class="topbar"><div class="header-inner"><a class="brand" href="/" aria-label="CastleNotebook 首页"><img src="/logo.svg" alt="" width="29" height="29"><span>CastleNotebook</span></a><input id="document-title" class="notebook-title" data-field="title" aria-label="Notebook 标题" maxlength="200"><span id="save-state" class="save-state">已保存</span><span class="app-version">0.9.6</span></div></header>
     <div class="command-area"><nav class="menubar" aria-label="Notebook 菜单"><div class="menu-wrap"><button data-action="file-menu">文件</button><div id="file-menu" class="dropdown" hidden><button data-action="new">新建 Notebook</button><button data-action="init">从项目初始化…</button><a id="export-link" download>下载 Notebook</a><div class="menu-divider"></div><div id="notebook-list"></div></div></div><button data-action="add-default">插入</button><div class="menu-wrap"><button data-action="cell-menu">单元</button><div id="cell-menu" class="dropdown" hidden><button data-action="run-selected">运行当前</button><button data-action="run-all">运行全部</button></div></div><button data-action="reset">内核</button><button data-action="help">帮助</button><span class="menu-spacer"></span><button class="kernel-state" data-action="environment" id="kernel-state">Python 3 <span class="kernel-dot"></span></button></nav>
     <div class="toolbar" role="toolbar" aria-label="Notebook 工具栏"><div class="tool-group"><button class="tool" data-action="save" title="保存 (Ctrl+S)" aria-label="保存 Notebook">${icon("save")}</button></div><div class="tool-group"><button class="tool" data-action="add-default" title="在当前单元下方插入" aria-label="插入单元">${icon("plus")}</button><button class="tool" data-action="delete-selected" title="删除单元" aria-label="删除所选单元">${icon("trash")}</button><button class="tool" data-action="duplicate-selected" title="复制单元" aria-label="复制所选单元">${icon("copy")}</button></div><div class="tool-group"><button class="tool" data-action="up-selected" title="上移" aria-label="上移所选单元">${icon("up")}</button><button class="tool" data-action="down-selected" title="下移" aria-label="下移所选单元">${icon("down")}</button></div><div class="tool-group"><button class="tool run-selected" data-action="run-selected" title="执行 (Shift+Enter)">${icon("play")}<span>运行</span></button><button class="tool" data-action="stop" title="停止" aria-label="停止执行">${icon("stop")}</button><button class="tool" data-action="reset" title="重启内核" aria-label="重启内核">${icon("refresh")}</button></div><select id="cell-type" aria-label="单元类型"><option value="code">Python</option><option value="markdown">Markdown</option><option value="order">Order</option></select><span class="toolbar-spacer"></span><button class="tool inspector-toggle" data-action="inspector" aria-label="切换检查器" title="上下文 / 变量 / 记录">${icon("panel")}</button></div></div>
     <div class="work-content"><main id="notebook" class="notebook" aria-label="Notebook 单元"></main><aside class="inspector" id="inspector" aria-label="调试检查面板"></aside></div></div>`;
@@ -442,7 +449,7 @@ function renderSidebar() {
   $("#document-title").disabled=editing;
   for(const operation of ["merge","split"]) {
     const button=$(`[data-action="${operation}-selected"]`);
-    button.disabled=editing||currentCell()?.type!=="order"||!state.boot.capabilities.claude||
+    button.disabled=editing||currentCell()?.type!=="order"||!providerAvailable(currentCell())||providerName(currentCell())==="custom"||
       (operation==="merge"&&state.doc.cells.filter(c=>c.type==="order").length<2)||
       (operation==="split"&&state.doc.cells.length>=100);
   }
@@ -474,14 +481,23 @@ function renderNotebook() {
 }
 
 function orderSessionHTML(session, cellId) {
-  const canOpen=session?.available && state.boot.capabilities.claude;
-  const reason=session?.reason || (!state.boot.capabilities.claude ? "请安装并登录 Claude Code 后重启服务。" : "请先运行此 Order 单元，再打开对话。");
-  return `<span class="session-name" title="${h(session?.name || reason)}">${session?.name?`Session Name <code>${h(session.name)}</code>`:"运行后可打开对话"}${session?.background_id?` · Background <code>${h(session.background_id)}</code>`:""}${session?.permission_mode?` · ${h(session.permission_mode)}`:""}</span><button class="text-button" data-action="open-session" data-id="${cellId}" title="${h(canOpen?"在新终端查看实时对话并继续交流":reason)}" ${canOpen?"":"disabled"}>${icon("terminal")}打开对话</button>`;
+  const name=session?.provider||providerName(state.doc?.cells.find(c=>c.id===cellId));
+  const installed=providerAvailable({provider:name});
+  const custom=name==="custom";
+  const canOpen=custom?Boolean(session?.available):Boolean(session?.available && installed);
+  const reason=session?.reason || (custom?"请先运行此 Order 单元，再绑定外部对话。":!installed?`请安装并登录 ${providerLabel(name)} 后重启服务。`:name==="codex"?"Codex 为流式执行，暂无可打开的后台对话。":"请先运行此 Order 单元，再打开对话。");
+  const hint=canOpen?(custom?"搜索并绑定外部 AI 对话，或查看已绑定的对话":"在新终端查看实时对话并继续交流"):reason;
+  const label=custom
+    ?(session?.id?`Custom · 已绑定 <code>${h(session.name||session.id)}</code>`:"Custom · 运行后绑定外部对话")
+    :`${session?.provider?`${providerLabel(session.provider)} · `:""}${session?.name?`Session Name <code>${h(session.name)}</code>`:"运行后可打开对话"}${session?.background_id?` · Background <code>${h(session.background_id)}</code>`:""}${session?.permission_mode?` · ${h(session.permission_mode)}`:""}`;
+  return `<span class="session-name" title="${h(session?.name || reason)}">${label}</span><button class="text-button" data-action="open-session" data-id="${cellId}" title="${h(hint)}" ${canOpen?"":"disabled"}>${icon("terminal")}打开对话</button>`;
 }
 function liveSession(run) {
-  return {name:run.session_name,id:run.session_id,background_id:run.background_id,
+  if(run.provider==="custom")return {name:run.session_name,id:run.session_id,provider:"custom",background_id:null,
+          permission_mode:null,available:true,reason:"",bound:Boolean(run.session_id)};
+  return {name:run.session_name,id:run.session_id,background_id:run.background_id,provider:run.provider,
           permission_mode:run.provider_permission_mode,available:Boolean(run.background_id),
-          reason:"请等待后台会话启动后再打开对话。"};
+          reason:run.provider==="codex"?"Codex 为流式执行，无后台会话；执行过程见下方实时输出。":"请等待后台会话启动后再打开对话。"};
 }
 function refreshSessionButton(cellId, session) {
   const row=$(`#session-${cellId}`);if(!row)return;
@@ -499,7 +515,7 @@ function cellHTML(cell,index) {
   } else if (cell.type === "markdown") {
     input=editing ? `<textarea class="markdown-input" data-field="source" data-cell="${cell.id}" spellcheck="false" aria-label="Markdown 内容" ${disabled}>${h(cell.source)}</textarea>` : `<div class="markdown markdown-preview" data-id="${cell.id}" title="双击编辑 Markdown">${cell.source ? markdown(cell.source, cell.attachments) : '<p class="placeholder">Markdown</p>'}</div>`;
   } else {
-    input=`<div class="order-body">${orderInputHTML(cell)}<div class="contract-row"><label for="contract-${cell.id}">预期</label><textarea id="contract-${cell.id}" class="contract-input" data-field="expected_output" data-cell="${cell.id}" placeholder="输出契约" aria-label="预期输出" rows="1" maxlength="8000" ${disabled}>${h(cell.expected_output)}</textarea></div><div class="order-options"><span>Claude</span><select aria-label="输出格式" data-field="output_format" data-cell="${cell.id}" ${disabled}>${["markdown","json","text"].map(v=>`<option value="${v}" ${cell.output_format===v?"selected":""}>${v==="markdown"?"Markdown":v==="json"?"JSON":"Text"}</option>`).join("")}</select><button class="text-button" data-action="context" data-id="${cell.id}">上下文</button></div></div>`;
+    input=`<div class="order-body">${orderInputHTML(cell)}<div class="contract-row"><label for="contract-${cell.id}">预期</label><textarea id="contract-${cell.id}" class="contract-input" data-field="expected_output" data-cell="${cell.id}" placeholder="输出契约" aria-label="预期输出" rows="1" maxlength="8000" ${disabled}>${h(cell.expected_output)}</textarea></div><div class="order-options"><select aria-label="AI 提供商" data-field="provider" data-cell="${cell.id}" ${disabled}>${[["default",`默认（${providerLabel(state.boot.capabilities.default_provider||"claude")}）`],["claude","Claude"],["codex","Codex"],["custom","Custom（外部对话）"]].map(([v,label])=>`<option value="${v}" ${(cell.provider||"default")===v?"selected":""}>${label}</option>`).join("")}</select><select aria-label="输出格式" data-field="output_format" data-cell="${cell.id}" ${disabled}>${["markdown","json","text"].map(v=>`<option value="${v}" ${cell.output_format===v?"selected":""}>${v==="markdown"?"Markdown":v==="json"?"JSON":"Text"}</option>`).join("")}</select><button class="text-button" data-action="context" data-id="${cell.id}">上下文</button></div></div>`;
   }
   if (cell.type === "order") {
     const session=live ? liveSession(live) : cell.session;
@@ -507,9 +523,9 @@ function cellHTML(cell,index) {
   }
   const count=cell.execution_count||cell.run_ids.length||" ";
   const hasOutput=live||cell.outputs.length||cell.last_error||(cell.type==="order"&&orderRunId(cell));
-  const operations=cell.type==="order"?`<button class="icon-btn" data-action="merge-cells" data-id="${cell.id}" title="Merge AI Cells · 合并两个 Order，清空原对话关联" aria-label="Merge AI Cells" ${executionDisabled||!state.boot.capabilities.claude||state.doc.cells.filter(c=>c.type==="order").length<2?"disabled":""}>${icon("merge")}</button><button class="icon-btn" data-action="split-cells" data-id="${cell.id}" title="Split AI Cells · 拆分为两个 Order，复制原对话" aria-label="Split AI Cells" ${executionDisabled||!state.boot.capabilities.claude||state.doc.cells.length>=100?"disabled":""}>${icon("split")}</button>`:"";
+  const operations=cell.type==="order"?`<button class="icon-btn" data-action="merge-cells" data-id="${cell.id}" title="Merge AI Cells · 合并两个 Order，清空原对话关联" aria-label="Merge AI Cells" ${executionDisabled||!providerAvailable(cell)||providerName(cell)==="custom"||state.doc.cells.filter(c=>c.type==="order").length<2?"disabled":""}>${icon("merge")}</button><button class="icon-btn" data-action="split-cells" data-id="${cell.id}" title="Split AI Cells · 拆分为两个 Order，复制原对话" aria-label="Split AI Cells" ${executionDisabled||!providerAvailable(cell)||providerName(cell)==="custom"||state.doc.cells.length>=100?"disabled":""}>${icon("split")}</button>`:"";
   return `<article class="cell ${cell.type}-cell ${state.selected===cell.id?"selected":""}" id="cell-${cell.id}" data-cell-card="${cell.id}" tabindex="0" title="${h(cell.title)} · 更新 ${h(timeText(cell.updated_at,true))}">
-    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${executionDisabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${live&&live.operation?'<span class="status-tag running"><i class="spinner"></i>整理中</span>':tagHTML(cell)}</span>${operations}<button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
+    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${cell.type==="order"&&!providerAvailable(cell)?"disabled":executionDisabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${live&&live.operation?'<span class="status-tag running"><i class="spinner"></i>整理中</span>':tagHTML(cell)}</span>${operations}<button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
     <div class="output-block ${cell.stale?"stale-output":""} ${outputExpanded?"output-expanded":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span>${cell.type==="order"?`<button class="output-expand" data-action="toggle-order-output" data-id="${cell.id}" aria-controls="output-${cell.id}" aria-expanded="${outputExpanded}" title="${outputExpanded?"恢复滚动显示":"展开完整输出"}"><span class="output-expand-label">${outputExpanded?"恢复滚动显示":"展开完整输出"}</span></button>`:""}</div><div class="output-content" id="output-${cell.id}">${cell.type==="order"?orderOutputHTML(cell):live?outputsHTML(live.outputs):outputsHTML(cell.outputs, cell.attachments)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
 }
 
@@ -617,7 +633,7 @@ function touch(scope="document",field=null) {
 function editablePayload() {
   const doc=state.doc;
   return {revision:doc.revision,title:doc.title,global:{goal:doc.global.goal,constraints:doc.global.constraints},
-    cells:doc.cells.map(c=>({...Object.fromEntries(["id","type","title","source","expected_output","output_format","mode","context_note"].map(k=>[k,c[k]])),
+    cells:doc.cells.map(c=>({...Object.fromEntries(["id","type","title","source","expected_output","output_format","mode","context_note","provider"].map(k=>[k,k==="provider"?(c.provider||"default"):c[k]])),
       ...(c.type==="order"?{input_edited:state.inputEditBases.has(c.id),input_file_sha256:(state.inputEditBases.get(c.id)||c.file_input)?.sha256}:{} )}))};
 }
 async function save() {
@@ -766,7 +782,9 @@ function watchRun(run) {
         run.outputs=[data];const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML([data]);
         typeset(el || document);
       } else if(message.type==="session") {
+        // Codex streams without a background session: background_id stays null.
         run.background_id=data.background_id;run.session_id=data.id;
+        if(data.provider)run.provider=data.provider;
         run.provider_permission_mode=data.permission_mode;
         refreshSessionButton(run.cell_id,liveSession(run));
       } else if(message.type==="variables") {
@@ -789,11 +807,16 @@ function watchRun(run) {
 function orderRunConfirmationEnabled() {
   return state.boot?.settings?.confirm_order_run !== false;
 }
-function orderRunModeText() {
+function orderRunModeText(cell) {
   const capabilities=state.boot?.capabilities||{};
+  const name=providerName(cell);
+  const mode=capabilities.claude_permission_mode;
+  const permission=permissionModeLabel[mode]||mode||"默认权限模式";
+  // claude_launch_mode only applies to Claude; Codex always streams a subprocess.
+  if(name==="custom")return "Custom · 外部 AI 对话 · 等待写入 output.md";
+  if(name==="codex")return `Codex · 流式执行 · ${codexSandboxLabel[mode]||permission}`;
   const launch=launchModeLabel[capabilities.claude_launch_mode]||capabilities.claude_launch_mode||"默认启动方式";
-  const permission=permissionModeLabel[capabilities.claude_permission_mode]||capabilities.claude_permission_mode||"默认权限模式";
-  return `${launch} · ${permission}`;
+  return `${providerLabel(name)} · ${launch} · ${permission}`;
 }
 function orderRunTarget(cell) {
   const title=String(cell.title||"").trim();
@@ -803,7 +826,12 @@ function orderRunTarget(cell) {
 }
 function orderRunConfirmBody(cell) {
   const rerun=Boolean(cell.run_ids?.length||cell.last_run_id);
-  return `<p class="modal-description">是否采用 <strong>Claude Code</strong> 的 <strong>${h(orderRunModeText())}</strong> 模式运行「<strong>${h(orderRunTarget(cell))}</strong>」？</p><div class="modal-callout">${icon("warning")}<span>${rerun?"这是覆盖式 AI 重跑：运行会重新生成并覆盖该单元现有的 output.md 与对话关联，下游结果会被标记失效。":"运行会启动一次 AI 会话，并把结果写入该单元的 output.md。"}</span></div><p class="muted">可在启动项目的 <code>.castle/settings.json</code> 中设置 <code>"confirm_order_run": false</code> 关闭此提示。</p><div class="modal-actions"><button class="btn outline" data-action="cancel-order-run">取消</button><button class="btn primary" data-action="confirm-order-run">${icon("play")}继续运行</button></div>`;
+  const name=providerName(cell);
+  const software=name==="codex"?"Codex":name==="custom"?"Custom（外部 AI）":"Claude Code";
+  const callout=name==="custom"
+    ?(rerun?"这是覆盖式重跑：会重新生成 input.md 并等待外部 AI 覆盖 output.md，下游结果会被标记失效。":"运行会生成 input.md 与上下文快照，然后等待外部 AI 写入 output.md。对话在外部 AI 中进行，可用“打开对话”搜索并绑定会话。")
+    :(rerun?"这是覆盖式 AI 重跑：运行会重新生成并覆盖该单元现有的 output.md 与对话关联，下游结果会被标记失效。":"运行会启动一次 AI 会话，并把结果写入该单元的 output.md。");
+  return `<p class="modal-description">是否采用 <strong>${software}</strong> 的 <strong>${h(orderRunModeText(cell))}</strong> 模式运行「<strong>${h(orderRunTarget(cell))}</strong>」？</p><div class="modal-callout">${icon("warning")}<span>${callout}</span></div><p class="muted">可在启动项目的 <code>.castle/settings.json</code> 中设置 <code>"confirm_order_run": false</code> 关闭此提示。</p><div class="modal-actions"><button class="btn outline" data-action="cancel-order-run">取消</button><button class="btn primary" data-action="confirm-order-run">${icon("play")}继续运行</button></div>`;
 }
 let pendingOrderRunConfirm=null;
 function settleOrderRunConfirm(value) {
@@ -865,25 +893,50 @@ function newModal() {
   showModal("新建 Notebook",`<form id="new-form"><div class="path-block">${icon("folder")}<code>${h(root)}</code></div><label class="modal-label">项目子目录<input name="relative_path" value="${h(relative)}" placeholder="." autocomplete="off"></label><label class="modal-label">标题<input name="title" placeholder="未命名 Notebook" maxlength="200" autocomplete="off"></label><fieldset class="template-grid"><legend>模板</legend><label class="template-option"><input type="radio" name="template" value="blank" checked><span>${icon("notebook")}<strong>空白</strong><small>自定义单元</small></span></label><label class="template-option"><input type="radio" name="template" value="quant"><span>${icon("code")}<strong>金融研究</strong><small>合成数据</small></span></label><label class="template-option"><input type="radio" name="template" value="algorithm"><span>${icon("terminal")}<strong>算法验证</strong><small>边界断言</small></span></label></fieldset><button class="btn primary full" type="submit">创建</button></form>`);
 }
 function initModal() {
-  showModal("从项目初始化",`<div class="path-block">${icon("folder")}<code>${h(state.boot.project_path)}</code></div><form id="init-form"><label class="modal-label">子目录<input name="relative_path" value="." placeholder="." autocomplete="off"></label><div class="modal-callout">${icon("info")}将生成一个初始化 Order 单元，由你手动运行；Claude 会归类历史对话需求并直接改写本 notebook。</div><div class="modal-actions"><button class="btn outline" type="button" data-action="scan-project">文件概览</button><button class="btn primary" type="submit">生成初始化 Order</button></div><div id="scan-result"></div></form>`);
+  showModal("从项目初始化",`<div class="path-block">${icon("folder")}<code>${h(state.boot.project_path)}</code></div><form id="init-form"><label class="modal-label">子目录<input name="relative_path" value="." placeholder="." autocomplete="off"></label><div class="modal-callout">${icon("info")}将生成一个初始化 Order 单元，由你手动运行；AI 会归类历史对话需求并直接改写本 notebook。</div><div class="modal-actions"><button class="btn outline" type="button" data-action="scan-project">文件概览</button><button class="btn primary" type="submit">生成初始化 Order</button></div><div id="scan-result"></div></form>`);
 }
 async function cellOperationModal(id,operation) {
   await flushSave();
   if(anyBusy()||state.sequence)throw new Error("请等待或停止当前执行后再整理单元。");
   const cell=state.doc.cells.find(c=>c.id===id);
   if(cell?.type!=="order")throw new Error("请选择一个 Order 单元。");
+  if(providerName(cell)==="custom")throw new Error("Custom 提供商的对话在外部 AI 中进行，暂不支持合并与拆分。");
   const merge=operation==="merge", others=state.doc.cells.filter(c=>c.type==="order"&&c.id!==id);
   if(merge&&!others.length)throw new Error("至少需要两个 Order 单元才能合并。");
   if(!merge&&state.doc.cells.length>=100)throw new Error("拆分后会超过 100 个单元。");
   selectCell(id);
   const index=state.doc.cells.indexOf(cell), next=state.doc.cells.slice(index+1).find(c=>c.type==="order")||others[0];
-  showModal(merge?"Merge AI Cells · 合并 Order":"Split AI Cells · 拆分 Order",`<form id="cell-operation-form" data-id="${id}" data-operation="${operation}"><p>${merge?"Agent 将归纳两个 Order 的指令、预期输出和已有结论，替换原单元，并清空原 AI 对话关联。":"Agent 将内容按任务边界拆成两个连续 Order，为两者复制原 AI 对话，之后可以分别续聊。"}</p><div class="path-block">${icon("order")}<strong>${h(cell.title||`Order ${index+1}`)}</strong></div>${merge?`<label class="modal-label">合并另一个 Order<select name="other_cell_id" aria-label="选择要合并的 Order">${others.map(other=>`<option value="${other.id}" ${other.id===next?.id?"selected":""}>${state.doc.cells.indexOf(other)+1}. ${h(other.title||other.source.slice(0,50))}</option>`).join("")}</select></label>`:!cell.session?.available?'<p class="muted">原单元暂无可恢复的 AI 对话，将拆分内容并分别保存输入、输出文件。</p>':""}<label class="modal-label">整理要求（可选）<textarea name="instructions" aria-label="整理要求" rows="3" maxlength="4000" placeholder="${merge?"例如：归纳成已完成的版本需求，保留验证结论":"例如：分别整理为功能实现和测试验证两个步骤"}"></textarea></label><p class="muted">完成后自动保存。失败或停止时保留原单元。</p><div class="modal-actions"><button class="btn outline" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit" ${state.boot.capabilities.claude?"":"disabled"}>${icon(operation)}调用 Agent ${merge?"合并":"拆分"}</button></div></form>`);
+  showModal(merge?"Merge AI Cells · 合并 Order":"Split AI Cells · 拆分 Order",`<form id="cell-operation-form" data-id="${id}" data-operation="${operation}"><p>${merge?"Agent 将归纳两个 Order 的指令、预期输出和已有结论，替换原单元，并清空原 AI 对话关联。":"Agent 将内容按任务边界拆成两个连续 Order，为两者复制原 AI 对话，之后可以分别续聊。"}</p><div class="path-block">${icon("order")}<strong>${h(cell.title||`Order ${index+1}`)}</strong></div>${merge?`<label class="modal-label">合并另一个 Order<select name="other_cell_id" aria-label="选择要合并的 Order">${others.map(other=>`<option value="${other.id}" ${other.id===next?.id?"selected":""}>${state.doc.cells.indexOf(other)+1}. ${h(other.title||other.source.slice(0,50))}</option>`).join("")}</select></label>`:!cell.session?.available?'<p class="muted">原单元暂无可恢复的 AI 对话，将拆分内容并分别保存输入、输出文件。</p>':""}<label class="modal-label">整理要求（可选）<textarea name="instructions" aria-label="整理要求" rows="3" maxlength="4000" placeholder="${merge?"例如：归纳成已完成的版本需求，保留验证结论":"例如：分别整理为功能实现和测试验证两个步骤"}"></textarea></label><p class="muted">完成后自动保存。失败或停止时保留原单元。</p><div class="modal-actions"><button class="btn outline" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit" ${providerAvailable(cell)?"":"disabled"}>${icon(operation)}调用 Agent ${merge?"合并":"拆分"}</button></div></form>`);
 }
 async function contextModal(id) {
   await flushSave();selectCell(id);
   const context=liveFor(id)?liveFor(id).context:await api(`/api/notebooks/${state.doc.id}/cells/${id}/context`);
   state.context=context;
-  showModal("执行输入 · 完整上下文",`<p class="modal-description">${h(context.policy)}<br>以下文本与本次状态下发送给 Claude 的输入一致；执行记录会保存当时的独立快照。${context.config_path?`<br>模板配置：<code>${h(context.config_path)}</code>`:""}</p><div class="context-modal-meta"><span>${context.characters.toLocaleString()} 字符 · ~${context.estimated_tokens.toLocaleString()} tokens</span><button class="btn outline small" data-action="copy-context">${icon("copy")}复制输入</button></div><pre class="context-full">${h(context.prompt)}</pre><div class="context-hash"><span>SHA-256</span><code>${h(context.fingerprint)}</code></div>`,true);
+  showModal("执行输入 · 完整上下文",`<p class="modal-description">${h(context.policy)}<br>以下文本与本次状态下发送给所选 AI 的输入一致；执行记录会保存当时的独立快照。${context.config_path?`<br>模板配置：<code>${h(context.config_path)}</code>`:""}</p><div class="context-modal-meta"><span>${context.characters.toLocaleString()} 字符 · ~${context.estimated_tokens.toLocaleString()} tokens</span><button class="btn outline small" data-action="copy-context">${icon("copy")}复制输入</button></div><pre class="context-full">${h(context.prompt)}</pre><div class="context-hash"><span>SHA-256</span><code>${h(context.fingerprint)}</code></div>`,true);
+}
+function customDirectoryModal(cellId) {
+  const dir=state.boot.settings?.custom_sessions_dir||"";
+  showModal("绑定外部对话目录",`<p class="modal-description">Custom 提供商只读取你在此指定的会话文件夹（例如 Qoder 的 <code>~/.qoder-cn/projects/&lt;项目&gt;</code>）。默认不绑定，也不读取任何外部文件。</p><label class="modal-label">会话目录<input id="custom-dir-path" value="${h(dir)}" placeholder="C:\\Users\\...\\.qoder-cn\\projects\\..." autocomplete="off"></label><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn primary" data-action="custom-bind-dir" data-id="${cellId}">${icon("folder")}绑定目录</button></div>`);
+}
+function customSearchModal(cellId) {
+  const dir=state.boot.settings?.custom_sessions_dir||"";
+  showModal("绑定外部对话",`<p class="modal-description">按聊天关键词与日期搜索已绑定目录中的会话，选中后绑定到本单元。</p><div class="path-block">${icon("folder")}<code>${h(dir)}</code><button class="text-button" data-action="custom-change-dir" data-id="${cellId}">更换目录</button></div><div class="custom-search-row"><input id="custom-keyword" placeholder="聊天关键词" aria-label="聊天关键词" autocomplete="off"><input type="date" id="custom-date-from" aria-label="开始日期"><input type="date" id="custom-date-to" aria-label="结束日期"><button class="btn primary small" data-action="custom-search" data-id="${cellId}">${icon("eye")}搜索</button></div><div id="custom-results" class="custom-results"><p class="muted">输入关键词或日期后搜索；留空则列出最近的会话。</p></div>`);
+}
+function customResultsHTML(sessions, cellId) {
+  if(!sessions.length)return '<p class="muted">没有匹配的会话。试试更短的关键词或更宽的日期范围。</p>';
+  return sessions.map(s=>`<div class="custom-result"><div class="custom-result-main"><strong>${h(s.title)}</strong><small>${h(timeText(s.started_at,true))} → ${h(timeText(s.updated_at,true))} · ${s.messages} 条消息${s.matches?` · 命中 ${s.matches}`:""}</small>${s.snippet?`<p class="muted">${h(s.snippet)}</p>`:""}</div><button class="btn outline small" data-action="custom-bind-session" data-id="${cellId}" data-session="${h(s.session_id)}">${icon("link")}绑定</button></div>`).join("");
+}
+async function customTranscriptModal(cellId, sessionId) {
+  const data=await api(`/api/custom/sessions/${encodeURIComponent(sessionId)}/transcript`);
+  showModal(`外部对话 · ${data.title||sessionId}`,`<div class="path-block">${icon("folder")}<code>${h(data.directory)}</code> · <code>${h(data.session_id)}</code></div><div class="modal-actions custom-transcript-actions"><button class="btn outline small" data-action="custom-refresh" data-id="${cellId}" data-session="${h(sessionId)}">${icon("refresh")}刷新</button><button class="btn outline small" data-action="custom-research" data-id="${cellId}">${icon("eye")}重新搜索绑定</button><button class="btn outline small" data-action="custom-change-dir" data-id="${cellId}">${icon("folder")}更换目录</button></div>${data.truncated?'<p class="muted">对话较长，仅显示部分内容。</p>':""}<div class="custom-transcript">${data.messages.map(m=>`<div class="custom-message ${m.role}"><div class="custom-message-head"><strong>${m.role==="user"?"用户":"AI"}</strong><time>${h(timeText(m.at,true))}</time></div><pre>${h(m.text)}</pre></div>`).join("")||'<p class="muted">该会话暂无可显示的文本消息。</p>'}</div>`,true);
+}
+async function openCustomSession(cellId) {
+  if(!state.boot.settings?.custom_sessions_dir)return customDirectoryModal(cellId);
+  const cell=state.doc.cells.find(c=>c.id===cellId);
+  const live=liveFor(cellId);
+  const session=live?liveSession(live):cell?.session;
+  if(session?.id)return customTranscriptModal(cellId,session.id);
+  return customSearchModal(cellId);
 }
 async function viewRun(id) {
   const run=await api(`/api/runs/${id}`);const events=await fetch(`/api/runs/${id}/artifact?name=events`).then(r=>r.ok?r.text():"");
@@ -942,11 +995,42 @@ async function action(name,el) {
   if(name==="stop"){state.sequenceStop=true;const rid=liveFor(state.selected)?.id || state.doc?.runtime.active_run_id;if(rid)return api(`/api/runs/${rid}/cancel`,"POST",{});return;}
   if(name==="context")return contextModal(id);
   if(name==="open-session"){
+    const cell=state.doc.cells.find(c=>c.id===id);
+    if(cell && providerName(cell)==="custom")return openCustomSession(id);
     el.disabled=true;
     try {const session=await api(`/api/notebooks/${state.doc.id}/cells/${id}/open-session`,"POST",{});toast(`已在新终端打开对话：${session.session_name}`);}
     finally {el.disabled=false;}
     return;
   }
+  if(name==="custom-bind-dir"){
+    const value=$("#custom-dir-path").value.trim();
+    state.boot.settings=await api("/api/custom/directory","PUT",{path:value});
+    toast(value?"对话目录已绑定。":"已解除对话目录绑定。");
+    return openCustomSession(id);
+  }
+  if(name==="custom-change-dir")return customDirectoryModal(id);
+  if(name==="custom-research")return customSearchModal(id);
+  if(name==="custom-search"){
+    el.disabled=true;
+    try {
+      const result=await api("/api/custom/sessions/search","POST",{keyword:$("#custom-keyword").value,date_from:$("#custom-date-from").value,date_to:$("#custom-date-to").value});
+      $("#custom-results").innerHTML=customResultsHTML(result.sessions,id)+(result.truncated?'<p class="muted">结果过多，仅显示前 50 条。</p>':"");
+    } finally {el.disabled=false;}
+    return;
+  }
+  if(name==="custom-bind-session"){
+    state.doc=await api(`/api/notebooks/${state.doc.id}/cells/${id}/custom-session`,"POST",{session_id:el.dataset.session});
+    const live=liveFor(id);
+    if(live){
+      const session=state.doc.cells.find(c=>c.id===id)?.session;
+      live.session_id=session?.id||el.dataset.session;
+      live.session_name=session?.name||live.session_id;
+    }
+    renderAll();
+    toast("外部对话已绑定到本单元。");
+    return customTranscriptModal(id,el.dataset.session);
+  }
+  if(name==="custom-refresh")return customTranscriptModal(id,el.dataset.session);
   if(name==="copy-context"){await navigator.clipboard.writeText(state.context.prompt);return toast("完整输入已复制。");}
   if(name==="edit-markdown"){if(cellLocked(id))return;await flushSave();state.selected=id;state.markdownEditing.has(id)?state.markdownEditing.delete(id):state.markdownEditing.add(id);renderAll();$(`#cell-${id} textarea`)?.focus();return;}
   if(name==="edit-order"||name==="done-order") {
@@ -973,14 +1057,14 @@ async function action(name,el) {
   if(name==="view-run")return viewRun(id);
   if(name==="reset")return showModal("重启 Python 内核",`<p>重启将清空当前共享变量，保留所有历史输出。已有计算结果会标记失效，需从上游重新执行。</p><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn primary" data-action="confirm-reset">${icon("refresh")}重启内核</button></div>`);
   if(name==="confirm-reset"){await flushSave();state.doc=await api(`/api/notebooks/${state.doc.id}/kernel/reset`,"POST",{});$("#modal").close();renderAll();return toast("内核已重启，历史输出已保留。");}
-  if(name==="add")return mutateCells(()=>{const stamp=new Date().toISOString(),kind=el.dataset.type;const cell={id:newId(),type:kind,title:"",source:"",expected_output:"",context_note:"",mode:"llm",output_format:"markdown",created_at:stamp,updated_at:stamp,revision:1,status:"idle",stale:false,outputs:[],run_ids:[]};const at=el.dataset.insert?state.doc.cells.findIndex(c=>c.id===state.selected)+1:state.doc.cells.length;state.doc.cells.splice(at,0,cell);state.selected=cell.id;if(kind==="markdown")state.markdownEditing.add(cell.id);if(kind==="order")state.orderEditing.add(cell.id);}).then(()=>{$(`#cell-${state.selected}`)?.scrollIntoView({behavior:"smooth",block:"center"});$(`#cell-${state.selected} textarea`)?.focus();});
+  if(name==="add")return mutateCells(()=>{const stamp=new Date().toISOString(),kind=el.dataset.type;const cell={id:newId(),type:kind,title:"",source:"",expected_output:"",context_note:"",mode:"llm",output_format:"markdown",provider:"default",created_at:stamp,updated_at:stamp,revision:1,status:"idle",stale:false,outputs:[],run_ids:[]};const at=el.dataset.insert?state.doc.cells.findIndex(c=>c.id===state.selected)+1:state.doc.cells.length;state.doc.cells.splice(at,0,cell);state.selected=cell.id;if(kind==="markdown")state.markdownEditing.add(cell.id);if(kind==="order")state.orderEditing.add(cell.id);}).then(()=>{$(`#cell-${state.selected}`)?.scrollIntoView({behavior:"smooth",block:"center"});$(`#cell-${state.selected} textarea`)?.focus();});
   if(["move-up","move-down","duplicate"].includes(name))return mutateCells(()=>{const index=state.doc.cells.findIndex(c=>c.id===id);if(name==="duplicate"){const copy=structuredClone(state.doc.cells[index]);Object.assign(copy,{id:newId(),title:copy.title+" · 副本",status:"idle",stale:false,outputs:[],run_ids:[],last_run_id:undefined,last_error:null,initializer:false,applied_run_id:undefined,file_input:undefined,file_output:undefined,input_session_synced:undefined});state.doc.cells.splice(index+1,0,copy);state.selected=copy.id;}else{const to=index+(name==="move-up"?-1:1);if(to>=0 && to<state.doc.cells.length)[state.doc.cells[index],state.doc.cells[to]]=[state.doc.cells[to],state.doc.cells[index]];}});
   if(name==="delete")return showModal("删除这个单元",`<p>将删除当前文档中的「${h(state.doc.cells.find(c=>c.id===id).title)}」。独立运行证据文件仍保存在本地，下游结果会标记失效。</p><div class="modal-actions"><button class="btn outline" data-action="close-modal">取消</button><button class="btn danger" data-action="confirm-delete" data-id="${id}">删除单元</button></div>`);
   if(name==="confirm-delete"){$("#modal").close();return mutateCells(()=>{state.doc.cells=state.doc.cells.filter(c=>c.id!==id);state.expandedOrderOutputs.delete(id);state.selected=state.doc.cells[0]?.id;});}
   if(name==="apply-init"){await flushSave();state.doc=await api(`/api/notebooks/${state.doc.id}/apply-init`,"POST",{run_id:id});renderAll();return toast("项目已拆分为独立单元。检查代码后再逐步运行。");}
   if(name==="scan-project"){el.disabled=true;try{const result=await api("/api/project/scan","POST",{relative_path:$("#init-form input[name=relative_path]").value});$("#scan-result").innerHTML=`<p class="muted">${result.files.length} 个文件${result.truncated?" · 概览已截断":""}</p><pre>${h(result.files.join("\n"))}</pre><p class="muted">${h(result.policy)}</p>`;}finally{el.disabled=false;}return;}
-  if(name==="environment")return showModal("本地运行环境",`<div class="environment-details"><label>项目工作目录</label><code>${h(state.doc?.project_path||state.boot.project_path)}</code><label>Python 内核</label><code>${h(state.boot.capabilities.python)}</code><label>Claude CLI</label><p>${state.boot.capabilities.claude?'<span class="status-tag succeeded">已检测到</span> 运行时沿用本机 Claude 的模型、工具、权限与登录配置。':'<span class="status-tag failed">未检测到</span> 安装并登录后，重启本服务。'}</p><label>Order 运行确认</label><p>${state.boot.settings?.confirm_order_run===false?'<span class="status-tag succeeded">已关闭</span> 可在 <code>'+h(state.boot.settings.path)+'</code> 中重新开启。':'<span class="status-tag succeeded">已开启</span> 运行 Order 前询问软件、模式与目标单元。'}${state.boot.settings?.error?`<br><span class="error-text">${h(state.boot.settings.error)}</span>`:""}</p><label>执行上限</label><p>Python ${state.boot.capabilities.code_timeout} 秒 · Claude ${state.boot.capabilities.agent_timeout} 秒</p></div><p class="muted">切换研究环境：启动服务时指定 <code>--python &lt;解释器路径&gt;</code>。初始化其他项目：使用 <code>--project &lt;项目目录&gt;</code>。</p>`);
-  if(name==="help")return showModal("把端到端过程，拆成可控的每一步",`<div class="help-steps"><div><b>01</b><section><h3>用 Global 约束全局</h3><p>写清目的、数据口径和执行边界。修改后，下游旧结果会标记失效。</p></section></div><div><b>02</b><section><h3>用单元推进研究</h3><p>Markdown 记录假设，Python 运行真实代码，Order 把精简上文与输出契约发送给 Claude。Python 单元共享变量。</p></section></div><div><b>03</b><section><h3>先检查，再决定下一步</h3><p>在检查器查看完整输入、有效结果和变量。每次执行都有独立的输入、输出与事件文件，代码建议由你检查后执行。</p></section></div></div><div class="shortcut-list"><span>执行并选择下一个单元<kbd>Shift + Enter</kbd></span><span>执行当前单元<kbd>Ctrl + Enter</kbd></span><span>立即保存<kbd>Ctrl + S</kbd></span><span>代码缩进<kbd>Tab</kbd></span></div>`);
+  if(name==="environment"){const caps=state.boot.capabilities,def=caps.default_provider||"claude";return showModal("本地运行环境",`<div class="environment-details"><label>项目工作目录</label><code>${h(state.doc?.project_path||state.boot.project_path)}</code><label>Python 内核</label><code>${h(caps.python)}</code><label>Claude CLI</label><p>${caps.claude?'<span class="status-tag succeeded">已检测到</span> 运行时沿用本机 Claude 的模型、工具、权限与登录配置。':'<span class="status-tag failed">未检测到</span> 安装并登录后，重启本服务。'}${def==="claude"?"当前为默认 AI 提供商。":""}</p><label>Codex CLI</label><p>${caps.codex?'<span class="status-tag succeeded">已检测到</span> 运行时沿用本机 Codex 的模型、沙箱与登录配置，始终流式执行。':'<span class="status-tag failed">未检测到</span> 安装并登录后，重启本服务。'}${def==="codex"?"当前为默认 AI 提供商。":""}</p><label>Custom 外部对话</label><p>${state.boot.settings?.custom_sessions_dir?`<span class="status-tag succeeded">已绑定目录</span> <code>${h(state.boot.settings.custom_sessions_dir)}</code>`:'<span class="status-tag idle">未绑定目录</span> 默认不读取任何外部文件；在 Custom 单元的“打开对话”弹窗中绑定。'}${def==="custom"?"当前为默认 AI 提供商。":""}</p><label>Order 运行确认</label><p>${state.boot.settings?.confirm_order_run===false?'<span class="status-tag succeeded">已关闭</span> 可在 <code>'+h(state.boot.settings.path)+'</code> 中重新开启。':'<span class="status-tag succeeded">已开启</span> 运行 Order 前询问软件、模式与目标单元。'}${state.boot.settings?.error?`<br><span class="error-text">${h(state.boot.settings.error)}</span>`:""}</p><label>执行上限</label><p>Python ${caps.code_timeout} 秒 · AI ${caps.agent_timeout} 秒</p></div><p class="muted">切换研究环境：启动服务时指定 <code>--python &lt;解释器路径&gt;</code>。切换默认 AI 提供商：使用 <code>--provider claude|codex|custom</code>；指定 Codex CLI 路径：使用 <code>--codex &lt;路径&gt;</code>。初始化其他项目：使用 <code>--project &lt;项目目录&gt;</code>。</p>`);}
+  if(name==="help")return showModal("把端到端过程，拆成可控的每一步",`<div class="help-steps"><div><b>01</b><section><h3>用 Global 约束全局</h3><p>写清目的、数据口径和执行边界。修改后，下游旧结果会标记失效。</p></section></div><div><b>02</b><section><h3>用单元推进研究</h3><p>Markdown 记录假设，Python 运行真实代码，Order 把精简上文与输出契约发送给所选 AI。Python 单元共享变量。</p></section></div><div><b>03</b><section><h3>先检查，再决定下一步</h3><p>在检查器查看完整输入、有效结果和变量。每次执行都有独立的输入、输出与事件文件，代码建议由你检查后执行。</p></section></div></div><div class="shortcut-list"><span>执行并选择下一个单元<kbd>Shift + Enter</kbd></span><span>执行当前单元<kbd>Ctrl + Enter</kbd></span><span>立即保存<kbd>Ctrl + S</kbd></span><span>代码缩进<kbd>Tab</kbd></span></div>`);
 }
 
 document.addEventListener("click",event=>{
@@ -1010,7 +1094,9 @@ document.addEventListener("change",event=>{
     const kind=event.target.value;
     mutateCells(()=>{const cell=currentCell();cell.type=kind;if(kind==="markdown")state.markdownEditing.add(cell.id);if(kind==="order")state.orderEditing.add(cell.id);}).catch(e=>toast(e.message,true));return;
   }
-  if(event.target.tagName==="SELECT"&&event.target.dataset.field)event.target.dispatchEvent(new Event("input",{bubbles:true}));
+  if(event.target.tagName==="SELECT"&&event.target.dataset.field){event.target.dispatchEvent(new Event("input",{bubbles:true}));
+    // Provider choice changes CLI availability gates; refresh buttons immediately.
+    if(event.target.dataset.field==="provider")renderAll();}
 });
 document.addEventListener("scroll",event=>{if(event.target.classList?.contains("code-input")){event.target.previousElementSibling.scrollTop=event.target.scrollTop;event.target.previousElementSibling.scrollLeft=event.target.scrollLeft;}},true);
 document.addEventListener("submit",async event=>{
@@ -1026,7 +1112,7 @@ document.addEventListener("submit",async event=>{
     } else if(form.id==="new-form"){
       const doc=await api("/api/notebooks","POST",values);state.boot.notebooks=await api("/api/notebooks");$("#modal").close();await openNotebook(doc.id);
     } else {
-      const result=await api("/api/project/initialize","POST",values);state.doc=result.notebook;state.selected=state.doc.cells[state.doc.cells.length-1]?.id;state.boot.notebooks=await api("/api/notebooks");localStorage.setItem("castle-notebook",state.doc.id);$("#modal").close();renderAll();toast("已生成初始化 Order，请运行该单元，由 Claude 归类需求并改写 notebook。");
+      const result=await api("/api/project/initialize","POST",values);state.doc=result.notebook;state.selected=state.doc.cells[state.doc.cells.length-1]?.id;state.boot.notebooks=await api("/api/notebooks");localStorage.setItem("castle-notebook",state.doc.id);$("#modal").close();renderAll();toast("已生成初始化 Order，请运行该单元，由 AI 归类需求并改写 notebook。");
     }
   } catch(error){toast(error.message,true);}finally{submit.disabled=false;}
 });

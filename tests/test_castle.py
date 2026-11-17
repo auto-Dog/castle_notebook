@@ -23,7 +23,8 @@ from castle_notebook.core import (MAX_CONTEXT, MAX_EMBEDDED_IMAGE_BYTES, Problem
                                  read_project_file, scan_project, settings_summary, snapshot_project,
                                  validate_order_output)
 from castle_notebook.execution import (Engine, linux_terminal_command, open_claude_terminal,
-                                       resolve_claude, spawn_options)
+                                       spawn_options)
+from castle_notebook.providers.claude import resolve_claude
 from castle_notebook.server import App, MathAssets, Server
 
 FAKE = [sys.executable, str(Path(__file__).with_name("fake_claude.py"))]
@@ -44,7 +45,7 @@ class PlatformTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             executable = Path(folder) / "claude"
             executable.write_text("fixture", encoding="utf-8")
-            with patch("castle_notebook.execution.shutil.which", return_value=str(executable)):
+            with patch("castle_notebook.providers.claude.shutil.which", return_value=str(executable)):
                 self.assertEqual(resolve_claude("claude"), [str(executable)])
 
     def test_linux_terminal_command_finds_an_emulator_and_preserves_argv(self):
@@ -128,7 +129,7 @@ class CoreTests(unittest.TestCase):
 
     def test_budget_preserves_global_and_current_input(self):
         self.doc["cells"] = [new_cell("code", f"step {i}", "a" * 30000) for i in range(70)] + [new_cell("order", "current", "CURRENT_END", "CONTRACT_END")]
-        result = pack_context(self.doc, self.doc["cells"][-1]["id"])
+        result = pack_context(self.doc, self.doc["cells"][-1]["id"], config={"features": {"compact_history": True}})
         self.assertLessEqual(len(result["prompt"]), MAX_CONTEXT)
         self.assertEqual(len(result["sections"]), 70)
         self.assertIn(self.doc["global"]["goal"], result["prompt"])
@@ -197,7 +198,7 @@ class CoreTests(unittest.TestCase):
     def test_context_uses_native_claude_without_legacy_mode_restrictions(self):
         cell = self.doc["cells"][-1]
         llm = pack_context(self.doc, cell["id"])
-        self.assertIn("使用本机 Claude 的现有配置", llm["prompt"])
+        self.assertIn("## Current step", llm["prompt"])
         cell["mode"] = "agent"
         agent = pack_context(self.doc, cell["id"])
         self.assertEqual(llm["fingerprint"], agent["fingerprint"])
@@ -243,7 +244,7 @@ class CoreTests(unittest.TestCase):
         current = self.doc["cells"][-1]
         first = self.doc["cells"][0]
         first.update(source="a" * 5000 + "FULL_SOURCE_END", context_note="MANUAL_SUMMARY_MARKER")
-        config = {"features": {"manual_summaries": False}}
+        config = {"features": {"manual_summaries": False, "compact_history": True}}
         compact = pack_context(self.doc, current["id"], config=config)
         self.assertNotIn("MANUAL_SUMMARY_MARKER", compact["prompt"])
         self.assertNotIn("FULL_SOURCE_END", compact["prompt"])
@@ -298,7 +299,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = ensure_settings(folder)
             self.assertEqual(path, Path(folder).resolve() / ".castle" / "settings.json")
-            self.assertEqual(load_settings(folder), {"version": 1, "confirm_order_run": True})
+            self.assertEqual(load_settings(folder), {"version": 1, "confirm_order_run": True, "custom_sessions_dir": ""})
             path.write_text('{"confirm_order_run": false}', encoding="utf-8")
             self.assertFalse(load_settings(folder)["confirm_order_run"])
             overview = settings_summary(folder)
@@ -906,7 +907,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(run["output_file"], f".castle/runs/{run['id']}/output.md")
         self.assertEqual((self.project / run["output_file"]).resolve(), Path(run["artifact"]))
         prompt = Path(run["prompt_file"]).read_text(encoding="utf-8")
-        self.assertIn(f"写入本次运行目录 `{run['run_dir']}` 的 output.md（相对项目目录的完整路径：`{run['output_file']}`）。注意：此后的每一轮对话", prompt)
+        self.assertIn(f"写入本次运行目录 `{run['run_dir']}` 的 output.md（相对项目目录的完整路径：`{run['output_file']}`），格式：TLDR总结做了什么，后面跟着详细内容。注意：此后的每一轮对话", prompt)
         self.assertNotIn(run["artifact"], prompt)
         self.assertNotIn("{output_file}", prompt)
         self.assertNotIn(run["output_file"], run["invocation_prompt"])
@@ -981,7 +982,7 @@ class EngineTests(unittest.TestCase):
         ensure_context_config(self.project)
         config = load_context_config(self.project)
         self.assertFalse(config["features"]["previous_outputs"])
-        self.assertTrue(config["features"]["variables"])
+        self.assertFalse(config["features"]["variables"])
         self.assertEqual(path.read_text(encoding="utf-8-sig"), content)
 
     def test_legacy_modes_both_use_native_claude(self):
@@ -1442,7 +1443,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(payload["token"], self.app.token)
         self.assertEqual(payload["context_config_path"], str(self.app.context_config_path))
         self.assertEqual(payload["settings"], {"path": str(self.app.settings_path),
-                                               "confirm_order_run": True, "error": None})
+                                               "confirm_order_run": True, "custom_sessions_dir": "", "error": None})
         status, headers, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn(b"app.js", body)
@@ -1613,7 +1614,7 @@ class HTTPTests(unittest.TestCase):
         with patch("castle_notebook.execution.subprocess.Popen", side_effect=FileNotFoundError("Claude unavailable")):
             status, _, body = self.request("POST", f"/api/notebooks/{doc['id']}/cells/{cell['id']}/open-session", {})
         self.assertEqual(status, 503)
-        self.assertIn("无法打开 Claude 对话终端", json.loads(body)["error"])
+        self.assertIn("无法打开 AI 对话终端", json.loads(body)["error"])
 
     def test_notebook_save_run_export_and_resumable_sse(self):
         status, _, body = self.request("POST", "/api/notebooks", {"title": "HTTP integration"})
