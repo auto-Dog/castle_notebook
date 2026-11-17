@@ -22,6 +22,7 @@ from .core import (Problem, apply_initialization, editable_document, embed_markd
 from .cell_operations import operation_cell, parse_cells, replace_cells, select_cells
 from .providers import create_providers
 from .providers.base import OUTPUT_LIMIT
+from .providers.custom import read_transcript
 
 INPUT_LIMIT = 32000
 
@@ -203,7 +204,7 @@ class Engine:
         self.python = python or sys.executable
         self.providers = create_providers(claude_command, codex_command)
         if provider not in self.providers:
-            raise Problem("AI 提供商必须为 claude 或 codex。")
+            raise Problem("AI 提供商必须为 claude、codex 或 custom。")
         self.default_provider = provider
         self.code_timeout = code_timeout
         self.agent_timeout = agent_timeout
@@ -470,6 +471,8 @@ class Engine:
                 raise Problem("只有 Order 单元可以打开 AI 对话。")
             run = self.get_run(cell["run_ids"][-1]) if cell["run_ids"] else None
             provider = self.provider_for(run or cell)
+            if provider.name == "custom":
+                raise Problem("Custom 对话请在界面弹窗中绑定并查看。")
             session = provider.session_details(run)
             if not session["available"]:
                 raise Problem(session["reason"], 409)
@@ -487,6 +490,28 @@ class Engine:
                 cell["input_session_synced"] = session["id"]
                 self.store.put(doc)
             return {"session_name": session["name"]}
+
+    def bind_custom_session(self, notebook_id, cell_id, session_id):
+        with self.lock:
+            doc = self.sync_output_files(notebook_id)
+            cell = next((c for c in doc["cells"] if c["id"] == cell_id), None)
+            if not cell or cell["type"] != "order":
+                raise Problem("只有 Order 单元可以绑定外部对话。")
+            if not cell["run_ids"]:
+                raise Problem("请先运行此 Order 单元，再绑定外部对话。", 409)
+            run = self.get_run(cell["run_ids"][-1])
+            provider = self.provider_for(run)
+            if provider.name != "custom":
+                raise Problem("只有 Custom 提供商的运行可以绑定外部对话。")
+            transcript = read_transcript(provider.sessions_dir, session_id)
+            # An active run keeps its own in-memory copy; update it so the
+            # worker's later persistence does not drop the binding.
+            control = self.runs.get(run["id"])
+            target = control["run"] if control else run
+            target["session_id"] = session_id
+            target["session_name"] = transcript["title"] or session_id
+            self.store.put_run(target)
+            return self.document(notebook_id)
 
     def save(self, notebook_id, payload):
         with self.lock:
@@ -609,6 +634,8 @@ class Engine:
             sources = select_cells(doc, cell_id, operation, payload.get("other_cell_id"))
             instructions = text_field(payload.get("instructions", ""), "整理要求", 4000)
             provider = self.provider_for(sources[0])
+            if provider.name == "custom":
+                raise Problem("Custom 提供商的对话在外部 AI 中进行，暂不支持合并与拆分。")
             if not provider.command:
                 raise Problem(f"合并和拆分需要 {provider.label} CLI，请安装并登录后重启服务。", 503)
             cell = operation_cell(operation, sources, instructions)
@@ -648,7 +675,7 @@ class Engine:
                 raise Problem("Order 单元必须填写预期输出契约。")
             if cell["type"] == "order":
                 provider = self.provider_for(cell)
-                if not provider.command:
+                if not provider.available:
                     raise Problem(f"未发现 {provider.label} CLI。请安装并登录后重启服务；Python 与 Markdown 单元仍可独立使用。", 503)
             key = (notebook_id, cell_id)
             rid = self.pending_contexts.get(key) or uid()
@@ -1017,7 +1044,9 @@ class Engine:
         for rid in list(self.active.values()):
             try:
                 control = self.runs[rid]
-                if control["run"].get("claude_launch_mode") == "background" or self.claude_launch_mode == "background" and control["run"]["cell_type"] == "order":
+                if control["run"].get("provider") == "custom":
+                    self.cancel(rid)
+                elif control["run"].get("claude_launch_mode") == "background" or self.claude_launch_mode == "background" and control["run"]["cell_type"] == "order":
                     control["detach"].set()
                 else:
                     self.cancel(rid)

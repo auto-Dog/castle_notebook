@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -15,11 +16,13 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .core import (Problem, Store, VERSION, ensure_context_config, ensure_settings,
-                   initialization_notebook, new_notebook, project_path, read_project_asset,
-                   read_project_file, scan_project, settings_summary, text_field)
+                   initialization_notebook, load_settings, new_notebook, project_path,
+                   read_project_asset, read_project_file, scan_project, settings_summary,
+                   text_field)
 from .execution import Engine
 from .providers.claude import resolve_claude
 from .providers.codex import resolve_codex
+from .providers.custom import read_transcript, search_sessions
 
 STATIC = Path(__file__).with_name("static")
 # Formula rendering (KaTeX) is vendored on first use. The server fetches it in a
@@ -66,6 +69,8 @@ class App:
         self.settings_path = ensure_settings(self.project)
         self.engine = Engine(self.store, python, claude_command, code_timeout, agent_timeout,
                              claude_launch_mode, claude_permission_mode, provider, codex_command)
+        custom_dir = settings_summary(self.project)["custom_sessions_dir"]
+        self.engine.providers["custom"].sessions_dir = Path(custom_dir) if custom_dir else None
         if seed and not self.store.list():
             self.store.put(new_notebook(self.project, template="quant"))
 
@@ -289,6 +294,7 @@ class Handler(BaseHTTPRequestHandler):
                               "settings": settings_summary(self.app.project),
                               "capabilities": {"claude": bool(self.app.engine.providers["claude"].command),
                                                "codex": bool(self.app.engine.providers["codex"].command),
+                                               "custom": True,
                                                "default_provider": self.app.engine.default_provider,
                                                "python": self.app.engine.python,
                                                "claude_launch_mode": self.app.engine.claude_launch_mode,
@@ -312,13 +318,41 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(scan_project(self.app.project, self.body().get("relative_path", "."), excluded=(self.app.store.path,)))
         if parts == ["api", "project", "initialize"] and method == "POST":
             body = self.body()
-            if body.get("run", True) and not self.app.engine.providers[self.app.engine.default_provider].command:
+            if body.get("run", True) and not self.app.engine.providers[self.app.engine.default_provider].available:
                 raise Problem("初始化项目需要 AI CLI（Claude 或 Codex）。请安装并登录后重启服务。", 503)
             scan = scan_project(self.app.project, body.get("relative_path", "."), excluded=(self.app.store.path,))
             doc = initialization_notebook(scan)
             self.app.store.put(doc)
             run = self.app.engine.start(doc["id"], doc["cells"][-1]["id"]) if body.get("run", True) else None
             return self.json({"notebook": self.app.engine.document(doc["id"]), "run": run}, 201)
+        if parts == ["api", "custom", "directory"] and method == "PUT":
+            value = text_field(self.body().get("path", ""), "对话目录", 4000).strip()
+            if value:
+                directory = Path(value).expanduser()
+                if not directory.is_dir():
+                    raise Problem("对话目录不存在或不是文件夹。")
+                value = str(directory.resolve())
+            settings = load_settings(self.app.project)
+            settings["custom_sessions_dir"] = value
+            self.app.store.atomic_json(self.app.settings_path, settings)
+            self.app.engine.providers["custom"].sessions_dir = Path(value) if value else None
+            return self.json(settings_summary(self.app.project))
+        if parts == ["api", "custom", "sessions", "search"] and method == "POST":
+            body = self.body()
+            keyword = text_field(body.get("keyword", ""), "关键词", 200).strip()
+            bounds = []
+            for field in ("date_from", "date_to"):
+                raw = text_field(body.get(field, "") or "", field, 10).strip()
+                try:
+                    bounds.append(date.fromisoformat(raw) if raw else None)
+                except ValueError as exc:
+                    raise Problem("日期必须为 YYYY-MM-DD 格式。") from exc
+            if bounds[0] and bounds[1] and bounds[0] > bounds[1]:
+                raise Problem("开始日期不能晚于结束日期。")
+            return self.json(search_sessions(self.app.engine.providers["custom"].sessions_dir,
+                                             keyword, bounds[0], bounds[1]))
+        if len(parts) == 5 and parts[:3] == ["api", "custom", "sessions"] and parts[4] == "transcript" and method == "GET":
+            return self.json(read_transcript(self.app.engine.providers["custom"].sessions_dir, parts[3]))
         if len(parts) >= 3 and parts[:2] == ["api", "notebooks"]:
             nid = parts[2]
             if len(parts) == 3:
@@ -362,6 +396,9 @@ class Handler(BaseHTTPRequestHandler):
                 if parts[5] == "open-session" and method == "POST":
                     self.body()
                     return self.json(self.app.engine.open_session(nid, cid))
+                if parts[5] == "custom-session" and method == "POST":
+                    session_id = text_field(self.body().get("session_id", ""), "会话 ID", 128)
+                    return self.json(self.app.engine.bind_custom_session(nid, cid, session_id))
         if len(parts) >= 3 and parts[:2] == ["api", "runs"]:
             rid = parts[2]
             if len(parts) == 3 and method == "GET":
@@ -456,8 +493,8 @@ def main():
     parser.add_argument("--python", default=sys.executable, help="Python 内核解释器，可指定研究环境")
     parser.add_argument("--claude", help="Claude 可执行文件或 npm cli.js 路径")
     parser.add_argument("--codex", help="Codex 可执行文件或 npm codex.js 路径")
-    parser.add_argument("--provider", choices=("claude", "codex"), default="claude",
-                        help="Order 单元的默认 AI 提供商；单元内可单独切换")
+    parser.add_argument("--provider", choices=("claude", "codex", "custom"), default="claude",
+                        help="Order 单元的默认 AI 提供商；单元内可单独切换。custom 不启动 CLI，等待外部 AI 写入 output.md，并在界面绑定其会话目录")
     parser.add_argument("--claude-launch-mode", choices=("background", "print"), default="background",
                         help="Claude 启动模式：原生后台（默认，可在 claude agents 查看）或非交互流式；Codex 始终为流式子进程")
     parser.add_argument("--claude-permission-mode", default="auto",
@@ -484,7 +521,9 @@ def main():
         parser.exit(1, f"无法启动端口 {args.port}：{exc}\n")
     claude_state = "available" if app.engine.providers["claude"].command else "not found"
     codex_state = "available" if app.engine.providers["codex"].command else "not found"
-    print(f"\n  CastleNotebook {VERSION}\n  Local:    http://127.0.0.1:{args.port}\n  Project:  {app.project}\n  Python:   {app.engine.python}\n  Claude:   {claude_state}\n  Codex:    {codex_state}\n  Provider: {app.engine.default_provider} (default)\n", flush=True)
+    custom_dir = app.engine.providers["custom"].sessions_dir
+    custom_state = str(custom_dir) if custom_dir else "no sessions directory bound"
+    print(f"\n  CastleNotebook {VERSION}\n  Local:    http://127.0.0.1:{args.port}\n  Project:  {app.project}\n  Python:   {app.engine.python}\n  Claude:   {claude_state}\n  Codex:    {codex_state}\n  Custom:   {custom_state}\n  Provider: {app.engine.default_provider} (default)\n", flush=True)
     try:
         server.serve_forever(poll_interval=0.3)
     except KeyboardInterrupt:

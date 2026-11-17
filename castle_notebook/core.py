@@ -17,7 +17,7 @@ import uuid
 
 VERSION = "0.9.6"
 CELL_TYPES = {"code", "markdown", "order"}
-AI_PROVIDERS = ("claude", "codex")
+AI_PROVIDERS = ("claude", "codex", "custom")
 ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
 MAX_CONTEXT = 48000
 
@@ -259,19 +259,22 @@ def load_context_config(project):
 
 
 def default_settings():
-    return {"version": 1, "confirm_order_run": True}
+    return {"version": 1, "confirm_order_run": True, "custom_sessions_dir": ""}
 
 
 def normalize_settings(value):
-    if not isinstance(value, dict) or set(value) - {"version", "confirm_order_run"}:
-        raise Problem("运行设置必须为 JSON 对象，只支持 version 与 confirm_order_run。")
+    if not isinstance(value, dict) or set(value) - {"version", "confirm_order_run", "custom_sessions_dir"}:
+        raise Problem("运行设置必须为 JSON 对象，只支持 version、confirm_order_run 与 custom_sessions_dir。")
     version = value.get("version", 1)
     if type(version) is not int or version != 1:
         raise Problem("运行设置 version 必须为 1。")
     confirm = value.get("confirm_order_run", True)
     if type(confirm) is not bool:
         raise Problem("运行设置 confirm_order_run 必须为 true 或 false。")
-    return {"version": 1, "confirm_order_run": confirm}
+    sessions_dir = value.get("custom_sessions_dir", "")
+    if not isinstance(sessions_dir, str) or len(sessions_dir) > 4000:
+        raise Problem("运行设置 custom_sessions_dir 必须为不超过 4000 字符的路径字符串。")
+    return {"version": 1, "confirm_order_run": confirm, "custom_sessions_dir": sessions_dir}
 
 
 def ensure_settings(project):
@@ -301,10 +304,11 @@ def settings_summary(project):
     path = ensure_settings(project)
     try:
         settings = load_settings(project)
-        return {"path": str(path), "confirm_order_run": settings["confirm_order_run"], "error": None}
+        return {"path": str(path), "confirm_order_run": settings["confirm_order_run"],
+                "custom_sessions_dir": settings["custom_sessions_dir"], "error": None}
     except Problem as exc:
         # Fail safe: an invalid file keeps the confirmation prompt enabled.
-        return {"path": str(path), "confirm_order_run": True, "error": str(exc)}
+        return {"path": str(path), "confirm_order_run": True, "custom_sessions_dir": "", "error": str(exc)}
 
 
 def pack_context(doc, cell_id, variables=None, config=None, project_scan=None, run_info=None):

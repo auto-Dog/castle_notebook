@@ -299,7 +299,7 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = ensure_settings(folder)
             self.assertEqual(path, Path(folder).resolve() / ".castle" / "settings.json")
-            self.assertEqual(load_settings(folder), {"version": 1, "confirm_order_run": True})
+            self.assertEqual(load_settings(folder), {"version": 1, "confirm_order_run": True, "custom_sessions_dir": ""})
             path.write_text('{"confirm_order_run": false}', encoding="utf-8")
             self.assertFalse(load_settings(folder)["confirm_order_run"])
             overview = settings_summary(folder)
@@ -1355,7 +1355,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(payload["token"], self.app.token)
         self.assertEqual(payload["context_config_path"], str(self.app.context_config_path))
         self.assertEqual(payload["settings"], {"path": str(self.app.settings_path),
-                                               "confirm_order_run": True, "error": None})
+                                               "confirm_order_run": True, "custom_sessions_dir": "", "error": None})
         status, headers, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn(b"app.js", body)
