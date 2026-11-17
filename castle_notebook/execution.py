@@ -319,7 +319,7 @@ class Engine:
                        "output_characters": 0, "stream_events": 0, "resume_background": True,
                        "project_before": json.loads(before.read_text(encoding="utf-8")) if before.is_file() else None}
             self.runs[rid] = control
-            self.active[doc["id"]] = rid
+            self._register_active(doc["id"], rid)
             run.pop("collection_state", None)
             worker = threading.Thread(target=self._execute, args=(rid, cell, doc), daemon=True)
             control["thread"] = worker
@@ -351,14 +351,32 @@ class Engine:
             return True
         return False
 
+    def _register_active(self, notebook_id, rid):
+        self.active.setdefault(notebook_id, []).append(rid)
+
+    def _forget_active(self, notebook_id, rid):
+        remaining = [item for item in self.active.get(notebook_id, []) if item != rid]
+        if remaining:
+            self.active[notebook_id] = remaining
+        else:
+            self.active.pop(notebook_id, None)
+
+    def _active_controls(self, notebook_id):
+        return [self.runs[rid] for rid in self.active.get(notebook_id, []) if rid in self.runs]
+
     def runtime(self, notebook_id):
         with self.lock:
             kernel = self.kernels.get(notebook_id)
             alive = bool(kernel and kernel.process.poll() is None)
-            return {"state": "busy" if notebook_id in self.active else ("ready" if alive else "cold"),
+            active = [{"id": control["run"]["id"], "cell_id": control["run"]["cell_id"],
+                       "cell_type": control["run"]["cell_type"],
+                       "operation": bool(control["run"].get("operation"))}
+                      for control in self._active_controls(notebook_id)]
+            return {"state": "busy" if active else ("ready" if alive else "cold"),
                     "kernel_id": kernel.id if alive else None,
                     "variables": copy.deepcopy(kernel.variables) if alive else [],
-                    "active_run_id": self.active.get(notebook_id), "python": self.python}
+                    "active_run_id": active[0]["id"] if active else None,
+                    "active_runs": active, "python": self.python}
 
     def document(self, notebook_id):
         with self.lock:
@@ -461,8 +479,7 @@ class Engine:
                 for cell in doc["cells"][first_changed + 1:]:
                     if cell["run_ids"]:
                         cell["stale"] = True
-                active = self.runs.get(self.active.get(notebook_id))
-                if active:
+                for active in self._active_controls(notebook_id):
                     active_index = next((i for i, cell in enumerate(doc["cells"])
                                          if cell["id"] == active["run"]["cell_id"]), -1)
                     if active_index > first_changed:
@@ -520,8 +537,8 @@ class Engine:
 
     def save(self, notebook_id, payload):
         with self.lock:
-            active = self.runs.get(self.active.get(notebook_id))
-            if active and active["run"].get("operation"):
+            actives = self._active_controls(notebook_id)
+            if any(active["run"].get("operation") for active in actives):
                 raise Problem("请等待或停止当前单元整理后再编辑。", 409)
             current = self.sync_output_files(notebook_id)
             incoming = copy.deepcopy(payload)
@@ -558,21 +575,23 @@ class Engine:
                         writes.append((cell, item.get("source", ""), info["sha256"]))
             doc = editable_document(current, incoming)
             editable_fields = ("title", "source", "expected_output", "context_note", "mode", "output_format")
-            upstream_changed = False
-            if active:
+            upstream = []
+            if actives:
                 if [(cell["id"], cell["type"]) for cell in doc["cells"]] != [
                         (cell["id"], cell["type"]) for cell in current["cells"]]:
                     raise Problem("执行期间可以编辑其他单元的内容，但不能增删、移动或转换单元。", 409)
-                active_id = active["run"]["cell_id"]
-                before = next(cell for cell in current["cells"] if cell["id"] == active_id)
-                after = next(cell for cell in doc["cells"] if cell["id"] == active_id)
-                if any(before[field] != after[field] for field in editable_fields):
-                    raise Problem("正在执行的单元使用固定输入快照；请编辑其他单元，或先停止当前执行。", 409)
-                active_index = next(index for index, cell in enumerate(current["cells"])
-                                    if cell["id"] == active_id)
                 changed_indices = [index for index, (old, new) in enumerate(zip(current["cells"], doc["cells"]))
                                    if any(old[field] != new[field] for field in editable_fields)]
-                upstream_changed = bool(changed_indices and min(changed_indices) < active_index)
+                for active in actives:
+                    active_id = active["run"]["cell_id"]
+                    before = next(cell for cell in current["cells"] if cell["id"] == active_id)
+                    after = next(cell for cell in doc["cells"] if cell["id"] == active_id)
+                    if any(before[field] != after[field] for field in editable_fields):
+                        raise Problem("正在执行的单元使用固定输入快照；请编辑其他单元，或先停止当前执行。", 409)
+                    active_index = next(index for index, cell in enumerate(current["cells"])
+                                        if cell["id"] == active_id)
+                    if changed_indices and min(changed_indices) < active_index:
+                        upstream.append(active)
             for cell, value, expected in writes:
                 info, _ = self.read_input_file(cell["run_ids"][-1], current["project_path"])
                 if info["state"] == "unavailable" or info["sha256"] != expected:
@@ -590,7 +609,7 @@ class Engine:
                 updated = next(item for item in doc["cells"] if item["id"] == cell["id"])
                 updated["file_input"] = self.read_input_file(cell["run_ids"][-1], current["project_path"])[0]
             self.store.put(doc)
-            if upstream_changed:
+            for active in upstream:
                 active["upstream_changed"] = True
             return self.document(notebook_id)
 
@@ -663,12 +682,21 @@ class Engine:
 
     def start(self, notebook_id, cell_id):
         with self.lock:
-            if notebook_id in self.active:
-                raise Problem("同一 Notebook 同时只执行一个单元。", 409)
             doc = self.sync_output_files(notebook_id)
             cell = next((c for c in doc["cells"] if c["id"] == cell_id), None)
             if not cell:
                 raise Problem("单元不存在。", 404)
+            actives = self._active_controls(notebook_id)
+            if any(active["run"].get("operation") for active in actives):
+                raise Problem("请等待或停止当前单元整理后再执行。", 409)
+            if cell["type"] != "order":
+                if actives:
+                    raise Problem("Python 与 Markdown 单元需要独占执行；请等待当前运行结束，Order 单元之间可以并行。", 409)
+            else:
+                if any(active["run"]["cell_type"] != "order" for active in actives):
+                    raise Problem("Python 单元执行期间暂不能启动 Order；请等待其结束。", 409)
+                if any(active["run"]["cell_id"] == cell_id for active in actives):
+                    raise Problem("该单元正在执行，请等待结束或先停止。", 409)
             if not cell["source"].strip():
                 raise Problem("请先填写单元内容。")
             if cell["type"] == "order" and not cell["expected_output"].strip():
@@ -718,7 +746,7 @@ class Engine:
         control = {"run": run, "events": [], "cancel": threading.Event(), "detach": threading.Event(), "condition": threading.Condition(),
                    "process": None, "output_characters": 0, "stream_events": 0, "project_before": before}
         self.runs[rid] = control
-        self.active[doc["id"]] = rid
+        self._register_active(doc["id"], rid)
         if operation:
             run["operation"] = operation
             doc.setdefault("operation_ids", []).append(rid)
@@ -906,7 +934,7 @@ class Engine:
                 with self.lock:
                     run["collection_state"] = "detached"
                     self.store.put_run(run)
-                    self.active.pop(doc["id"], None)
+                    self._forget_active(doc["id"], rid)
                     self.emit(rid, "detached", {"message": "Notebook 已停止收集，Claude 后台对话继续保留；重启服务后继续收集。"})
                 return
             if control["project_before"] is not None:
@@ -948,7 +976,7 @@ class Engine:
                 run["output_sha256"] = hashlib.sha256(output_text.encode()).hexdigest()
                 if run.get("operation"):
                     self.store.put_run(run)
-                    self.active.pop(doc["id"], None)
+                    self._forget_active(doc["id"], rid)
                     self.emit(rid, "finished", {"status": run["status"], "duration_ms": run["duration_ms"],
                                                 "error": run["error"], "applied_cell_ids": run.get("applied_cell_ids", [])})
                     return
@@ -974,7 +1002,7 @@ class Engine:
                 saved["revision"] += 1
                 self.store.put_run(run)
                 self.store.put(saved)
-                self.active.pop(doc["id"], None)
+                self._forget_active(doc["id"], rid)
                 if cell["type"] == "order":
                     self.sync_output_files(doc["id"])
                 self.emit(rid, "finished", {"status": run["status"], "duration_ms": run["duration_ms"], "error": run["error"], "stale": run["stale"], "stale_reason": run["stale_reason"]})
@@ -1157,7 +1185,7 @@ class Engine:
             return self.document(notebook_id)
 
     def close(self):
-        for rid in list(self.active.values()):
+        for rid in [rid for rids in list(self.active.values()) for rid in rids]:
             try:
                 control = self.runs[rid]
                 if control["run"].get("claude_launch_mode") == "background" or self.claude_launch_mode == "background" and control["run"]["cell_type"] == "order":

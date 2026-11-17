@@ -5,7 +5,7 @@ const h = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;",
 const state = {boot:null, doc:null, selected:null, tab:"context", context:null, contextRequest:0,
   projectRequest:0,
   outputNotebook:null, outputFingerprint:"", outputInFlight:false, outputDisconnected:false,
-  dirty:false, globalDirty:false, documentDirty:false, dirtyFields:new Set(), editSeq:0, savePromise:null, timer:null, live:null, source:null, runRefresh:null,
+  dirty:false, globalDirty:false, documentDirty:false, dirtyFields:new Set(), editSeq:0, savePromise:null, timer:null, lives:new Map(), sources:new Map(), runRefresh:null,
   sequence:false, sequenceStop:false, markdownEditing:new Set(), orderEditing:new Set(),
   inputEditBases:new Map(), inputConflicts:new Map(), savingInputs:new Map(), expandedOrderOutputs:new Set(), inspectorOpen:false};
 
@@ -38,9 +38,18 @@ const launchModeLabel = {background:"原生后台", print:"print 非交互"};
 const permissionModeLabel = {bypassPermissions:"bypassPermissions（跳过审批）", auto:"auto（自动审批）",
   acceptEdits:"acceptEdits（自动接受编辑）", default:"default（逐项询问）",
   plan:"plan（只读规划）", dontAsk:"dontAsk（不主动询问）"};
-const busy = () => Boolean(state.live || state.doc?.runtime?.active_run_id || state.runRefresh);
-const cellLocked = id => Boolean(state.live?.operation || state.live?.cell_id===id ||
-  (state.doc?.runtime?.active_run_id && !state.live));
+const liveFor = id => [...state.lives.values()].find(run => run.cell_id===id) || null;
+const activeRuns = () => state.doc?.runtime?.active_runs || [];
+const anyBusy = () => Boolean(state.lives.size || activeRuns().length || state.runRefresh);
+const codeBusy = () => Boolean([...state.lives.values()].some(run => run.cell_type!=="order") ||
+  activeRuns().some(run => run.cell_type!=="order"));
+// Only running cells are locked; Order runs may proceed in parallel.
+const cellLocked = id => Boolean(liveFor(id) ||
+  activeRuns().some(run => run.cell_id===id || run.operation) ||
+  [...state.lives.values()].some(run => run.operation));
+const runBlocked = id => {const cell=state.doc?.cells.find(c=>c.id===id);
+  return !cell || cellLocked(id) || (cell.type==="order" ? codeBusy() : anyBusy());};
+const canRun = id => !state.sequence && !runBlocked(id);
 const currentCell = () => state.doc?.cells.find(c => c.id === state.selected);
 const newId = () => crypto.randomUUID().replaceAll("-", "").slice(0,12);
 
@@ -260,7 +269,8 @@ function outputsHTML(outputs, attachments = {}) {
 }
 
 function orderRunId(cell) {
-  return state.live?.cell_id===cell.id && !state.live.operation ? state.live.id : cell.run_ids.at(-1) || cell.last_run_id;
+  const live=liveFor(cell.id);
+  return live && !live.operation ? live.id : cell.run_ids.at(-1) || cell.last_run_id;
 }
 
 // Every Order input is rendered Markdown unless the user is editing it. An
@@ -422,10 +432,10 @@ function shell() {
 }
 
 function renderSidebar() {
-  $("#notebook-list").innerHTML = state.boot.notebooks.map(doc=>`<button class="notebook-link ${state.doc?.id===doc.id?"active":""}" data-action="open" data-id="${doc.id}" ${busy()?"disabled":""}>${state.doc?.id===doc.id?"✓ ":""}${h(doc.title)}</button>`).join("");
+  $("#notebook-list").innerHTML = state.boot.notebooks.map(doc=>`<button class="notebook-link ${state.doc?.id===doc.id?"active":""}" data-action="open" data-id="${doc.id}" ${anyBusy()?"disabled":""}>${state.doc?.id===doc.id?"✓ ":""}${h(doc.title)}</button>`).join("");
   if(state.doc){$("#document-title").value=state.doc.title;$("#export-link").href=`/api/notebooks/${state.doc.id}/export`;}
-  const editing=busy()||state.sequence;
-  document.querySelectorAll('.toolbar [data-action]').forEach(el=>{el.disabled=el.dataset.action==="stop"?!busy():["inspector","save"].includes(el.dataset.action)?false:editing;});
+  const editing=anyBusy()||state.sequence;
+  document.querySelectorAll('.toolbar [data-action]').forEach(el=>{el.disabled=el.dataset.action==="stop"?!anyBusy():["inspector","save"].includes(el.dataset.action)?false:editing;});
   $("#cell-type").value=currentCell()?.type||"code";$("#cell-type").disabled=editing||!currentCell();
   $("#document-title").disabled=editing;
   for(const operation of ["merge","split"]) {
@@ -438,7 +448,7 @@ function renderSidebar() {
   $("#project-name").textContent=project.split(/[\\/]/).filter(Boolean).at(-1)||"项目";
   $("#project-button").title=`项目目录：${project}`;
   $("#project-button").disabled=!state.doc;
-  $("#kernel-state").innerHTML=`Python 3 <span class="kernel-dot ${busy()?"busy":""}" title="${busy()?"执行中":state.doc?.runtime?.state==="ready"?"已就绪":"未启动"}"></span>`;
+  $("#kernel-state").innerHTML=`Python 3 <span class="kernel-dot ${codeBusy()?"busy":""}" title="${codeBusy()?"执行中":state.doc?.runtime?.state==="ready"?"已就绪":"未启动"}"></span>`;
 }
 
 function stampHTML(item) { return `<span title="创建：${h(timeText(item.created_at,true))}">更新 ${h(timeText(item.updated_at))} <span class="dot-separator">·</span> r${item.revision}</span>`; }
@@ -453,7 +463,7 @@ function projectChangesHTML(changes) {
 function renderNotebook() {
   const doc = state.doc;
   if (!doc) { $("#notebook").innerHTML=`<div class="empty-workspace">${icon("notebook")}<h1>开始一篇研究笔记</h1><p>定义全局目的，再把问题拆成可验证的步骤。</p><button class="btn primary" data-action="new">${icon("plus")}新建 Notebook</button></div>`; return; }
-  const disabled=busy() || state.sequence ? "disabled" : "";
+  const disabled=anyBusy() || state.sequence ? "disabled" : "";
   $("#notebook").innerHTML = `<div class="notebook-inner">
     <section class="global-card" id="global-cell" title="${h(timeText(doc.global.updated_at,true))} · r${doc.global.revision}"><div class="input-prompt global-prompt">Global:</div><div class="global-fields"><label><span>目标</span><textarea data-field="goal" data-global="true" placeholder="项目目标" rows="1" aria-label="项目目标" maxlength="8000">${h(doc.global.goal)}</textarea></label><label><span>约束</span><textarea data-field="constraints" data-global="true" placeholder="全局约束" rows="1" aria-label="全局约束" maxlength="8000">${h(doc.global.constraints)}</textarea></label></div></section>
     <div id="cells">${doc.cells.map(cellHTML).join("")}</div>
@@ -477,8 +487,8 @@ function refreshSessionButton(cellId, session) {
 }
 function cellHTML(cell,index) {
   const disabled=cellLocked(cell.id) ? "disabled" : "";
-  const executionDisabled=busy() || state.sequence ? "disabled" : "";
-  const live=state.live?.cell_id===cell.id;
+  const executionDisabled=canRun(cell.id) ? "" : "disabled";
+  const live=liveFor(cell.id);
   const editing=state.markdownEditing.has(cell.id);
   const outputExpanded=cell.type==="order"&&state.expandedOrderOutputs.has(cell.id);
   let input="";
@@ -490,15 +500,15 @@ function cellHTML(cell,index) {
     input=`<div class="order-body">${orderInputHTML(cell)}<div class="contract-row"><label for="contract-${cell.id}">预期</label><textarea id="contract-${cell.id}" class="contract-input" data-field="expected_output" data-cell="${cell.id}" placeholder="输出契约" aria-label="预期输出" rows="1" maxlength="8000" ${disabled}>${h(cell.expected_output)}</textarea></div><div class="order-options"><span>Claude</span><select aria-label="输出格式" data-field="output_format" data-cell="${cell.id}" ${disabled}>${["markdown","json","text"].map(v=>`<option value="${v}" ${cell.output_format===v?"selected":""}>${v==="markdown"?"Markdown":v==="json"?"JSON":"Text"}</option>`).join("")}</select><button class="text-button" data-action="context" data-id="${cell.id}">上下文</button></div></div>`;
   }
   if (cell.type === "order") {
-    const session=live ? liveSession(state.live) : cell.session;
+    const session=live ? liveSession(live) : cell.session;
     input+=`<div class="order-session" id="session-${cell.id}">${orderSessionHTML(session,cell.id)}</div>`;
   }
   const count=cell.execution_count||cell.run_ids.length||" ";
   const hasOutput=live||cell.outputs.length||cell.last_error||(cell.type==="order"&&orderRunId(cell));
   const operations=cell.type==="order"?`<button class="icon-btn" data-action="merge-cells" data-id="${cell.id}" title="Merge AI Cells · 合并两个 Order，清空原对话关联" aria-label="Merge AI Cells" ${executionDisabled||!state.boot.capabilities.claude||state.doc.cells.filter(c=>c.type==="order").length<2?"disabled":""}>${icon("merge")}</button><button class="icon-btn" data-action="split-cells" data-id="${cell.id}" title="Split AI Cells · 拆分为两个 Order，复制原对话" aria-label="Split AI Cells" ${executionDisabled||!state.boot.capabilities.claude||state.doc.cells.length>=100?"disabled":""}>${icon("split")}</button>`:"";
   return `<article class="cell ${cell.type}-cell ${state.selected===cell.id?"selected":""}" id="cell-${cell.id}" data-cell-card="${cell.id}" tabindex="0" title="${h(cell.title)} · 更新 ${h(timeText(cell.updated_at,true))}">
-    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${executionDisabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${live&&state.live.operation?'<span class="status-tag running"><i class="spinner"></i>整理中</span>':tagHTML(cell)}</span>${operations}<button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
-    <div class="output-block ${cell.stale?"stale-output":""} ${outputExpanded?"output-expanded":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span>${cell.type==="order"?`<button class="output-expand" data-action="toggle-order-output" data-id="${cell.id}" aria-controls="output-${cell.id}" aria-expanded="${outputExpanded}" title="${outputExpanded?"恢复滚动显示":"展开完整输出"}"><span class="output-expand-label">${outputExpanded?"恢复滚动显示":"展开完整输出"}</span></button>`:""}</div><div class="output-content" id="output-${cell.id}">${cell.type==="order"?orderOutputHTML(cell):live?outputsHTML(state.live.outputs):outputsHTML(cell.outputs, cell.attachments)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
+    <div class="input-row"><div class="input-prompt">${cell.type==="markdown"?"":`${cell.type==="order"?"AI":"In"} [${live?"*":count}]:`}<button class="gutter-run" data-action="run" data-id="${cell.id}" title="执行单元" aria-label="执行单元" ${executionDisabled}>${icon("play")}</button></div><div class="input-body"><div class="cell-head"><input class="cell-title" data-field="title" data-cell="${cell.id}" aria-label="单元标题" value="${h(cell.title)}" maxlength="200" placeholder="单元标题" ${disabled}><span class="cell-status" data-status-id="${cell.id}">${live&&live.operation?'<span class="status-tag running"><i class="spinner"></i>整理中</span>':tagHTML(cell)}</span>${operations}<button class="icon-btn" data-action="history" data-id="${cell.id}" title="执行记录" aria-label="执行记录">${icon("clock")}</button></div>${input}</div></div>
+    <div class="output-block ${cell.stale?"stale-output":""} ${outputExpanded?"output-expanded":""}" ${!hasOutput||cell.type==="markdown"?"hidden":""}><div class="output-prompt">Out[${count}]:</div><div class="output-body"><div class="output-heading">${cell.stale?'<span class="stale-label">结果已失效</span>':""}<span class="output-links"></span>${cell.type==="order"?`<button class="output-expand" data-action="toggle-order-output" data-id="${cell.id}" aria-controls="output-${cell.id}" aria-expanded="${outputExpanded}" title="${outputExpanded?"恢复滚动显示":"展开完整输出"}"><span class="output-expand-label">${outputExpanded?"恢复滚动显示":"展开完整输出"}</span></button>`:""}</div><div class="output-content" id="output-${cell.id}">${cell.type==="order"?orderOutputHTML(cell):live?outputsHTML(live.outputs):outputsHTML(cell.outputs, cell.attachments)}</div><div class="live-trace" id="trace-${cell.id}"></div>${!live?projectChangesHTML(cell.project_changes):""}${!live&&cell.last_error?`<div class="run-error">${h(cell.last_error)}</div>`:""}${cell.initializer&&cell.status==="succeeded"&&!cell.stale&&cell.applied_run_id!==cell.last_run_id?`<button class="btn primary small" data-action="apply-init" data-id="${cell.last_run_id}">采用拆分结果</button>`:""}</div></div></article>`;
 }
 
 function autoSize() {
@@ -508,7 +518,7 @@ function autoSize() {
 function inspectorFrame() {
   const cell=currentCell();
   const index=state.doc?.cells.findIndex(c=>c.id===state.selected);
-  $("#inspector").innerHTML=`<div class="inspector-heading"><span>调试检查器</span><span class="inspector-symbol">${icon("panel")}</span></div><div class="inspector-tabs" role="tablist" aria-label="检查器面板">${[["project","项目"],["context","上下文"],["variables","变量"],["history","记录"]].map(([key,label])=>`<button role="tab" aria-selected="${state.tab===key}" class="${state.tab===key?"active":""}" data-action="tab" data-tab="${key}">${label}${key==="variables" ? `<span>${state.doc?.runtime?.variables.length || 0}</span>` : ""}</button>`).join("")}</div><div class="inspector-body" id="inspector-body"></div><div class="inspector-footer"><span class="local-dot ${state.doc?.runtime?.state==="cold"?"cold":""}"></span>Python 内核 · ${busy()?"执行中":state.doc?.runtime?.state==="ready"?"已就绪":"尚未启动"}<button class="icon-btn" data-action="environment" aria-label="查看运行环境">${icon("info")}</button></div>`;
+  $("#inspector").innerHTML=`<div class="inspector-heading"><span>调试检查器</span><span class="inspector-symbol">${icon("panel")}</span></div><div class="inspector-tabs" role="tablist" aria-label="检查器面板">${[["project","项目"],["context","上下文"],["variables","变量"],["history","记录"]].map(([key,label])=>`<button role="tab" aria-selected="${state.tab===key}" class="${state.tab===key?"active":""}" data-action="tab" data-tab="${key}">${label}${key==="variables" ? `<span>${state.doc?.runtime?.variables.length || 0}</span>` : ""}</button>`).join("")}</div><div class="inspector-body" id="inspector-body"></div><div class="inspector-footer"><span class="local-dot ${state.doc?.runtime?.state==="cold"?"cold":""}"></span>Python 内核 · ${codeBusy()?"执行中":state.doc?.runtime?.state==="ready"?"已就绪":"尚未启动"}<button class="icon-btn" data-action="environment" aria-label="查看运行环境">${icon("info")}</button></div>`;
   if(state.tab==="project" && state.doc){renderProject();return;}
   if (!cell) { $("#inspector-body").innerHTML='<div class="inspector-empty">选择一个单元，检查它的输入、变量和执行记录。</div>'; return; }
   if(state.tab==="variables") renderVariables();
@@ -525,13 +535,13 @@ async function refreshContext() {
   const request=++state.contextRequest, nid=state.doc.id, cid=state.selected;
   if(state.dirty) { target.innerHTML='<p class="muted">保存编辑后更新上下文预览。</p>'; return; }
   try {
-    const result=state.live?.cell_id===cid ? state.live.context : await api(`/api/notebooks/${nid}/cells/${cid}/context`);
+    const result=liveFor(cid) ? liveFor(cid).context : await api(`/api/notebooks/${nid}/cells/${cid}/context`);
     if(request!==state.contextRequest || cid!==state.selected || state.tab!=="context") return;
     state.context=result;
     const features=result.config?.features || {global_goal:true,global_constraints:true,expected_output:true};
     const globalParts=[features.global_goal?"目的":"",features.global_constraints?"约束":""].filter(Boolean);
     target.innerHTML=`<div class="context-description">${icon("eye")}每一步的输入，都可以检查。</div>
-      <p class="inspector-copy">${state.live?.cell_id===cid?"以下为本次执行的实际输入快照。":"按项目配置组装上下文，点击完整输入查看实际内容。"}</p>
+      <p class="inspector-copy">${liveFor(cid)?"以下为本次执行的实际输入快照。":"按项目配置组装上下文，点击完整输入查看实际内容。"}</p>
       <div class="context-stat"><div><strong>${result.characters.toLocaleString()}</strong><span>输入字符</span></div><div><strong>~${result.estimated_tokens.toLocaleString()}</strong><span>估计 tokens</span></div></div>
       <div class="budget-bar"><span style="width:${Math.min(100, result.characters/result.budget*100)}%"></span></div>
       <div class="budget-caption">${Math.round(result.characters/result.budget*100)}% 的字符预算 <span>${result.budget.toLocaleString()}</span></div>
@@ -663,10 +673,19 @@ async function openNotebook(id) {
   state.dirtyFields.clear();
   state.orderEditing.clear();state.inputEditBases.clear();state.inputConflicts.clear();state.expandedOrderOutputs.clear();
   state.selected=state.doc.cells.find(c=>c.type==="order")?.id || state.doc.cells[0]?.id || null;
-  state.context=null;state.live=null;
+  state.context=null;
+  for(const source of state.sources.values())source.close();
+  state.lives.clear();state.sources.clear();
   localStorage.setItem("castle-notebook",id);
   renderAll();
-  if(state.doc.runtime.active_run_id) {const run=await api(`/api/runs/${state.doc.runtime.active_run_id}`);watchRun(run).catch(e=>toast(e.message,true));}
+  await watchActiveRuns();
+}
+
+async function watchActiveRuns() {
+  for(const item of state.doc?.runtime?.active_runs||[]) {
+    try {const run=await api(`/api/runs/${item.id}`);watchRun(run).catch(e=>toast(e.message,true));}
+    catch(error){toast(error.message,true);}
+  }
 }
 
 function rebaseDirtyDraft(latest,draft) {
@@ -682,57 +701,72 @@ function rebaseDirtyDraft(latest,draft) {
 }
 
 function watchRun(run) {
-  state.live=run;state.live.outputs=[];state.doc.runtime.active_run_id=run.id;
+  run.outputs=[];
+  state.lives.set(run.id,run);
+  const runtime=state.doc.runtime;
+  runtime.active_runs=(runtime.active_runs||[]).filter(item=>item.id!==run.id);
+  runtime.active_runs.push({id:run.id,cell_id:run.cell_id,cell_type:run.cell_type,operation:Boolean(run.operation)});
+  runtime.active_run_id=runtime.active_runs[0].id;
   const cell=state.doc.cells.find(c=>c.id===run.cell_id);if(cell&&!run.operation){cell.status="running";cell.execution_count=run.execution_count;if(cell.run_ids.at(-1)!==run.id)cell.run_ids.push(run.id);}
-  state.selected=run.cell_id;renderAll();
+  if(state.lives.size===1)state.selected=run.cell_id;
+  renderAll();
   state.outputFingerprint="";refreshOrderOutputs();
   let ended=false, lost=false;
   return new Promise((resolve,reject)=>{
-    const source=new EventSource(`/api/runs/${run.id}/events`);state.source=source;
+    const source=new EventSource(`/api/runs/${run.id}/events`);state.sources.set(run.id,source);
+    const forget=()=>{
+      state.lives.delete(run.id);state.sources.delete(run.id);
+      const runtime=state.doc.runtime;
+      runtime.active_runs=(runtime.active_runs||[]).filter(item=>item.id!==run.id);
+      runtime.active_run_id=runtime.active_runs[0]?.id||null;
+    };
     const finish=async final=>{
-      if(ended)return;ended=true;source.close();state.source=null;
+      if(ended)return;ended=true;source.close();
+      let refresh=null;
       try {
         clearTimeout(state.timer);
         // Pause new saves until the final document revision is known. An in-flight
         // save may have raced the run's revision update; keep its local draft.
-        state.runRefresh=(async()=>{
+        refresh=(async()=>{
           if(state.savePromise){try{await state.savePromise;}catch(error){if(error.status!==409)throw error;}}
           const latest=await api(`/api/notebooks/${run.notebook_id}`);
-          state.doc=rebaseDirtyDraft(latest,state.doc);
+          if(state.doc?.id===run.notebook_id)state.doc=rebaseDirtyDraft(latest,state.doc);
         })();
-        await state.runRefresh;state.runRefresh=null;state.live=null;
+        state.runRefresh=refresh;
+        await refresh;if(state.runRefresh===refresh)state.runRefresh=null;
+        forget();
         await flushSave();
         if(final.applied_cell_ids?.length)state.selected=final.applied_cell_ids[0];
         final.stale=Boolean(final.stale||state.doc.cells.find(c=>c.id===run.cell_id)?.stale);
-        state.boot.notebooks=await api("/api/notebooks");
+        if(!anyBusy())state.boot.notebooks=await api("/api/notebooks");
         renderAll();
         if(final.status!=="succeeded") toast(final.error || "执行未完成，请检查输出与运行记录。",true);
         else if(run.operation) toast(run.operation.kind==="merge"?"Order 已合并，原对话关联已清空。":"Order 已拆分，内容与对话已分别保存。");
         else if(!state.sequence) toast(final.stale?final.stale_reason||"上游输入已变化，本次结果已标记失效。":"本步执行完成，结果与输入快照已保存。");
         resolve(final);
-      } catch(error) {state.runRefresh=null;state.live=null;state.doc.runtime.active_run_id=null;renderAll();reject(error);}
+      } catch(error) {if(state.runRefresh===refresh)state.runRefresh=null;forget();renderAll();reject(error);}
     };
     source.onmessage=event=>{
-      if(ended || state.live?.id!==run.id)return;
+      if(ended || !state.lives.has(run.id))return;
       const message=JSON.parse(event.data), data=message.data;
       if(message.type==="output") {
         if(run.cell_type==="order") {
-          state.live.progress=((state.live.progress||"")+(data.text||"")).slice(-500);
-          const trace=$(`#trace-${run.cell_id}`);if(trace)trace.textContent=state.live.progress;
+          run.progress=((run.progress||"")+(data.text||"")).slice(-500);
+          const trace=$(`#trace-${run.cell_id}`);if(trace)trace.textContent=run.progress;
           return;
         }
-        const previous=state.live.outputs.at(-1);
+        const previous=run.outputs.at(-1);
         if(previous && ["stdout","stderr"].includes(data.kind) && previous.kind===data.kind)previous.text+=data.text||"";
-        else state.live.outputs.push(data);
-        const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML(state.live.outputs);
+        else run.outputs.push(data);
+        const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML(run.outputs);
       } else if(message.type==="canonical_output") {
         if(run.cell_type==="order"){state.outputFingerprint="";refreshOrderOutputs();return;}
-        state.live.outputs=[data];const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML([data]);
+        run.outputs=[data];const el=$(`#output-${run.cell_id}`);if(el)el.innerHTML=outputsHTML([data]);
         typeset(el || document);
       } else if(message.type==="session") {
-        state.live.background_id=data.background_id;state.live.session_id=data.id;
-        state.live.provider_permission_mode=data.permission_mode;
-        refreshSessionButton(run.cell_id,liveSession(state.live));
+        run.background_id=data.background_id;run.session_id=data.id;
+        run.provider_permission_mode=data.permission_mode;
+        refreshSessionButton(run.cell_id,liveSession(run));
       } else if(message.type==="variables") {
         state.doc.runtime.variables=data.variables;state.doc.runtime.kernel_id=data.kernel_id;
         if(state.tab==="variables")inspectorFrame();
@@ -792,13 +826,13 @@ function confirmOrderRun(cell) {
 
 async function runCell(id, options={}) {
   await flushSave();
-  if(busy())throw new Error("请先等待或停止当前单元。");
+  if(runBlocked(id))throw new Error("该单元正在执行，或 Python 正在独占执行；请等待或先停止。");
   const cell=state.doc.cells.find(item=>item.id===id);
   if(cell?.type==="order" && options.confirm!==false && !(await confirmOrderRun(cell)))
     return {status:"cancelled",cancelled:true,cell_id:id};
   // A dialog may stay open while output polling refreshes the document.
   await flushSave();
-  if(busy())throw new Error("请先等待或停止当前单元。");
+  if(runBlocked(id))throw new Error("该单元正在执行，或 Python 正在独占执行；请等待或先停止。");
   const run=await api(`/api/notebooks/${state.doc.id}/cells/${id}/run`,"POST",{});
   if(run.document_revision)state.doc.revision=run.document_revision;
   state.markdownEditing.delete(id);
@@ -833,7 +867,7 @@ function initModal() {
 }
 async function cellOperationModal(id,operation) {
   await flushSave();
-  if(busy()||state.sequence)throw new Error("请等待或停止当前执行后再整理单元。");
+  if(anyBusy()||state.sequence)throw new Error("请等待或停止当前执行后再整理单元。");
   const cell=state.doc.cells.find(c=>c.id===id);
   if(cell?.type!=="order")throw new Error("请选择一个 Order 单元。");
   const merge=operation==="merge", others=state.doc.cells.filter(c=>c.type==="order"&&c.id!==id);
@@ -845,7 +879,7 @@ async function cellOperationModal(id,operation) {
 }
 async function contextModal(id) {
   await flushSave();selectCell(id);
-  const context=state.live?.cell_id===id?state.live.context:await api(`/api/notebooks/${state.doc.id}/cells/${id}/context`);
+  const context=liveFor(id)?liveFor(id).context:await api(`/api/notebooks/${state.doc.id}/cells/${id}/context`);
   state.context=context;
   showModal("执行输入 · 完整上下文",`<p class="modal-description">${h(context.policy)}<br>以下文本与本次状态下发送给 Claude 的输入一致；执行记录会保存当时的独立快照。${context.config_path?`<br>模板配置：<code>${h(context.config_path)}</code>`:""}</p><div class="context-modal-meta"><span>${context.characters.toLocaleString()} 字符 · ~${context.estimated_tokens.toLocaleString()} tokens</span><button class="btn outline small" data-action="copy-context">${icon("copy")}复制输入</button></div><pre class="context-full">${h(context.prompt)}</pre><div class="context-hash"><span>SHA-256</span><code>${h(context.fingerprint)}</code></div>`,true);
 }
@@ -858,7 +892,7 @@ async function viewRun(id) {
 }
 
 async function mutateCells(fn) {
-  await flushSave();if(busy() || state.sequence)throw new Error("请等待或停止执行后再编辑。");
+  await flushSave();if(anyBusy() || state.sequence)throw new Error("请等待或停止执行后再编辑。");
   fn();touch("document","document|structure");await flushSave();renderAll();
 }
 async function action(name,el) {
@@ -903,7 +937,7 @@ async function action(name,el) {
   }
   if(name==="run")return runCell(id);
   if(name==="run-all")return runAll();
-  if(name==="stop"){state.sequenceStop=true;const rid=state.live?.id || state.doc?.runtime.active_run_id;if(rid)return api(`/api/runs/${rid}/cancel`,"POST",{});return;}
+  if(name==="stop"){state.sequenceStop=true;const rid=liveFor(state.selected)?.id || state.doc?.runtime.active_run_id;if(rid)return api(`/api/runs/${rid}/cancel`,"POST",{});return;}
   if(name==="context")return contextModal(id);
   if(name==="open-session"){
     el.disabled=true;
@@ -982,7 +1016,7 @@ document.addEventListener("submit",async event=>{
   event.preventDefault();const form=event.target, submit=$("button[type=submit]",form);submit.disabled=true;
   try {
     await flushSave();
-    if(busy())throw new Error("请等待或停止当前运行后再创建。");
+    if(anyBusy())throw new Error("请等待或停止当前运行后再创建。");
     const values=Object.fromEntries(new FormData(form));
     if(form.id==="cell-operation-form"){
       const run=await api(`/api/notebooks/${state.doc.id}/cells/${form.dataset.id}/${form.dataset.operation}`,"POST",{...values,revision:state.doc.revision});
@@ -998,7 +1032,7 @@ document.addEventListener("keydown",event=>{
   if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==="s"){event.preventDefault();flushSave().then(()=>toast("已保存到本地。")).catch(e=>toast(e.message,true));return;}
   if($("#modal").open)return;
   if(event.key==="Tab" && event.target.classList?.contains("code-input")){event.preventDefault();const el=event.target;el.setRangeText("    ",el.selectionStart,el.selectionEnd,"end");el.dispatchEvent(new Event("input",{bubbles:true}));return;}
-  if(event.key==="Enter"&&(event.shiftKey||event.ctrlKey||event.metaKey)&&currentCell()&&!busy()&&!state.sequence){event.preventDefault();const id=state.selected,advance=event.shiftKey;runCell(id).then(result=>{if(advance&&result.status==="succeeded"&&state.selected===id){const i=state.doc.cells.findIndex(c=>c.id===id);if(state.doc.cells[i+1])selectCell(state.doc.cells[i+1].id,true);}}).catch(e=>toast(e.message,true));}
+  if(event.key==="Enter"&&(event.shiftKey||event.ctrlKey||event.metaKey)&&currentCell()&&canRun(state.selected)){event.preventDefault();const id=state.selected,advance=event.shiftKey;runCell(id).then(result=>{if(advance&&result.status==="succeeded"&&state.selected===id){const i=state.doc.cells.findIndex(c=>c.id===id);if(state.doc.cells[i+1])selectCell(state.doc.cells[i+1].id,true);}}).catch(e=>toast(e.message,true));}
   if(event.key==="?" && !["INPUT","TEXTAREA","SELECT"].includes(event.target.tagName))action("help",{});
 });
 window.addEventListener("beforeunload",event=>{if(state.dirty){event.preventDefault();event.returnValue="";}});
@@ -1014,6 +1048,6 @@ $("#modal").addEventListener("click",event=>{if(event.target===$("#modal")){cons
     shell();
     startOutputPolling();
     startMath();
-    if(state.doc?.runtime.active_run_id){const run=await api(`/api/runs/${state.doc.runtime.active_run_id}`);watchRun(run).catch(e=>toast(e.message,true));}
+    if(state.doc?.runtime?.active_runs?.length)await watchActiveRuns();
   } catch(error){$("#app").innerHTML=`<div class="boot error-text">${icon("warning")}<h1>无法打开研究工作台</h1><p>${h(error.message)}</p><a class="btn outline" href="/">重新连接</a></div>`;}
 })();

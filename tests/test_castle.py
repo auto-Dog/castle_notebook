@@ -1222,6 +1222,54 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(final["cells"][1]["source"], cell["source"])
         self.assertEqual(final["cells"][2]["source"], "next_value = 2")
 
+    def test_order_cells_run_in_parallel_and_allow_other_cell_edits(self):
+        first = self.add("order", "FAKE_FILE_WAIT")
+        second = self.add("order", "FAKE_FILE_WAIT")
+        code = self.add("code", "value = 1")
+        run_a = self.engine.start(self.doc["id"], first["id"])
+        run_b = self.engine.start(self.doc["id"], second["id"])
+        self.assertEqual(self.engine.get_run(run_a["id"])["status"], "running")
+        self.assertEqual(self.engine.get_run(run_b["id"])["status"], "running")
+        runtime = self.engine.runtime(self.doc["id"])
+        self.assertEqual(runtime["state"], "busy")
+        self.assertEqual({item["id"] for item in runtime["active_runs"]}, {run_a["id"], run_b["id"]})
+        with self.assertRaises(Problem) as same_cell:
+            self.engine.start(self.doc["id"], first["id"])
+        self.assertEqual(same_cell.exception.status, 409)
+        with self.assertRaises(Problem) as code_blocked:
+            self.engine.start(self.doc["id"], code["id"])
+        self.assertEqual(code_blocked.exception.status, 409)
+
+        payload = self.engine.document(self.doc["id"])
+        payload["cells"][2]["source"] = "value = 2"
+        saved = self.engine.save(self.doc["id"], payload)
+        self.assertEqual(saved["cells"][2]["source"], "value = 2")
+        protected = copy.deepcopy(saved)
+        protected["cells"][0]["source"] = "change the running input"
+        with self.assertRaises(Problem) as running_edit:
+            self.engine.save(self.doc["id"], protected)
+        self.assertEqual(running_edit.exception.status, 409)
+
+        self.assertEqual(wait_run(self.engine, run_a["id"])["status"], "succeeded")
+        self.assertEqual(wait_run(self.engine, run_b["id"])["status"], "succeeded")
+        self.assertEqual(self.engine.runtime(self.doc["id"])["active_runs"], [])
+        final = self.engine.document(self.doc["id"])
+        self.assertEqual(final["cells"][2]["source"], "value = 2")
+
+    def test_code_execution_stays_exclusive_against_orders(self):
+        code = self.add("code", "import time\ntime.sleep(1)\nx = 1")
+        order = self.add("order", "FAKE_FILE_WAIT")
+        run = self.engine.start(self.doc["id"], code["id"])
+        with self.assertRaises(Problem) as order_blocked:
+            self.engine.start(self.doc["id"], order["id"])
+        self.assertEqual(order_blocked.exception.status, 409)
+        another = self.add("code", "y = 2")
+        with self.assertRaises(Problem) as code_blocked:
+            self.engine.start(self.doc["id"], another["id"])
+        self.assertEqual(code_blocked.exception.status, 409)
+        self.assertEqual(wait_run(self.engine, run["id"])["status"], "succeeded")
+        self.assertEqual(self.execute(order)["status"], "succeeded")
+
     def test_global_is_editable_during_run_without_changing_snapshot(self):
         cell = self.add("code", "import time\ntime.sleep(.5)\nx=42")
         initial = self.store.get(self.doc["id"])
@@ -1346,6 +1394,45 @@ class HTTPTests(unittest.TestCase):
         result = (response.status, dict(response.getheaders()), body)
         connection.close()
         return result
+
+    def test_parallel_order_runs_over_http_with_live_edits(self):
+        doc = new_notebook(self.temp.name)
+        first = new_cell("order", "并行一", "FAKE_FILE_WAIT", "Markdown")
+        second = new_cell("order", "并行二", "FAKE_FILE_WAIT", "Markdown")
+        code = new_cell("code", "验证", "value = 1", "预期")
+        doc["cells"] = [first, second, code]
+        self.app.store.put(doc)
+        base = f"/api/notebooks/{doc['id']}"
+        status, _, body = self.request("POST", f"{base}/cells/{first['id']}/run", {})
+        self.assertEqual(status, 202)
+        run_a = json.loads(body)
+        status, _, body = self.request("POST", f"{base}/cells/{second['id']}/run", {})
+        self.assertEqual(status, 202)
+        run_b = json.loads(body)
+        status, _, body = self.request("GET", base)
+        runtime = json.loads(body)["runtime"]
+        self.assertEqual({item["id"] for item in runtime["active_runs"]}, {run_a["id"], run_b["id"]})
+        status, _, body = self.request("POST", f"{base}/cells/{code['id']}/run", {})
+        self.assertEqual(status, 409)
+        status, _, body = self.request("GET", base)
+        payload = json.loads(body)
+        payload["cells"][2]["source"] = "value = 2"
+        status, _, body = self.request("PUT", base, payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["cells"][2]["source"], "value = 2")
+        for rid in (run_a["id"], run_b["id"]):
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                status, _, body = self.request("GET", f"/api/runs/{rid}")
+                run = json.loads(body)
+                if run["status"] != "running":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(run["status"], "succeeded")
+        status, _, body = self.request("GET", base)
+        final = json.loads(body)
+        self.assertEqual(final["runtime"]["active_runs"], [])
+        self.assertEqual(final["cells"][2]["source"], "value = 2")
 
     def test_bootstrap_static_and_security_headers(self):
         status, headers, body = self.request("GET", "/api/bootstrap")

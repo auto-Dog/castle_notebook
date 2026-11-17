@@ -21,7 +21,7 @@ function cell(id, type) {
 function documentFixture() {
   return {id:nid, title:"Concurrent editing", revision:2, project_path:"/project",
     global:{revision:1, goal:"Original goal", constraints:""},
-    runtime:{active_run_id:null, variables:[]},
+    runtime:{active_run_id:null, active_runs:[], variables:[]},
     cells:[cell(runningId,"order"),cell(codeId,"code"),cell(markdownId,"markdown"),cell(orderId,"order")]};
 }
 
@@ -29,6 +29,7 @@ function finalDocument(doc, revision=3) {
   const latest = structuredClone(doc);
   latest.revision = revision;
   latest.runtime.active_run_id = null;
+  latest.runtime.active_runs = [];
   Object.assign(latest.cells[0], {status:"succeeded", source:"Model-updated requirements",
     outputs:[{kind:"markdown", text:"Completed output"}], last_run_id:"run", run_ids:["run"]});
   return latest;
@@ -84,7 +85,7 @@ function makeApp() {
     renderSidebar=()=>{};renderNotebook=()=>{};
     inspectorFrame=()=>renderHooks.inspector?.();
     refreshOrderOutputs=async()=>{};refreshContext=()=>{};toast=()=>{};
-    globalThis.app={state,window,cellLocked,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
+    globalThis.app={state,window,cellLocked,canRun,anyBusy,codeBusy,liveFor,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
       outputsHTML,orderInputMode,updateOrderInput,markdown,inline,mathSpan,splitMath,
       mathState,mathScript,typeset,startMath,runCell,confirmOrderRun,settleOrderRunConfirm,
       orderRunConfirmationEnabled,orderRunConfirmBody};
@@ -106,13 +107,14 @@ function makeApp() {
     assert.fail(`Missing ${method} ${path}; saw ${requests.map(r=>r.method+" "+r.path).join(", ")}`);
   };
   const finishList = async () => (await take("GET","/api/notebooks")).respond([{id:nid,title:doc.title}]);
-  return {app,doc,edit,watch,finish,take,finishList,requests,document,elements,renderHooks,sandbox};
+  return {app,doc,edit,watch,finish,take,finishList,requests,streams,document,elements,renderHooks,sandbox};
 }
 
 test("only the running cell is locked, including during Run All", () => {
   const {app,doc} = makeApp();
-  app.state.live = {id:"run",cell_id:runningId};
+  app.state.lives.set("run",{id:"run",cell_id:runningId,cell_type:"order",outputs:[]});
   doc.runtime.active_run_id = "run";
+  doc.runtime.active_runs = [{id:"run",cell_id:runningId,cell_type:"order",operation:false}];
   doc.cells[3].run_ids = ["earlier"];
   app.state.markdownEditing.add(markdownId);
   app.state.orderEditing.add(orderId);
@@ -125,14 +127,54 @@ test("only the running cell is locked, including during Run All", () => {
       const inputs = html.match(/<(?:input|textarea|select)\b[^>]*data-field="[^"]+"[^>]*>/g);
       assert.ok(inputs.length);
       for (const input of inputs) assert.doesNotMatch(input,/\bdisabled\b/);
-      assert.match(html,/<button\b[^>]*data-action="run"[^>]*\bdisabled\b/);
+      // Other Orders stay runnable while an Order runs; Python/Markdown remain exclusive.
+      const runButton = html.match(/<button\b[^>]*data-action="run"[^>]*>/)[0];
+      if (!sequence && other.type==="order") assert.doesNotMatch(runButton,/\bdisabled\b/);
+      else assert.match(runButton,/\bdisabled\b/);
     }
     assert.doesNotMatch(app.inputFileStateHTML(doc.cells[3]),/\bdisabled\b/);
   }
-  app.state.live.operation = {kind:"merge"};
+  app.state.sequence = false;
+  app.state.lives.get("run").operation = {kind:"merge"};
   assert.equal(app.cellLocked(codeId),true);
-  app.state.live = null; // Reconnecting to an active run must not expose its input.
+  app.state.lives.clear(); // Reconnecting to an active run must not expose its input.
   assert.equal(app.cellLocked(runningId),true);
+});
+
+test("two Order runs stream in parallel and finish independently", async () => {
+  const env = makeApp(), {app,doc,take} = env;
+  const first = env.watch();
+  const second = app.watchRun({id:"run2",notebook_id:nid,cell_id:orderId,
+    cell_type:"order",status:"running",outputs:[],execution_count:2,context:{}});
+  assert.equal(app.state.lives.size,2);
+  assert.equal(app.cellLocked(runningId),true);
+  assert.equal(app.cellLocked(orderId),true);
+  assert.equal(app.cellLocked(codeId),false);
+  assert.equal(app.canRun(codeId),false);
+  assert.equal(app.codeBusy(),false);
+  assert.equal(app.anyBusy(),true);
+  env.edit(codeId,"source","Draft during parallel orders");
+  env.streams[0].send("finished",{status:"succeeded"});
+  const mid = finalDocument(structuredClone(doc));
+  mid.runtime.active_run_id = "run2";
+  mid.runtime.active_runs = [{id:"run2",cell_id:orderId,cell_type:"order",operation:false}];
+  (await take("GET",`/api/notebooks/${nid}`)).respond(mid);
+  const save = await take("PUT",`/api/notebooks/${nid}`);
+  assert.equal(save.body.cells[1].source,"Draft during parallel orders");
+  save.respond(savedDocument(mid,save.body));
+  await first;
+  assert.equal(app.state.lives.size,1);
+  assert.equal(app.cellLocked(runningId),false);
+  assert.equal(app.canRun(runningId),true);
+  assert.equal(app.canRun(codeId),false);
+  assert.equal(app.state.doc.cells[0].outputs[0].text,"Completed output");
+  env.streams[1].send("finished",{status:"succeeded"});
+  (await take("GET",`/api/notebooks/${nid}`)).respond(finalDocument(structuredClone(doc),4));
+  await env.finishList();
+  await second;
+  assert.equal(app.state.lives.size,0);
+  assert.equal(app.state.doc.runtime.active_run_id,null);
+  assert.equal(app.canRun(codeId),true);
 });
 
 test("an Order run waits for the confirmation dialog before starting", async () => {
@@ -179,6 +221,23 @@ test("confirming starts the run, and settings can disable the prompt", async () 
   assert.equal(env.elements.get("#modal").open,false);
   request.respond({error:"test stop"},500);
   await assert.rejects(pending,/test stop/);
+});
+
+test("Run All keeps starting cells while the sequence flag is set", async () => {
+  const env = makeApp(), {app} = env;
+  app.state.boot.settings = {confirm_order_run:false};
+  app.state.sequence = true;
+  const pending = app.runCell(orderId);
+  const request = await env.take("POST",`/api/notebooks/${nid}/cells/${orderId}/run`);
+  request.respond({id:"run",notebook_id:nid,cell_id:orderId,cell_type:"order",
+    status:"running",outputs:[],execution_count:1,context:{}});
+  await tick();
+  env.streams[0].send("finished",{status:"succeeded"});
+  (await env.take("GET",`/api/notebooks/${nid}`)).respond(finalDocument(env.doc));
+  await env.finishList();
+  const result = await pending;
+  assert.equal(result.status,"succeeded");
+  app.state.sequence = false;
 });
 
 test("completion rebases unsaved edits without replacing model-written requirements", async () => {
@@ -273,7 +332,7 @@ test("a real input-file conflict during completion retains the draft and latest 
   assert.equal(app.state.doc.cells[3].source,"My unsaved requirements");
   assert.equal(app.state.doc.cells[0].outputs[0].text,"Completed output");
   assert.equal(app.state.dirty,true);
-  assert.equal(app.state.live,null);
+  assert.equal(app.state.lives.size,0);
   assert.equal(app.state.runRefresh,null);
 });
 

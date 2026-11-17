@@ -50,6 +50,17 @@ python -m castle_notebook --project E:\research\my_model --python E:\conda\envs\
 --empty               不自动创建首次示例
 ```
 
+## 测试
+
+测试需要 IPython 与 nbformat（`test` 附加依赖），请在专用环境中运行，避免复用其他项目的解释器：
+
+```bash
+uv venv .venv-test --python 3.12
+uv pip install --python .venv-test -e ".[test]"
+.venv-test/bin/python -m unittest discover -s tests   # Windows 用 .venv-test/Scripts/python.exe
+node --test tests/test_app.js                          # 前端
+```
+
 ## 文档
 
 | 内容 | 中文 | English |
