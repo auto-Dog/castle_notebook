@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 import uuid
 
-VERSION = "0.9.0"
+VERSION = "0.9.5"
 CELL_TYPES = {"code", "markdown", "order"}
 ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
 MAX_CONTEXT = 48000
