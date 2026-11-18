@@ -2,6 +2,10 @@
 
 Language: [English](README.en.md) | 简体中文
 
+在使用 LLM Agent 进行聊天式项目研发时，通常存在信息零散、展示不直观、全局信息不透明的问题。该问题造成了需求的重复提出、修改困难、复现不稳定，因此推出 CastleNotebook。
+项目参考 Jupyter Notebook 的核心哲学：实时展示
+界面采用经典 Jupyter 布局
+
 ## 快速开始
 
 需要 Python 3.10+。Python 内核使用 IPython 执行单元；网页不需要 Node 或前端构建。
