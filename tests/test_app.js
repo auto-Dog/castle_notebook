@@ -65,6 +65,7 @@ function makeApp() {
     FormData:class {constructor(){} [Symbol.iterator](){return [][Symbol.iterator]();}},
     setTimeout:callback => {timers.set(++nextTimer,callback);return nextTimer;},
     clearTimeout:id => timers.delete(id),
+    crypto:{randomUUID:() => "eeeeeeee-ffff-0000-1111-222222222222"},
     requestAnimationFrame:callback => {callback();return 0;},
     setInterval:() => 0,
     MutationObserver:class {observe(){}},
@@ -86,7 +87,7 @@ function makeApp() {
     renderSidebar=()=>{};renderNotebook=()=>{};
     inspectorFrame=()=>renderHooks.inspector?.();
     refreshOrderOutputs=async()=>{};refreshContext=()=>{};toast=(message,error)=>renderHooks.toast?.(message,error);
-    globalThis.app={state,window,cellLocked,canRun,anyBusy,codeBusy,liveFor,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
+    globalThis.app={state,window,cellLocked,canRun,anyBusy,codeBusy,structureBusy,liveFor,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
       outputsHTML,orderInputMode,updateOrderInput,markdown,inline,mathSpan,splitMath,
       mathState,mathScript,typeset,startMath,runCell,confirmOrderRun,settleOrderRunConfirm,
       orderRunConfirmationEnabled,orderRunConfirmBody,action,openCustomSession,orderSessionHTML,
@@ -177,6 +178,37 @@ test("two Order runs stream in parallel and finish independently", async () => {
   assert.equal(app.state.lives.size,0);
   assert.equal(app.state.doc.runtime.active_run_id,null);
   assert.equal(app.canRun(codeId),true);
+});
+
+test("background Order runs keep adding cells unlocked", async () => {
+  const env = makeApp(), {app,doc,take} = env;
+  const watching = env.watch();
+  assert.equal(app.structureBusy(),false);
+  const before = doc.cells.length;
+  const adding = app.action("add",{dataset:{type:"order"}});
+  const save = await take("PUT",`/api/notebooks/${nid}`);
+  assert.equal(save.body.cells.length,before+1);
+  const added = save.body.cells.at(-1);
+  const responded = structuredClone(doc);
+  responded.revision++;
+  save.respond(responded);
+  await adding;
+  assert.equal(app.state.doc.cells.length,before+1);
+  assert.equal(app.canRun(added.id),true);
+  // Exclusive Python runs, restructuring and Run All still lock the layout.
+  app.state.lives.set("code-run",{id:"code-run",cell_id:codeId,cell_type:"code",outputs:[]});
+  assert.equal(app.structureBusy(),true);
+  app.state.lives.delete("code-run");
+  app.state.lives.get("run").operation={kind:"merge"};
+  assert.equal(app.structureBusy(),true);
+  delete app.state.lives.get("run").operation;
+  app.state.sequence=true;
+  assert.equal(app.structureBusy(),true);
+  app.state.sequence=false;
+  env.streams[0].send("finished",{status:"succeeded"});
+  (await take("GET",`/api/notebooks/${nid}`)).respond(finalDocument(structuredClone(app.state.doc),4));
+  await env.finishList();
+  await watching;
 });
 
 test("an Order run waits for the confirmation dialog before starting", async () => {

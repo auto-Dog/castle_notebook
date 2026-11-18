@@ -914,9 +914,9 @@ def initialization_notebook(scan):
     doc["global"].update(goal="在已有代码项目中建立 Notebook 交互界面。先识别项目目标、源码入口、输入和验证方法。", constraints="本次初始化只读取项目，不更改源文件。将项目工作拆分为小而可验证的步骤；不要自动执行生成的代码。不要读取凭据或私密配置。")
     inventory = new_cell("markdown", "项目快照", "## 项目文件概览\n\n```text\n" + "\n".join(scan["files"]) + "\n```\n\n" + scan["manifest_excerpt"] + ("\n\n目录已截断。" if scan["truncated"] else ""))
     order = new_cell("order", "初始化 / 需求归类",
-                     "进行项目notebook初始化：把 `~/.claude/projects/{" + scan["project_path"] + "}/*.jsonl` 的对话（本次对话除外）"
-                     "需求进行需求归类，按**时间**、**目的**归类，合并成 **≤5 个 AI Order 板块**，直接改写本 notebook。",
-                     "markdown：Input Cell 高度概括各需求板块；需求与运行结果详情写入对应 Output Cell。")
+                     "进行项目notebook初始化：把 `~/.claude/projects/{" + scan["project_path"] + "}/*.jsonl` 的对话（本次对话除外，即不需要归纳“ 进行项目 notebook 初始化”的对话）"
+                     "进行需求归类，当对话很长时考虑用文本聚类算法预处理。按**时间**、**目的**归类，合并成 **≤5 个 AI Order 板块**，直接改写本 notebook，可以每完成一个cell立即写入一下。",
+                     "markdown：Input Cell 高度概括各需求板块；需求与结果详情写入对应 Output Cell。")
     order.update(mode="agent")
     doc["cells"] = [inventory, order]
     return doc

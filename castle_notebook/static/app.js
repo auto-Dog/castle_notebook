@@ -50,6 +50,11 @@ const activeRuns = () => state.doc?.runtime?.active_runs || [];
 const anyBusy = () => Boolean(state.lives.size || activeRuns().length || state.runRefresh);
 const codeBusy = () => Boolean([...state.lives.values()].some(run => run.cell_type!=="order") ||
   activeRuns().some(run => run.cell_type!=="order"));
+const operationBusy = () => Boolean(activeRuns().some(run => run.operation) ||
+  [...state.lives.values()].some(run => run.operation));
+// Order runs are background work: adding/moving/deleting cells and creating
+// notebooks stays available; only exclusive Python runs and restructuring lock layout.
+const structureBusy = () => codeBusy() || operationBusy() || state.sequence;
 // Only running cells are locked; Order runs may proceed in parallel.
 const cellLocked = id => Boolean(liveFor(id) ||
   activeRuns().some(run => run.cell_id===id || run.operation) ||
@@ -441,12 +446,16 @@ function shell() {
 }
 
 function renderSidebar() {
-  $("#notebook-list").innerHTML = state.boot.notebooks.map(doc=>`<button class="notebook-link ${state.doc?.id===doc.id?"active":""}" data-action="open" data-id="${doc.id}" ${anyBusy()?"disabled":""}>${state.doc?.id===doc.id?"✓ ":""}${h(doc.title)}</button>`).join("");
+  $("#notebook-list").innerHTML = state.boot.notebooks.map(doc=>`<button class="notebook-link ${state.doc?.id===doc.id?"active":""}" data-action="open" data-id="${doc.id}" ${structureBusy()?"disabled":""}>${state.doc?.id===doc.id?"✓ ":""}${h(doc.title)}</button>`).join("");
   if(state.doc){$("#document-title").value=state.doc.title;$("#export-link").href=`/api/notebooks/${state.doc.id}/export`;}
   const editing=anyBusy()||state.sequence;
-  document.querySelectorAll('.toolbar [data-action]').forEach(el=>{el.disabled=el.dataset.action==="stop"?!anyBusy():["inspector","save"].includes(el.dataset.action)?false:editing;});
-  $("#cell-type").value=currentCell()?.type||"code";$("#cell-type").disabled=editing||!currentCell();
-  $("#document-title").disabled=editing;
+  document.querySelectorAll('.toolbar [data-action]').forEach(el=>{
+    const name=el.dataset.action;
+    el.disabled=name==="stop"?!anyBusy():["inspector","save"].includes(name)?false:
+      name==="run-selected"?!canRun(state.selected):name==="reset"?anyBusy():structureBusy();
+  });
+  $("#cell-type").value=currentCell()?.type||"code";$("#cell-type").disabled=structureBusy()||cellLocked(state.selected)||!currentCell();
+  $("#document-title").disabled=structureBusy();
   for(const operation of ["merge","split"]) {
     const button=$(`[data-action="${operation}-selected"]`);
     button.disabled=editing||currentCell()?.type!=="order"||!providerAvailable(currentCell())||providerName(currentCell())==="custom"||
@@ -472,7 +481,7 @@ function projectChangesHTML(changes) {
 function renderNotebook() {
   const doc = state.doc;
   if (!doc) { $("#notebook").innerHTML=`<div class="empty-workspace">${icon("notebook")}<h1>开始一篇研究笔记</h1><p>定义全局目的，再把问题拆成可验证的步骤。</p><button class="btn primary" data-action="new">${icon("plus")}新建 Notebook</button></div>`; return; }
-  const disabled=anyBusy() || state.sequence ? "disabled" : "";
+  const disabled=structureBusy() ? "disabled" : "";
   $("#notebook").innerHTML = `<div class="notebook-inner">
     <section class="global-card" id="global-cell" title="${h(timeText(doc.global.updated_at,true))} · r${doc.global.revision}"><div class="input-prompt global-prompt">Global:</div><div class="global-fields"><label><span>目标</span><textarea data-field="goal" data-global="true" placeholder="项目目标" rows="1" aria-label="项目目标" maxlength="8000">${h(doc.global.goal)}</textarea></label><label><span>约束</span><textarea data-field="constraints" data-global="true" placeholder="全局约束" rows="1" aria-label="全局约束" maxlength="8000">${h(doc.global.constraints)}</textarea></label></div></section>
     <div id="cells">${doc.cells.map(cellHTML).join("")}</div>
@@ -952,7 +961,7 @@ async function viewRun(id) {
 }
 
 async function mutateCells(fn) {
-  await flushSave();if(anyBusy() || state.sequence)throw new Error("请等待或停止执行后再编辑。");
+  await flushSave();if(structureBusy())throw new Error("Python 执行、单元整理或运行全部期间不能增删、移动或转换单元。");
   fn();touch("document","document|structure");await flushSave();renderAll();
 }
 async function action(name,el) {
@@ -1110,7 +1119,8 @@ document.addEventListener("submit",async event=>{
   event.preventDefault();const form=event.target, submit=$("button[type=submit]",form);submit.disabled=true;
   try {
     await flushSave();
-    if(anyBusy())throw new Error("请等待或停止当前运行后再创建。");
+    if(form.id==="cell-operation-form"){if(anyBusy())throw new Error("请等待或停止当前运行后再整理单元。");}
+    else if(structureBusy())throw new Error("Python 执行或单元整理期间暂不能创建，Order 后台运行时不受影响。");
     const values=Object.fromEntries(new FormData(form));
     if(form.id==="cell-operation-form"){
       const run=await api(`/api/notebooks/${state.doc.id}/cells/${form.dataset.id}/${form.dataset.operation}`,"POST",{...values,revision:state.doc.revision});

@@ -1240,9 +1240,11 @@ class EngineTests(unittest.TestCase):
 
         reordered = copy.deepcopy(saved)
         reordered["cells"].reverse()
-        with self.assertRaises(Problem) as structural_edit:
-            self.engine.save(self.doc["id"], reordered)
-        self.assertEqual(structural_edit.exception.status, 409)
+        reversed_doc = self.engine.save(self.doc["id"], reordered)
+        self.assertEqual([c["id"] for c in reversed_doc["cells"]], [c["id"] for c in saved["cells"]][::-1])
+        restored = copy.deepcopy(reversed_doc)
+        restored["cells"].reverse()
+        saved = self.engine.save(self.doc["id"], restored)
 
         result = wait_run(self.engine, run["id"])
         self.assertEqual(result["status"], "succeeded")
@@ -1286,6 +1288,49 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.runtime(self.doc["id"])["active_runs"], [])
         final = self.engine.document(self.doc["id"])
         self.assertEqual(final["cells"][2]["source"], "value = 2")
+
+    def test_order_run_allows_structural_edits_and_new_runs(self):
+        first = self.add("order", "FAKE_FILE_WAIT")
+        run_a = self.engine.start(self.doc["id"], first["id"])
+        payload = self.engine.document(self.doc["id"])
+        extra = new_cell("order", "追加单元", "FAKE_FILE_WAIT", "Explicit expected result")
+        payload["cells"].append(extra)
+        saved = self.engine.save(self.doc["id"], payload)
+        self.assertEqual(len(saved["cells"]), 2)
+        run_b = self.engine.start(self.doc["id"], extra["id"])
+        self.assertEqual(run_b["status"], "running")
+
+        converted = self.engine.document(self.doc["id"])
+        converted["cells"][0]["type"] = "code"
+        with self.assertRaises(Problem) as convert:
+            self.engine.save(self.doc["id"], converted)
+        self.assertEqual(convert.exception.status, 409)
+
+        self.assertEqual(wait_run(self.engine, run_a["id"])["status"], "succeeded")
+        self.assertEqual(wait_run(self.engine, run_b["id"])["status"], "succeeded")
+
+    def test_running_order_cell_can_be_deleted_while_run_finishes(self):
+        first = self.add("order", "FAKE_FILE_WAIT")
+        downstream = self.add("code", "value = 1")
+        run = self.engine.start(self.doc["id"], first["id"])
+        payload = self.engine.document(self.doc["id"])
+        payload["cells"] = [c for c in payload["cells"] if c["id"] != first["id"]]
+        saved = self.engine.save(self.doc["id"], payload)
+        self.assertEqual([c["id"] for c in saved["cells"]], [downstream["id"]])
+        result = wait_run(self.engine, run["id"])
+        self.assertEqual(result["status"], "succeeded")
+        final = self.engine.document(self.doc["id"])
+        self.assertEqual([c["id"] for c in final["cells"]], [downstream["id"]])
+
+    def test_python_run_still_locks_structure(self):
+        code = self.add("code", "import time\ntime.sleep(1)\nx = 1")
+        run = self.engine.start(self.doc["id"], code["id"])
+        payload = self.engine.document(self.doc["id"])
+        payload["cells"].append(new_cell("markdown", "新单元", "内容", "预期"))
+        with self.assertRaises(Problem) as locked:
+            self.engine.save(self.doc["id"], payload)
+        self.assertEqual(locked.exception.status, 409)
+        self.assertEqual(wait_run(self.engine, run["id"])["status"], "succeeded")
 
     def test_code_execution_stays_exclusive_against_orders(self):
         code = self.add("code", "import time\ntime.sleep(1)\nx = 1")

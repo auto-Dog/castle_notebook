@@ -618,20 +618,36 @@ class Engine:
             editable_fields = ("title", "source", "expected_output", "context_note", "mode", "output_format")
             upstream = []
             if actives:
-                if [(cell["id"], cell["type"]) for cell in doc["cells"]] != [
-                        (cell["id"], cell["type"]) for cell in current["cells"]]:
-                    raise Problem("执行期间可以编辑其他单元的内容，但不能增删、移动或转换单元。", 409)
-                changed_indices = [index for index, (old, new) in enumerate(zip(current["cells"], doc["cells"]))
-                                   if any(old[field] != new[field] for field in editable_fields)]
+                # Order runs live in background terminals; the layout stays editable.
+                # Only exclusive Python/Markdown runs still freeze the structure.
+                if any(active["run"]["cell_type"] != "order" for active in actives):
+                    if [(cell["id"], cell["type"]) for cell in doc["cells"]] != [
+                            (cell["id"], cell["type"]) for cell in current["cells"]]:
+                        raise Problem("Python 执行期间可以编辑其他单元的内容，但不能增删、移动或转换单元。", 409)
+                old_index = {cell["id"]: index for index, cell in enumerate(current["cells"])}
+                new_index = {cell["id"]: index for index, cell in enumerate(doc["cells"])}
+                new_by_id = {cell["id"]: cell for cell in doc["cells"]}
+                changed_ids = {cell["id"] for cell in current["cells"] if cell["id"] in new_by_id
+                               and any(cell[field] != new_by_id[cell["id"]][field] for field in editable_fields)}
+                removed_ids = {cell["id"] for cell in current["cells"]
+                               if cell["id"] not in new_by_id and cell["run_ids"]}
                 for active in actives:
                     active_id = active["run"]["cell_id"]
                     before = next(cell for cell in current["cells"] if cell["id"] == active_id)
-                    after = next(cell for cell in doc["cells"] if cell["id"] == active_id)
-                    if any(before[field] != after[field] for field in editable_fields):
+                    after = new_by_id.get(active_id)
+                    if after is None:
+                        # The running cell was deleted; the background run finishes
+                        # and its evidence stays on disk.
+                        continue
+                    if before["type"] != after["type"] or any(before[field] != after[field] for field in editable_fields):
                         raise Problem("正在执行的单元使用固定输入快照；请编辑其他单元，或先停止当前执行。", 409)
-                    active_index = next(index for index, cell in enumerate(current["cells"])
-                                        if cell["id"] == active_id)
-                    if changed_indices and min(changed_indices) < active_index:
+                    moved_ids = {cell["id"] for cell in current["cells"]
+                                 if cell["id"] in new_by_id and cell["run_ids"]
+                                 and old_index[cell["id"]] > old_index[active_id]
+                                 and new_index[cell["id"]] < new_index[active_id]}
+                    if (any(new_index[cid] < new_index[active_id] for cid in changed_ids)
+                            or any(old_index[cid] < old_index[active_id] for cid in removed_ids)
+                            or moved_ids):
                         upstream.append(active)
             for cell, value, expected in writes:
                 info, _ = self._current_input_file(cell, current["project_path"])
