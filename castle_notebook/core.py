@@ -95,9 +95,9 @@ def new_notebook(project, title="未命名 Notebook", template="blank"):
 def imported_notebook(incoming, project):
     """A local copy of an exported notebook: new ids, bound to this project.
 
-    Execution evidence (runs, sessions, outputs) belongs to the source store and
-    is never carried over, so the copy starts idle instead of claiming results
-    that were not produced here.
+    Content and prior outputs are carried across for reference, but run/session
+    links stay behind because they point into the source store. Cells start idle
+    so the copy never claims results that were not produced here.
     """
     if (not isinstance(incoming, dict) or not isinstance(incoming.get("cells"), list)
             or not isinstance(incoming.get("global"), dict)):
@@ -119,7 +119,11 @@ def imported_notebook(incoming, project):
                "global": {"goal": incoming["global"].get("goal", ""),
                           "constraints": incoming["global"].get("constraints", "")},
                "cells": cells}
-    return editable_document(doc, payload)
+    result = editable_document(doc, payload)
+    for cell, item in zip(result["cells"], incoming["cells"]):
+        if isinstance(item.get("outputs"), list):
+            cell["outputs"] = copy.deepcopy([o for o in item["outputs"] if isinstance(o, dict)])
+    return result
 
 
 def editable_document(doc, incoming):

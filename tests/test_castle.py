@@ -1595,6 +1595,9 @@ class HTTPTests(unittest.TestCase):
         markdown = source["cells"][0]
         markdown["source"] = "![figure](attachment:figure.png)"
         markdown["attachments"] = {"figure.png": {"image/png": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()}}
+        code = new_cell("code", "Stored result", "6 * 7")
+        code["outputs"] = [{"kind": "text", "text": "42"}]
+        source["cells"].insert(1, code)
         self.app.store.put(source)
         before = copy.deepcopy(source)
         status, _, body = self.request("POST", "/api/notebooks/import", {"notebook": source})
@@ -1607,17 +1610,23 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(doc["global"]["constraints"], source["global"]["constraints"])
         self.assertEqual([c["type"] for c in doc["cells"]], [c["type"] for c in source["cells"]])
         self.assertEqual(doc["cells"][0]["attachments"], markdown["attachments"])
+        self.assertEqual(doc["cells"][1]["outputs"], [{"kind": "text", "text": "42"}])
         copied = doc["cells"][-1]
         self.assertNotEqual(copied["id"], order["id"])
         self.assertEqual(copied["source"], order["source"])
         self.assertEqual(copied["expected_output"], order["expected_output"])
         self.assertEqual(copied["status"], "idle")
         self.assertFalse(copied["stale"])
-        self.assertEqual(copied["outputs"], [])
+        self.assertEqual(copied["outputs"], [{"kind": copied["output_format"], "text": "old evidence"}])
         self.assertEqual(copied["run_ids"], [])
         self.assertNotIn("last_run_id", copied)
-        self.assertEqual(copied["file_input"]["state"], "missing")
-        self.assertEqual(copied["file_output"]["state"], "missing")
+        self.assertEqual(copied["file_input"]["state"], "ready")
+        self.assertEqual(copied["file_input"]["run_id"], copied["id"])
+        self.assertEqual(copied["file_output"]["state"], "ready")
+        self.assertEqual(copied["file_output"]["run_id"], copied["id"])
+        board = self.app.store.board_path(copied["id"])
+        self.assertEqual((board / "input.md").read_text(encoding="utf-8"), order["source"])
+        self.assertEqual((board / "output.md").read_text(encoding="utf-8"), "old evidence")
         self.assertEqual(self.app.store.get(source["id"]), before)
         status, _, body = self.request("GET", f"/api/notebooks/{doc['id']}/export")
         self.assertEqual(status, 200)

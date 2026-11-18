@@ -657,6 +657,7 @@ test("import uploads the exported file as a copy and promises the source stays u
   assert.equal(modal.open,true);
   assert.match(modal.innerHTML,/type="file"/);
   assert.match(modal.innerHTML,/原始笔记本文件不会被改动/);
+  assert.match(modal.innerHTML,/原有输出会保留/);
   assert.match(modal.innerHTML,/下载 Notebook/);
   const exported = structuredClone(doc);
   const submitButton = {disabled:false};

@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .core import (Problem, Store, VERSION, ensure_context_config, ensure_settings,
-                   imported_notebook, initialization_notebook, load_settings, new_notebook,
+                   initialization_notebook, load_settings, new_notebook,
                    project_path, read_project_asset, read_project_file, scan_project,
                    settings_summary, text_field)
 from .execution import Engine
@@ -320,9 +320,7 @@ class Handler(BaseHTTPRequestHandler):
             body = self.body(120000000)
             project = project_path(self.app.project, body.get("relative_path", "."))
             ensure_context_config(project)
-            doc = imported_notebook(body.get("notebook"), project)
-            self.app.store.put(doc)
-            return self.json(self.app.engine.document(doc["id"]), 201)
+            return self.json(self.app.engine.import_notebook(body.get("notebook"), project), 201)
         if parts == ["api", "project", "scan"] and method == "POST":
             return self.json(scan_project(self.app.project, self.body().get("relative_path", "."), excluded=(self.app.store.path,)))
         if parts == ["api", "project", "initialize"] and method == "POST":

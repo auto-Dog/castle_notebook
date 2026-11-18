@@ -895,7 +895,7 @@ function newModal() {
 function importModal() {
   const root=state.boot.project_path, project=state.doc?.project_path||root;
   const relative=project.startsWith(root+"\\")||project.startsWith(root+"/")?project.slice(root.length+1):".";
-  showModal("从文件导入 Notebook",`<div class="path-block">${icon("folder")}<code>${h(project)}</code></div><form id="import-form" data-relative="${h(relative)}"><label class="modal-label">Notebook 文件（.json）<input type="file" name="file" accept=".json,application/json" required></label><div class="modal-callout">${icon("info")}<span>导入会在当前项目下创建一个副本，原始笔记本文件不会被改动。副本不携带执行记录，单元需重新运行；如需导出，请使用「下载 Notebook」。</span></div><button class="btn primary full" type="submit">导入副本</button></form>`);
+  showModal("从文件导入 Notebook",`<div class="path-block">${icon("folder")}<code>${h(project)}</code></div><form id="import-form" data-relative="${h(relative)}"><label class="modal-label">Notebook 文件（.json）<input type="file" name="file" accept=".json,application/json" required></label><div class="modal-callout">${icon("info")}<span>导入会在当前项目下创建一个副本，原始笔记本文件不会被改动。原有输出会保留，并立即写入副本的 input/output 文件；执行记录不迁移，重新运行才会产生新结果。如需导出，请使用「下载 Notebook」。</span></div><button class="btn primary full" type="submit">导入副本</button></form>`);
 }
 function initModal() {
   showModal("从项目初始化",`<div class="path-block">${icon("folder")}<code>${h(state.boot.project_path)}</code></div><form id="init-form"><label class="modal-label">子目录<input name="relative_path" value="." placeholder="." autocomplete="off"></label><div class="modal-callout">${icon("info")}将生成一个初始化 Order 单元，由你手动运行；AI 会归类历史对话需求并直接改写本 notebook。</div><div class="modal-actions"><button class="btn outline" type="button" data-action="scan-project">文件概览</button><button class="btn primary" type="submit">生成初始化 Order</button></div><div id="scan-result"></div></form>`);
@@ -1125,7 +1125,7 @@ document.addEventListener("submit",async event=>{
       try{notebook=JSON.parse(await file.text());}catch{throw new Error("文件不是有效的 JSON，请选择「下载 Notebook」导出的文件。");}
       const doc=await api("/api/notebooks/import","POST",{notebook,relative_path:form.dataset.relative});
       state.boot.notebooks=await api("/api/notebooks");$("#modal").close();await openNotebook(doc.id);
-      toast("已导入副本。原始笔记本不会被改动；如需导出，请使用「下载 Notebook」。");
+      toast("已导入副本，原有输出已写入副本目录。原始笔记本不会被改动；如需导出，请使用「下载 Notebook」。");
     } else {
       const result=await api("/api/project/initialize","POST",values);state.doc=result.notebook;state.selected=state.doc.cells[state.doc.cells.length-1]?.id;state.boot.notebooks=await api("/api/notebooks");localStorage.setItem("castle-notebook",state.doc.id);$("#modal").close();renderAll();toast("已生成初始化 Order，请运行该单元，由 AI 归类需求并改写 notebook。");
     }

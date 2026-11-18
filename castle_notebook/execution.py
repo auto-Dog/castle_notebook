@@ -17,8 +17,9 @@ import threading
 import time
 
 from .core import (Problem, apply_initialization, editable_document, embed_markdown_images, now,
-                   load_context_config, output_summary, pack_context, project_changes, scan_project,
-                   short, snapshot_project, text_field, uid, validate_order_output)
+                   imported_notebook, load_context_config, output_summary, pack_context,
+                   project_changes, scan_project, short, snapshot_project, text_field, uid,
+                   validate_order_output)
 from .cell_operations import operation_cell, parse_cells, replace_cells, select_cells
 from .providers import create_providers
 from .providers.base import OUTPUT_LIMIT
@@ -360,6 +361,21 @@ class Engine:
                     run = self.get_run(cell["run_ids"][-1]) if cell["run_ids"] else None
                     cell["session"] = self.provider_for(run or cell).session_details(run)
             return doc | {"runtime": self.runtime(notebook_id)}
+
+    def import_notebook(self, incoming, project):
+        doc = imported_notebook(incoming, project)
+        self.store.put(doc)
+        for cell in doc["cells"]:
+            if cell["type"] != "order":
+                continue
+            board = self.store.board_path(cell["id"])
+            board.mkdir(parents=True, exist_ok=True)
+            if cell["source"]:
+                (board / "input.md").write_text(cell["source"][:INPUT_LIMIT], encoding="utf-8")
+            text = next((o.get("text") for o in cell["outputs"] if isinstance(o.get("text"), str)), None)
+            if text:
+                (board / "output.md").write_text(text[:OUTPUT_LIMIT], encoding="utf-8")
+        return self.document(doc["id"])
 
     def read_output_file(self, rid, project):
         """Read only the output belonging to a known run, with a bounded payload."""
