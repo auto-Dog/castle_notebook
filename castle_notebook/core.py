@@ -206,6 +206,14 @@ def editable_document(doc, incoming):
     return result
 
 
+EMBEDDED_IMAGE_URI = re.compile(r"data:image/[a-z+.-]+;base64,[A-Za-z0-9+/=]+", re.IGNORECASE)
+
+
+def strip_embedded_images(text):
+    """AI 可能把 base64 图片直接写进 output.md；字节不属于上下文证据。"""
+    return EMBEDDED_IMAGE_URI.sub("[内嵌图片已省略]", text)
+
+
 def output_summary(outputs, limit=1200):
     pieces = []
     for item in outputs:
@@ -214,7 +222,7 @@ def output_summary(outputs, limit=1200):
         elif item.get("kind") == "table":
             pieces.append(json.dumps(item.get("data"), ensure_ascii=False))
         else:
-            pieces.append(str(item.get("text", "")))
+            pieces.append(strip_embedded_images(str(item.get("text", ""))))
     return short("\n".join(pieces), limit)
 
 

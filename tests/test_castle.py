@@ -19,7 +19,7 @@ from castle_notebook.core import (MAX_CONTEXT, MAX_EMBEDDED_IMAGE_BYTES, Problem
                                  embed_markdown_images, ensure_context_config, ensure_settings,
                                  load_context_config, load_settings, normalize_context_config,
                                  normalize_settings, initialization_notebook, new_cell, new_notebook,
-                                 pack_context, parse_json_output, project_changes, read_project_asset,
+                                 output_summary, pack_context, parse_json_output, project_changes, read_project_asset,
                                  read_project_file, scan_project, settings_summary, snapshot_project,
                                  validate_order_output)
 from castle_notebook.execution import (Engine, linux_terminal_command, open_claude_terminal,
@@ -141,6 +141,14 @@ class CoreTests(unittest.TestCase):
         cell["source"] = "x" * MAX_CONTEXT
         with self.assertRaises(Problem):
             pack_context(self.doc, cell["id"])
+
+    def test_output_summary_replaces_embedded_base64_images(self):
+        image = "data:image/png;base64," + "A" * 5000
+        outputs = [{"kind": "markdown", "text": f"结论保留\n![图]({image})"}]
+        summary = output_summary(outputs, limit=1000)
+        self.assertIn("结论保留", summary)
+        self.assertIn("[内嵌图片已省略]", summary)
+        self.assertNotIn("base64,", summary)
 
     def test_edit_marks_downstream_stale_preserving_evidence(self):
         self.evidence()
@@ -1627,6 +1635,10 @@ class HTTPTests(unittest.TestCase):
         board = self.app.store.board_path(copied["id"])
         self.assertEqual((board / "input.md").read_text(encoding="utf-8"), order["source"])
         self.assertEqual((board / "output.md").read_text(encoding="utf-8"), "old evidence")
+        preview = self.app.engine.context(doc["id"], copied["id"])
+        self.assertEqual(preview["run"]["run_id"], copied["id"])
+        self.assertEqual(preview["run"]["input_file"], copied["file_input"]["path"])
+        self.assertEqual(preview["run"]["output_file"], copied["file_output"]["path"])
         self.assertEqual(self.app.store.get(source["id"]), before)
         status, _, body = self.request("GET", f"/api/notebooks/{doc['id']}/export")
         self.assertEqual(status, 200)

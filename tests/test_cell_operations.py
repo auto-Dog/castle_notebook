@@ -96,6 +96,28 @@ class CellOperationTests(unittest.TestCase):
         for index, run in enumerate(originals):
             self.assertIn(f"结论 {index}", Path(run["artifact"]).read_text(encoding="utf-8"))
 
+    def test_merge_and_split_omit_embedded_base64_images_instead_of_exceeding_budget(self):
+        image = "data:image/png;base64," + "A" * 60000
+        first = self.add("第一轮需求 FAKE_TRANSFORM_FILE", execute=True)
+        second = self.add("第二轮需求", execute=True)
+        doc = self.engine.document(self.doc["id"])
+        for cell, conclusion in zip(doc["cells"], ["结论一", "结论二"]):
+            run = self.engine.get_run(cell["run_ids"][-1])
+            Path(run["artifact"]).write_text(f"{conclusion}\n![图]({image})", encoding="utf-8")
+        merged_run = wait_run(self.engine, self.transform(second, "merge", other_cell_id=first["id"])["id"])
+        self.assertEqual(merged_run["status"], "succeeded", merged_run["error"])
+        prompt = Path(merged_run["prompt_file"]).read_text(encoding="utf-8")
+        self.assertNotIn("base64,", prompt)
+        self.assertIn("[内嵌图片已省略]", prompt)
+        merged = self.engine.document(self.doc["id"])["cells"][0]
+        self.assertIn("结论一", merged["outputs"][0]["text"])
+        self.assertIn("结论二", merged["outputs"][0]["text"])
+        self.assertNotIn("base64,", merged["outputs"][0]["text"])
+        split_run = wait_run(self.engine, self.transform(merged, "split")["id"])
+        self.assertEqual(split_run["status"], "succeeded", split_run["error"])
+        self.assertNotIn("base64,", Path(split_run["prompt_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(len(self.engine.document(self.doc["id"])["cells"]), 2)
+
     def test_split_copies_history_into_two_independent_sessions_and_files_after_restart(self):
         source = self.add("先实现功能，再做独立验证", execute=True)
         after = self.add("后续步骤", execute=True)

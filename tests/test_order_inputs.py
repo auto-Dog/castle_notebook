@@ -228,6 +228,25 @@ class OrderInputTests(unittest.TestCase):
         self.assertIn(downstream["cell_id"], after["stale_cell_ids"])
         self.assertFalse(self.engine.order_outputs(self.doc["id"], after["fingerprint"])["changed"])
 
+    def test_unrun_board_directory_is_the_first_run_directory(self):
+        cell = self.add("导入后的需求")
+        board = self.store.board_path(cell["id"])
+        board.mkdir(parents=True)
+        (board / "input.md").write_text("导入后的需求", encoding="utf-8")
+        (board / "output.md").write_text("旧证据", encoding="utf-8")
+        preview = self.engine.context(self.doc["id"], cell["id"])
+        self.assertEqual(preview["run"]["run_id"], cell["id"])
+        self.assertEqual(preview["run"]["input_file"], f".castle/runs/{cell['id']}/input.md")
+        self.assertEqual(preview["run"]["output_file"], f".castle/runs/{cell['id']}/output.md")
+        run = self.execute(cell)
+        self.assertEqual(run["id"], cell["id"])
+        self.assertEqual(run["context"], preview)
+        self.assertEqual((board / "output.prior.md").read_text(encoding="utf-8"), "旧证据")
+        self.assertNotEqual(run["outputs"][0]["text"], "旧证据")
+        self.assertEqual((board / "output.md").read_text(encoding="utf-8"), run["outputs"][0]["text"])
+        rerun_preview = self.engine.context(self.doc["id"], cell["id"])
+        self.assertNotEqual(rerun_preview["run"]["run_id"], cell["id"])
+
     def test_legacy_cells_board_migrates_into_runs_namespace(self):
         cell = self.add("迁移前的外部试跑需求")
         legacy = self.store.path / "cells" / cell["id"]
@@ -258,6 +277,9 @@ class OrderInputTests(unittest.TestCase):
 
     def test_finished_run_mirrors_files_to_board_and_run_files_stay_canonical(self):
         cell = self.add("检查现有问题")
+        # The first run reuses the board directory; a rerun gets its own folder,
+        # which is what makes the board a mirror instead of the canonical file.
+        self.execute(cell)
         run = self.execute(cell)
         board = self.store.board_path(cell["id"])
         self.assertEqual((board / "input.md").read_bytes(), self.input_path(run).read_bytes())

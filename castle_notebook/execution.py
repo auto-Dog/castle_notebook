@@ -660,11 +660,19 @@ class Engine:
                 self.store.put(updated)
             return self.document(notebook_id)
 
+    def _next_run_id(self, doc, cell_id):
+        cell = next((c for c in doc["cells"] if c["id"] == cell_id), None)
+        if cell and cell["type"] == "order" and not cell["run_ids"]:
+            # The first run lives in the cell's board directory, so the context
+            # preview, the display board and external writes share one folder.
+            return cell_id
+        return uid()
+
     def context(self, notebook_id, cell_id):
         with self.lock:
             doc = self.sync_output_files(notebook_id)
             key = (notebook_id, cell_id)
-            rid = self.pending_contexts.get(key) or uid()
+            rid = self.pending_contexts.get(key) or self._next_run_id(doc, cell_id)
             context = self._context(doc, cell_id, rid)
             self.pending_contexts[key] = rid
             return context
@@ -744,14 +752,14 @@ class Engine:
                 if not provider.available:
                     raise Problem(f"未发现 {provider.label} CLI。请安装并登录后重启服务；Python 与 Markdown 单元仍可独立使用。", 503)
             key = (notebook_id, cell_id)
-            rid = self.pending_contexts.get(key) or uid()
+            rid = self.pending_contexts.get(key) or self._next_run_id(doc, cell_id)
             context = self._context(doc, cell_id, rid)
             before = snapshot_project(doc["project_path"], excluded=(self.store.path,)) if cell["type"] != "markdown" else None
             return self._start_run(doc, cell, rid, context, before)
 
     def _prepare_run(self, doc, cell, rid, context, before=None):
         folder = self.store.run_path(rid)
-        folder.mkdir()
+        folder.mkdir(exist_ok=True)
         prompt_bytes = context["prompt"].encode("utf-8")
         (folder / "context.md").write_bytes(prompt_bytes)
         if before is not None:
@@ -766,6 +774,11 @@ class Engine:
                "input_snapshot": copy.deepcopy(cell), "project_path": doc["project_path"],
                "project_changes": None}
         if cell["type"] == "order":
+            # A reused board directory may hold prior trial/import evidence;
+            # archive it so providers never mistake it for this run's output.
+            prior = folder / "output.md"
+            if prior.exists():
+                os.replace(prior, folder / "output.prior.md")
             run["provider"] = self.provider_for(cell).name
             run["session_name"] = context["run"]["session_name"]
             run["run_dir"] = context["run"]["run_dir"]
@@ -1020,7 +1033,7 @@ class Engine:
                         board.mkdir(parents=True, exist_ok=True)
                         for name in ("input.md", "output.md"):
                             source = self.store.run_path(rid) / name
-                            if source.is_file() and not source.is_symlink():
+                            if source != board / name and source.is_file() and not source.is_symlink():
                                 (board / name).write_bytes(source.read_bytes())
                     except OSError:
                         pass
