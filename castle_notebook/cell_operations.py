@@ -4,8 +4,8 @@ from __future__ import annotations
 import copy
 import json
 
-from .core import (Problem, check_id, new_cell, now, output_summary, parse_json_output,
-                   strip_embedded_images, text_field, validate_order_output)
+from .core import (Problem, check_id, extract_embedded_images, new_cell, now, output_summary,
+                   parse_json_output, strip_embedded_images, text_field, validate_order_output)
 
 
 def select_cells(doc, cell_id, operation, other_cell_id=None):
@@ -28,17 +28,20 @@ def select_cells(doc, cell_id, operation, other_cell_id=None):
     return cells
 
 
-def operation_cell(operation, cells, instructions):
+def operation_cell(operation, cells, instructions, project):
     count = 1 if operation == "merge" else 2
     verb = "合并" if operation == "merge" else "拆分"
     fields = ("id", "title", "source", "expected_output", "output_format", "context_note",
               "status", "stale", "outputs", "file_output")
 
+    def scrub_text(value):
+        return strip_embedded_images(extract_embedded_images(value, project))
+
     def scrub(cell):
         data = {key: cell[key] for key in fields if key in cell}
-        data["source"] = strip_embedded_images(data.get("source", ""))
+        data["source"] = scrub_text(data.get("source", ""))
         if isinstance(data.get("outputs"), list):
-            data["outputs"] = [dict(item, text=strip_embedded_images(item["text"]))
+            data["outputs"] = [dict(item, text=scrub_text(item["text"]))
                                if isinstance(item, dict) and isinstance(item.get("text"), str) else item
                                for item in data["outputs"]]
         return data
@@ -56,7 +59,7 @@ def operation_cell(operation, cells, instructions):
         "合并时消除重复，将后续修正融入整体；拆分时按两个清晰的任务边界分配内容，保持先后依赖。\n"
         "已有输出只能归纳，不能编造执行或验证。原来没有输出时 output 必须为空字符串；"
         "失败或失效的证据必须明确保留其状态。原输出为 JSON 时，output 是包含有效 JSON 的字符串。\n"
-        "原单元中的内嵌图片已替换为“[内嵌图片已省略]”；保留图片的说明文字即可，不要编造或还原图片内容。\n"
+        "原单元中的内嵌图片已保存为项目文件，引用形如 ![说明](castle-assets/…)；归纳时原样保留这些图片引用及其说明文字，不要修改路径，不要编造或还原图片内容。\n"
         "只返回规定的 JSON，写入本轮 output.md；应用程序负责替换单元和管理会话。\n"
         f"返回格式（cells 数量必须为 {count}）：{contract}\n"
         f"用户补充整理要求：{instructions or '按内容的自然边界整理。'}\n\n"

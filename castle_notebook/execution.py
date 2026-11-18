@@ -16,10 +16,10 @@ import sys
 import threading
 import time
 
-from .core import (Problem, apply_initialization, editable_document, embed_markdown_images, now,
-                   imported_notebook, load_context_config, output_summary, pack_context,
-                   project_changes, scan_project, short, snapshot_project, text_field, uid,
-                   validate_order_output)
+from .core import (Problem, apply_initialization, editable_document, embed_markdown_images,
+                   embed_output_images, now, imported_notebook, load_context_config, output_summary,
+                   pack_context, project_changes, scan_project, short, snapshot_project,
+                   strip_embedded_images, text_field, uid, validate_order_output)
 from .cell_operations import operation_cell, parse_cells, replace_cells, select_cells
 from .providers import create_providers
 from .providers.base import OUTPUT_LIMIT
@@ -412,6 +412,16 @@ class Engine:
                 info.update(state="unavailable", error=f"{label_name}文件超过 {limit_name}。")
                 return info, None
             value = raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+            if filename == "output.md":
+                embedded = embed_output_images(value, project, excluded=(self.store.path,))
+                if embedded != value:
+                    # Persist the data URIs so the board file stays self-contained
+                    # and later syncs do not re-embed on every load.
+                    try:
+                        path.write_text(embedded, encoding="utf-8")
+                    except OSError:
+                        pass
+                    value = embedded
             if character_limit is not None and len(value) > character_limit:
                 info.update(state="unavailable", error=f"{label_name}文件超过 {limit_name}。")
                 return info, None
@@ -703,7 +713,7 @@ class Engine:
                 raise Problem("Custom 提供商的对话在外部 AI 中进行，暂不支持合并与拆分。")
             if not provider.command:
                 raise Problem(f"合并和拆分需要 {provider.label} CLI，请安装并登录后重启服务。", 503)
-            cell = operation_cell(operation, sources, instructions)
+            cell = operation_cell(operation, sources, instructions, doc["project_path"])
             cell["provider"] = provider.name
             rid = uid()
             context = self._context(doc | {"cells": [cell]}, cell["id"], rid)
@@ -862,7 +872,7 @@ class Engine:
                         f"此后每轮对话更新本单元的需求摘要文件：{context['run']['input_file']}\n"
                         f"此后每轮对话更新本单元的输出文件：{context['run']['output_file']}\n"
                         "历史中的其他输入/输出路径已失效，不得继续更新原单元或另一个拆分单元的文件。\n"
-                        f"当前已有结论（本轮保持不变）：\n{output_summary(cell['outputs'], OUTPUT_LIMIT + 100000)}\n"
+                        f"当前已有结论（本轮保持不变）：\n{strip_embedded_images(output_summary(cell['outputs'], OUTPUT_LIMIT + 100000))}\n"
                     )
                     context = self._replace_prompt(context, context["prompt"] + notice)
                 child = self._prepare_run(candidate, cell, rid, context)

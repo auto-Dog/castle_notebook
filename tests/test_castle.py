@@ -17,6 +17,7 @@ from unittest.mock import patch
 from castle_notebook.core import (MAX_CONTEXT, MAX_EMBEDDED_IMAGE_BYTES, Problem, Store,
                                  default_context_config, editable_document,
                                  embed_markdown_images, ensure_context_config, ensure_settings,
+                                 extract_embedded_images, embed_output_images, strip_embedded_images,
                                  load_context_config, load_settings, normalize_context_config,
                                  normalize_settings, initialization_notebook, new_cell, new_notebook,
                                  output_summary, pack_context, parse_json_output, project_changes, read_project_asset,
@@ -142,13 +143,34 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(Problem):
             pack_context(self.doc, cell["id"])
 
-    def test_output_summary_replaces_embedded_base64_images(self):
+    def test_history_context_replaces_embedded_base64_images(self):
         image = "data:image/png;base64," + "A" * 5000
         outputs = [{"kind": "markdown", "text": f"结论保留\n![图]({image})"}]
-        summary = output_summary(outputs, limit=1000)
+        summary = strip_embedded_images(output_summary(outputs, limit=1000))
         self.assertIn("结论保留", summary)
         self.assertIn("[内嵌图片已省略]", summary)
         self.assertNotIn("base64,", summary)
+
+    def test_extract_embedded_images_saves_deduplicated_files_and_rewrites_references(self):
+        payload = base64.b64encode(b"\x89PNG fake bytes").decode("ascii")
+        image = f"data:image/png;base64,{payload}"
+        with tempfile.TemporaryDirectory() as folder:
+            text = f"前文\n![图A]({image})\n裸引用 {image}\n![坏图](data:image/png;base64,!!!)\n"
+            result = extract_embedded_images(text, folder)
+            files = list((Path(folder) / "castle-assets").iterdir())
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].read_bytes(), b"\x89PNG fake bytes")
+            reference = f"castle-assets/{files[0].name}"
+            self.assertIn(f"![图A]({reference})", result)
+            self.assertIn(f"裸引用 {reference}", result)
+            self.assertIn("![坏图](data:image/png;base64,!!!)", result)
+            self.assertNotIn(payload, result)
+            self.assertEqual(extract_embedded_images("没有图片", folder), "没有图片")
+            roundtrip = embed_output_images(result, folder)
+            self.assertIn(f"data:image/png;base64,{payload}", roundtrip)
+            self.assertNotIn("](castle-assets/", roundtrip)
+            missing = "![图](castle-assets/image-doesnotexist.png)"
+            self.assertEqual(embed_output_images(missing, folder), missing)
 
     def test_edit_marks_downstream_stale_preserving_evidence(self):
         self.evidence()

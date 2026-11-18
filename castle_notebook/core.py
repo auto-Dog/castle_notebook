@@ -214,6 +214,49 @@ def strip_embedded_images(text):
     return EMBEDDED_IMAGE_URI.sub("[内嵌图片已省略]", text)
 
 
+EMBEDDED_IMAGE_MARKDOWN = re.compile(
+    r"!\[([^\]\n]*)\]\(data:image/([a-z+.-]+);base64,([A-Za-z0-9+/=]+)\)", re.IGNORECASE)
+IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                    "image/webp": ".webp", "image/avif": ".avif", "image/bmp": ".bmp"}
+
+
+def extract_embedded_images(text, project):
+    """Save data-URI images as project files so restructuring keeps them visible.
+
+    Content-hash names deduplicate across cells; the asset endpoint serves the
+    rewritten relative references exactly like any other project image.
+    """
+    if "data:image/" not in text.lower():
+        return text
+    folder = Path(project) / "castle-assets"
+
+    def save(mime, payload):
+        mime = mime.lower()
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except (ValueError, TypeError):
+            return None
+        if not data or len(data) > MAX_EMBEDDED_IMAGE_BYTES or mime not in IMAGE_EXTENSIONS:
+            return None
+        name = f"image-{hashlib.sha256(data).hexdigest()[:16]}{IMAGE_EXTENSIONS[mime]}"
+        folder.mkdir(exist_ok=True)
+        target = folder / name
+        if not target.exists():
+            target.write_bytes(data)
+        return f"castle-assets/{name}"
+
+    def markdown(match):
+        path = save("image/" + match.group(2), match.group(3))
+        return f"![{match.group(1)}]({path})" if path else match.group(0)
+
+    text = EMBEDDED_IMAGE_MARKDOWN.sub(markdown, text)
+
+    def bare(match):
+        return save("image/" + match.group(1), match.group(2)) or "[内嵌图片已省略]"
+
+    return re.sub(r"data:image/([a-z+.-]+);base64,([A-Za-z0-9+/=]+)", bare, text, flags=re.IGNORECASE)
+
+
 def output_summary(outputs, limit=1200):
     pieces = []
     for item in outputs:
@@ -222,7 +265,7 @@ def output_summary(outputs, limit=1200):
         elif item.get("kind") == "table":
             pieces.append(json.dumps(item.get("data"), ensure_ascii=False))
         else:
-            pieces.append(strip_embedded_images(str(item.get("text", ""))))
+            pieces.append(str(item.get("text", "")))
     return short("\n".join(pieces), limit)
 
 
@@ -422,7 +465,7 @@ def pack_context(doc, cell_id, variables=None, config=None, project_scan=None, r
         source = previous["context_note"] if manual else previous["source"]
         if enabled["compact_history"]:
             source = short(source, field_limit)
-        output = output_summary(previous["outputs"], field_limit if enabled["compact_history"] else limits["max_characters"] + 1) if valid else "[不纳入历史输出]"
+        output = strip_embedded_images(output_summary(previous["outputs"], field_limit if enabled["compact_history"] else limits["max_characters"] + 1)) if valid else "[不纳入历史输出]"
         piece = render("previous_step", id=previous["id"],
                        title=short(previous["title"], 80) if enabled["compact_history"] else previous["title"],
                        type=previous["type"], state=state,
@@ -823,6 +866,30 @@ def embed_markdown_images(cells, project, excluded=(), per_image=MAX_EMBEDDED_IM
             cell["source"] = source
         # An explicit key (even empty) tells editable_document to replace, not keep.
         cell["attachments"] = attachments
+
+
+def embed_output_images(text, project, excluded=(), per_image=MAX_EMBEDDED_IMAGE_BYTES):
+    """Order outputs keep images as data URIs so the notebook stays self-contained.
+
+    Reuses the markdown image walk; Order cells have no attachments, so local
+    references are inlined directly into the output text on load.
+    """
+    if "![" not in text:
+        return text
+
+    def replace(match):
+        relative = _local_image_path(match.group(2))
+        if relative is None:
+            return match.group(0)
+        try:
+            data, mime = read_project_asset(project, relative, excluded=excluded, max_bytes=per_image)
+        except Problem:
+            return match.group(0)
+        if mime not in ATTACHMENT_MEDIA_TYPES:
+            return match.group(0)
+        return f"![{match.group(1)}](data:{mime};base64,{base64.b64encode(data).decode('ascii')})"
+
+    return _rewrite_markdown_images(text, replace)
 
 
 def scan_project(root, relative=".", excluded=()):
