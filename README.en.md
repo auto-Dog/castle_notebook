@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="castle_notebook/static/logo.svg" alt="Castle Notebook Logo" width="96" height="96">
+</p>
+
 # Castle Notebook
 
 <!-- Language: English | [简体中文](README.md) -->

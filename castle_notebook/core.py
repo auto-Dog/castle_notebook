@@ -85,22 +85,124 @@ def new_notebook(project, title="未命名 Notebook", template="blank"):
            "global": {"id": uid(), "goal": "", "constraints": "",
                       "revision": 1, "created_at": stamp, "updated_at": stamp},
            "cells": []}
-    if template == "quant":
-        doc["title"] = "波动率信号 · 研究笔记"
-        doc["global"].update(
-            goal="验证波动率信号的统计口径，逐步审阅假设。",
-            constraints="固定种子的合成数据；年化系数 252；禁止未来数据；不连接交易系统。")
+    if template == "project":
+        doc["title"] = "从项目初始化 · 入门教程"
+        doc["global"].update(goal="将项目已有的 AI 对话整理成可以继续工作的 Notebook。",
+                             constraints="先确认 CLI 与项目目录，再手动运行初始化 Order；历史结论与待办分别保留。")
         doc["cells"] = [
-            new_cell("markdown", "研究假设", "## 波动率信号\n\n构造合成日收益，检查风险指标，再审阅统计口径。"),
-            new_cell("code", "01 / 构造收益序列", "import random\nimport math\nimport statistics\n\nrng = random.Random(42)\nreturns = [rng.gauss(0.0003, 0.012) for _ in range(252)]\nannualization = 252\nprint(f'已构造 {len(returns)} 个合成日收益，固定种子 = 42')\nreturns[:5]"),
-            new_cell("code", "02 / 检查风险指标", "sample_size = len(returns)\nmean_return = statistics.mean(returns)\nannual_vol = statistics.stdev(returns) * math.sqrt(annualization)\nmetrics = [\n    {'指标': '样本长度', '数值': sample_size},\n    {'指标': '日均收益', '数值': round(mean_return, 6)},\n    {'指标': '年化波动率', '数值': round(annual_vol, 6)},\n]\ndisplay(metrics)\nassert sample_size == 252\nassert 0 < annual_vol < 1\nprint('样本长度与波动率范围检查通过。')"),
-            new_cell("order", "03 / 审阅假设与下一步", "根据上游已执行的代码、结果和全局约束，检查波动率计算是否合理，指出当前证据的局限，并提出一个可以独立执行的下一步调试单元。不要编造未执行的结果。", "Markdown，包含：口径检查、已知局限、下一步 Python 代码及其预期断言。明确区分观察事实与待验证假设。")]
+            new_cell("markdown", "01 / 确认 AI 已就绪", """## 从已有项目和对话开始
+
+1. 确认已安装并登录 **Codex CLI（ChatGPT 的命令行工具）或 Claude Code CLI**。在终端运行 `codex --version` 或 `claude --version` 检查，再启动对应工具确认能够正常对话。
+2. 点击顶部 **Python 3 / 运行环境**，确认相应 CLI 显示“已检测到”。如果刚安装，请重启 CastleNotebook。
+3. 确认工作目录是你想整理的项目；需要换项目时，以 `castle-notebook --project <项目目录>` 启动。最好选一个已有 Codex / Claude 对话的项目。"""),
+            new_cell("markdown", "02 / 点击从项目初始化", """## 生成并运行初始化 Order
+
+1. 点击 **文件 → 从项目初始化…**。
+2. 填写项目子目录：当前项目用 `.`；也可以先点 **文件概览** 核对目录。
+3. 点击 **生成初始化 Order**，会打开新的“项目拆解”Notebook。
+4. 找到 **初始化 / 需求归类** Order，在 **AI 提供商** 中选择已安装的 Claude 或 Codex；可以先改需求，例如“只整理最近一周的对话”。
+5. 点击这个 Order 左侧的 **▶ 运行**；出现运行确认时，核对软件和目标单元，点击 **继续运行**。"""),
+            new_cell("markdown", "03 / 整理已有对话，继续工作", """## 把对话变成工作单元
+
+初始化 Order 会按时间和目的整理项目历史对话，归并为至多 5 个 AI Order 板块，并直接改写新 Notebook。读完各板块的需求和结果后，再选择一个继续工作。
+
+你可以修改 Order 的需求后运行。支持恢复会话时，也可以点 **打开对话** 继续追问；按钮不可用时，在当前 Order 修改需求继续。没有找到历史对话时，请先检查项目目录和所选工具，并让 AI 说明未找到的范围，不要生成虚构的项目进展。""")]
+    elif template == "quant":
+        doc["title"] = "定投策略回测 · 金融研究"
+        doc["global"].update(
+            goal="获取 Nasdaq-100 历史数据，完成月度定投的小型回测，再通过 Order 改进展示和指标。",
+            constraints="只使用实际获取的 NDX 历史收盘数据，不以合成数据冒充；每月首个交易日收盘投入 1000，允许碎份额，不计手续费、税费和分红。NDX 是指数，按指数点位模拟份额，不代表可交易产品的实际收益。")
+        doc["cells"] = [
+            new_cell("markdown", "第一组 / 让 AI 获取并清洗数据", """## 先准备真实数据
+
+下面的 Order 从 [Nasdaq NDX 历史数据页面](https://www.nasdaq.com/market-activity/index/ndx/historical?page=1&rows_per_page=10&timeline=ytd) 获取今年以来的数据。
+
+**这个需求可以直接改。** 例如改成过去五年、换指数、增加数据质量检查，再点击该 Order 的 **▶ 运行**。支持恢复会话时，可以点 **打开对话** 继续讨论数据口径；按钮不可用时，直接在 Order 中补充需求后运行。
+
+先运行数据获取，再运行清洗；确认文件生成后，逐个运行第二组 Python 单元。若缺少绘图库，请在顶部“运行环境”所示 Python 环境中安装 `matplotlib`。"""),
+            new_cell("order", "01 / 获取 NDX 历史数据", """从 https://www.nasdaq.com/market-activity/index/ndx/historical?page=1&rows_per_page=10&timeline=ytd 下载数据。""","无"),
+            new_cell("order", "02 / 清洗与校验数据", """读取上一单元下载的数据，清洗数据，输出到data/ndx_daily.csv""",
+                     "清洗报告；展示首尾各 5 行、清洗前后行数、异常处理与实际日期范围。"),
+            new_cell("markdown", "第二组 / 用 Python 固定方案", """依次运行下面两个 Python 单元：第一个读取并校验清洗文件，第二个计算并绘制“持仓市值 / 累计投入”。改 `monthly_budget` 后可重跑第二个单元。这里的盈亏 / 累计投入是简单收益比例，不是年化收益率。"""),
+            new_cell("code", "03 / 读取清洗后的数据", """import csv
+import math
+from datetime import date
+from pathlib import Path
+
+data_path = Path('data/ndx_daily.csv')
+if not data_path.exists():
+    raise FileNotFoundError('请先运行第一组 Order，生成 data/ndx_daily.csv')
+with data_path.open(encoding='utf-8-sig', newline='') as f:
+    reader = csv.DictReader(f)
+    if reader.fieldnames != ['date', 'close']:
+        raise ValueError('CSV 必须仅含 date,close 两列，请回到清洗 Order 修正')
+    prices = [(date.fromisoformat(row['date']), float(row['close'])) for row in reader]
+if not prices or any(not math.isfinite(p) or p <= 0 for _, p in prices):
+    raise ValueError('数据为空或存在无效收盘值，请回到清洗 Order 修正')
+if any(a[0] >= b[0] for a, b in zip(prices, prices[1:])):
+    raise ValueError('日期必须严格升序且不重复')
+if len({(d.year, d.month) for d, _ in prices}) < 2:
+    raise ValueError('至少需要两个自然月的数据，请扩展获取区间')
+print(f'{len(prices)} 个交易日：{prices[0][0]} 至 {prices[-1][0]}')"""),
+            new_cell("code", "04 / 月度定投回测与可视化", """import matplotlib.pyplot as plt
+
+monthly_budget = 1000.0
+if not math.isfinite(monthly_budget) or monthly_budget <= 0:
+    raise ValueError('每月投入必须是正的有限数值')
+units = invested = 0.0
+last_month = None
+history, purchases = [], []
+for day, close in prices:
+    month = (day.year, day.month)
+    if month != last_month:
+        units += monthly_budget / close
+        invested += monthly_budget
+        purchases.append((day, monthly_budget, close))
+        last_month = month
+    history.append({'date': day, 'value': units * close, 'invested': invested})
+
+final_value = history[-1]['value']
+pnl = final_value - invested
+print(f'投入次数：{len(purchases)}；累计投入：{invested:,.2f}')
+print(f'期末市值：{final_value:,.2f}；盈亏：{pnl:,.2f}')
+print(f'盈亏 / 累计投入：{pnl / invested:.2%}（非年化）')
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.plot([r['date'] for r in history], [r['value'] for r in history], label='Portfolio value')
+ax.step([r['date'] for r in history], [r['invested'] for r in history], where='post', label='Contributions')
+ax.set(title='NDX monthly DCA (index simulation)', xlabel='Date', ylabel='Value / contributions')
+ax.legend()
+ax.grid(alpha=0.25)
+fig.autofmt_xdate()
+fig.tight_layout()
+plt.show()"""),
+            new_cell("markdown", "第三组 / 并行开发流程", """## 提出多个需求改进，再整理成一个单元
+
+先查看基础回测的图和输出，再依次运行下面两个 Order。它们分别处理绘图和指标，执行前也可以改成你自己的需求。"""),
+            new_cell("order", "05 / 改进 plot 方式", """基于上游实际运行的定投回测，改进绘图：上图画持仓市值与阶梯形累计投入，并用标记显示真实投入日期；中图画实际K线；下图画盈亏金额及零线，共享日期轴。不要把新增投入造成的市值跳变解释为投资收益。保留基础版本，沿用 prices、history 和 purchases，不重新抓取数据、不改变策略参数。运行新增单元验证，报告图表与核验结果。""",
+                     "两行子图、投入点、盈亏零线；保留原始回测口径。"),
+            new_cell("order", "06 / 增加输出指标", """基于同一次定投回测，输出更多指标：投入次数、累计投入、期末市值、绝对盈亏、简单收益比例、夏普比等，并按实际日期和现金流计算 XIRR（投入为负、期末估值为正，同日现金流合并，使用 365 天口径）。""",
+                     "指标表、XIRR 现金流和求解说明、单位净值回撤口径，以及已运行的边界用例结果。"),
+            new_cell("markdown", "合并 / 展示改进", """## 将两个改进归为一个 cell：展示改进
+
+完成两个改进 Order 后，点击其中一个的 **Merge AI Cells · 合并** 按钮，选择另一个改进 Order。在“整理要求”填写：**合并为一个标题为「展示改进」的 Order，概括绘图和指标的最终需求，保留口径、验证结果与代码单元位置。** 然后点击 **调用 Agent 合并**。
+
+合并会整理两个 Order 的需求和已有结论，并清空原对话关联；已有 Python 单元仍可单独运行。这样零散的改图、补指标就能归为一个清晰的「展示改进」单元。""")]
+        for cell in doc["cells"]:
+            if cell["type"] == "order":
+                cell["mode"] = "agent"
     elif template == "algorithm":
         doc["title"] = "算法验证 · 研究笔记"
-        doc["global"].update(goal="将算法问题拆为小规模实现、边界验证和 AI 审阅三个可控单元。", constraints="先建立可复现用例，再讨论优化。AI 建议需经显式代码执行验证。")
-        doc["cells"] = [new_cell("code", "01 / 最小实现", "def lower_bound(values, target):\n    lo, hi = 0, len(values)\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if values[mid] < target:\n            lo = mid + 1\n        else:\n            hi = mid\n    return lo\n\nvalues = [1, 3, 3, 7]\nlower_bound(values, 3)"),
-                        new_cell("code", "02 / 边界验证", "assert lower_bound([], 1) == 0\nassert lower_bound(values, 0) == 0\nassert lower_bound(values, 3) == 1\nassert lower_bound(values, 9) == 4\nprint('4 个边界用例通过')"),
-                        new_cell("order", "03 / 审阅不变量", "审阅上游实现与断言，说明循环不变量、终止条件与尚未覆盖的边界，给出下一个独立验证单元。", "Markdown：观察、推理、补充测试代码。不要将未运行的测试描述为已通过。")]
+        doc["global"].update(goal="复现已有的xx算法，并进行自己场景的再训练", constraints="1. 使用远程服务器进行全量测试\n 2. 数据集文件、pth文件都保存到远程xx/xx \n 3. git管理，且每一版取得SOTA指标的算法要备份")
+        doc["cells"] = [
+                        new_cell("order", "查找文献", "搜索MLLM领域，任意模态到任意模态的理解和生成，找几个经典工作clone下来","自定义输出格式"),
+                        new_cell("order", "复现算法", "复现xx文献中的算法，确保在原始数据集上可以达到论文中描述的指标","自定义输出格式"),
+                        new_cell("code", "确定性复现", "!python algo1/train.py --config configs/xx.yaml --data_path /data/xx --output_path /output/xx --seed 42\n# 确保在原始数据集上可以达到论文中描述的指标"),
+                        new_cell("order", "再训练算法", "在自己的xx数据集上用aa算法进行再训练，确保可以达到预期指标","表格方式报告指标，并辅以图片"),
+                        new_cell("order", "再训练算法", "（可以和上一个同时运行）在自己的xx数据集上用bb算法进行再训练，确保可以达到预期指标","表格方式报告指标，并辅以图片"),
+                        new_cell("order", "再训练", "prompt:修复bug1","自定义输出格式"),
+                        new_cell("order", "再训练", "prompt:修复bug2","自定义输出格式"),
+                        new_cell("markdown", "合并", "点击Merge AI Cells，可合并多个 修bug 类型琐碎需求")
+                        ]
     return doc
 
 
@@ -963,7 +1065,8 @@ def initialization_notebook(scan):
     doc["global"].update(goal="在已有代码项目中建立 Notebook 交互界面。先识别项目目标、源码入口、输入和验证方法。", constraints="本次初始化只读取项目，不更改源文件。将项目工作拆分为小而可验证的步骤；不要自动执行生成的代码。不要读取凭据或私密配置。")
     inventory = new_cell("markdown", "项目快照", "## 项目文件概览\n\n```text\n" + "\n".join(scan["files"]) + "\n```\n\n" + scan["manifest_excerpt"] + ("\n\n目录已截断。" if scan["truncated"] else ""))
     order = new_cell("order", "初始化 / 需求归类",
-                     "进行项目notebook初始化：把 `~/.claude/projects/{" + scan["project_path"] + "}/*.jsonl` 的对话（本次对话除外，即不需要归纳“ 进行项目 notebook 初始化”的对话）"
+                     "进行项目notebook初始化：查找与当前项目 `" + scan["project_path"] + "` 匹配的历史对话。Claude 对话通常位于 `~/.claude/projects/` 下项目对应目录的 *.jsonl；Codex 对话通常位于 `~/.codex/sessions/`，须依据会话元数据中的 cwd 筛选当前项目，不能混入其他项目的记录。"
+                     "只读取匹配项目的对话，不读取凭据或私密配置；找不到时明确报告，不编造。排除本次初始化对话（即不需要归纳“进行项目 notebook 初始化”的对话）。将找到的历史对话"
                      "进行需求归类，当对话很长时考虑用文本聚类算法预处理。按**时间**、**目的**归类，合并成 **≤5 个 AI Order 板块**，直接改写本 notebook，可以每完成一个cell立即写入一下。",
                      "markdown：Input Cell 高度概括各需求板块；需求与结果详情写入对应 Output Cell。")
     order.update(mode="agent")

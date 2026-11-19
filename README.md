@@ -1,10 +1,20 @@
+<p align="center">
+  <img src="castle_notebook/static/logo.svg" alt="Castle Notebook Logo" width="96" height="96">
+</p>
+
 # Castle Notebook
 
 Language: [English](README.en.md) | 简体中文
 
-在使用 LLM Agent 进行聊天式项目研发时，通常存在信息零散、展示不直观、全局信息不透明的问题。该问题造成了需求的重复提出、修改困难、复现不稳定，因此推出 CastleNotebook。
+在使用 LLM Agent 进行聊天式项目研发时，通常存在信息零散、展示不直观、全局信息不透明的问题。
+
+该问题造成了需求的重复提出、修改困难、复现不稳定，因此推出 CastleNotebook。
+
 项目参考 Jupyter Notebook 的核心哲学：实时展示
+
 界面采用经典 Jupyter 布局
+
+![界面](examples/show2.png)
 
 ## 快速开始
 

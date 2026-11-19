@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -79,7 +79,13 @@ class App:
         custom_dir = settings["custom_sessions_dir"]
         self.engine.providers["custom"].sessions_dir = Path(custom_dir) if custom_dir else None
         if seed and not self.store.list():
-            self.store.put(new_notebook(self.project, template="quant"))
+            stamp = datetime.now(timezone.utc)
+            for index, template in enumerate(("project", "quant", "algorithm")):
+                doc = new_notebook(self.project, template=template)
+                # The most recently updated document is opened first. Keep the
+                # tutorial first even when all three are created in one tick.
+                doc["updated_at"] = (stamp - timedelta(milliseconds=index)).isoformat(timespec="milliseconds")
+                self.store.put(doc)
 
     def close(self):
         self.engine.close()
@@ -314,7 +320,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 body = self.body()
                 template = body.get("template", "blank")
-                if template not in {"blank", "quant", "algorithm"}:
+                if template not in {"blank", "project", "quant", "algorithm"}:
                     raise Problem("不支持的模板。")
                 project = project_path(self.app.project, body.get("relative_path", "."))
                 ensure_context_config(project)
