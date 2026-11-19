@@ -88,7 +88,7 @@ function makeApp() {
     inspectorFrame=()=>renderHooks.inspector?.();
     refreshOrderOutputs=async()=>{};refreshContext=()=>{};toast=(message,error)=>renderHooks.toast?.(message,error);
     globalThis.app={state,window,cellLocked,canRun,anyBusy,codeBusy,structureBusy,liveFor,cellHTML,inputFileStateHTML,save,flushSave,watchRun,renderAll,
-      outputsHTML,orderInputMode,updateOrderInput,markdown,inline,mathSpan,splitMath,
+      outputsHTML,orderInputMode,updateOrderInput,markdown,inline,mathSpan,splitMath,globalFieldHTML,
       mathState,mathScript,typeset,startMath,runCell,confirmOrderRun,settleOrderRunConfirm,
       orderRunConfirmationEnabled,orderRunConfirmBody,action,openCustomSession,orderSessionHTML,
       liveSession,providerName,importModal};
@@ -110,7 +110,7 @@ function makeApp() {
     assert.fail(`Missing ${method} ${path}; saw ${requests.map(r=>r.method+" "+r.path).join(", ")}`);
   };
   const finishList = async () => (await take("GET","/api/notebooks")).respond([{id:nid,title:doc.title}]);
-  return {app,doc,edit,watch,finish,take,finishList,requests,streams,document,elements,renderHooks,sandbox,listeners};
+  return {app,doc,edit,watch,finish,take,finishList,requests,streams,document,elements,renderHooks,sandbox,listeners,timers};
 }
 
 test("only the running cell is locked, including during Run All", () => {
@@ -424,6 +424,32 @@ test("an unrun order still previews its requirement and offers an edit toggle", 
   assert.match(editing, /data-action="done-order"/);
   app.state.orderEditing.delete(order.id);
   assert.equal(app.orderInputMode(order),"preview");
+});
+
+test("global fields render markdown previews until edited", () => {
+  const env = makeApp(), {app} = env;
+  env.doc.global.goal = "# 目标\n\n- 条目一";
+  const preview = app.globalFieldHTML("goal","目标","项目目标");
+  assert.match(preview, /<div class="markdown markdown-preview global-preview" data-global-field="goal"/);
+  assert.match(preview, /<h1>目标<\/h1>/);
+  assert.doesNotMatch(preview, /<textarea/);
+  assert.match(app.globalFieldHTML("constraints","约束","全局约束"), /<p class="placeholder">全局约束 · 双击编辑<\/p>/);
+  app.state.markdownEditing.add("global:goal");
+  const editing = app.globalFieldHTML("goal","目标","项目目标");
+  assert.match(editing, /<textarea data-field="goal" data-global="true"/);
+  assert.doesNotMatch(editing, /global-preview/);
+});
+
+test("double-click edits a global field and blur restores the preview", async () => {
+  const env = makeApp(), {app} = env;
+  const previewEl = {dataset:{globalField:"goal"},classList:{contains:name=>name==="global-preview"}};
+  env.listeners.get("dblclick")({target:{closest:()=>previewEl}});
+  await tick();
+  assert.ok(app.state.markdownEditing.has("global:goal"));
+  env.listeners.get("focusout")({target:{tagName:"TEXTAREA",dataset:{global:"true",field:"goal"}}});
+  [...env.timers.values()].at(-1)();
+  await tick();await tick();
+  assert.ok(!app.state.markdownEditing.has("global:goal"));
 });
 
 test("an unrun order displays board files written by an external trial run", () => {

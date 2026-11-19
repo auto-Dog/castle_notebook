@@ -478,12 +478,20 @@ function projectChangesHTML(changes) {
   return `<details class="project-changes" ${changes.files.length?"open":""}><summary>项目文件变更 · ${changes.files.length}${changes.complete?"":" · 部分核验"}</summary>${changes.files.length?`<ul>${changes.files.map(file=>`<li><span class="change-${h(file.change)}">${labels[file.change]||h(file.change)}</span><code>${h(file.path)}</code></li>`).join("")}</ul>`:'<p class="muted">已核验范围内未检测到文件变更。</p>'}${(changes.warnings||[]).map(warning=>`<p class="error-text">${h(warning)}</p>`).join("")}<p class="muted">${h(changes.policy)}</p></details>`;
 }
 
+function globalFieldHTML(field,label,placeholder) {
+  const value=state.doc.global[field];
+  const editor=state.markdownEditing.has(`global:${field}`)
+    ? `<textarea data-field="${field}" data-global="true" placeholder="${placeholder}" rows="1" aria-label="${label}" maxlength="8000">${h(value)}</textarea>`
+    : `<div class="markdown markdown-preview global-preview" data-global-field="${field}" title="双击编辑">${value?markdown(value):`<p class="placeholder">${placeholder} · 双击编辑</p>`}</div>`;
+  return `<label><span>${label}</span>${editor}</label>`;
+}
+
 function renderNotebook() {
   const doc = state.doc;
   if (!doc) { $("#notebook").innerHTML=`<div class="empty-workspace">${icon("notebook")}<h1>开始一篇研究笔记</h1><p>定义全局目的，再把问题拆成可验证的步骤。</p><button class="btn primary" data-action="new">${icon("plus")}新建 Notebook</button></div>`; return; }
   const disabled=structureBusy() ? "disabled" : "";
   $("#notebook").innerHTML = `<div class="notebook-inner">
-    <section class="global-card" id="global-cell" title="${h(timeText(doc.global.updated_at,true))} · r${doc.global.revision}"><div class="input-prompt global-prompt">Global:</div><div class="global-fields"><label><span>目标</span><textarea data-field="goal" data-global="true" placeholder="项目目标" rows="1" aria-label="项目目标" maxlength="8000">${h(doc.global.goal)}</textarea></label><label><span>约束</span><textarea data-field="constraints" data-global="true" placeholder="全局约束" rows="1" aria-label="全局约束" maxlength="8000">${h(doc.global.constraints)}</textarea></label></div></section>
+    <section class="global-card" id="global-cell" title="${h(timeText(doc.global.updated_at,true))} · r${doc.global.revision}"><div class="input-prompt global-prompt">Global:</div><div class="global-fields">${globalFieldHTML("goal","目标","项目目标")}${globalFieldHTML("constraints","约束","全局约束")}</div></section>
     <div id="cells">${doc.cells.map(cellHTML).join("")}</div>
     <div class="add-cell-bar"><button data-action="add" data-type="code" ${disabled} title="添加 Python 单元">+ Python</button><button data-action="add" data-type="markdown" ${disabled} title="添加 Markdown 单元">+ Markdown</button><button data-action="add" data-type="order" ${disabled} title="添加 AI Order 单元">+ Order</button></div></div>`;
   autoSize();
@@ -1048,6 +1056,7 @@ async function action(name,el) {
   if(name==="custom-refresh")return customTranscriptModal(id,el.dataset.session);
   if(name==="copy-context"){await navigator.clipboard.writeText(state.context.prompt);return toast("完整输入已复制。");}
   if(name==="edit-markdown"){if(cellLocked(id))return;await flushSave();state.selected=id;state.markdownEditing.has(id)?state.markdownEditing.delete(id):state.markdownEditing.add(id);renderAll();$(`#cell-${id} textarea`)?.focus();return;}
+  if(name==="edit-global"){const field=el.dataset.globalField,key=`global:${field}`;await flushSave();state.markdownEditing.add(key);renderAll();$(`[data-global][data-field="${field}"]`)?.focus();return;}
   if(name==="edit-order"||name==="done-order") {
     if(cellLocked(id))return;
     await flushSave();state.selected=id;
@@ -1089,7 +1098,17 @@ document.addEventListener("click",event=>{
   if(!event.target.closest(".menu-wrap"))document.querySelectorAll(".dropdown").forEach(el=>el.hidden=true);
 });
 document.addEventListener("focusin",event=>{const id=event.target.dataset?.cell;if(id&&state.selected!==id)selectCell(id);});
-document.addEventListener("dblclick",event=>{const el=event.target.closest(".markdown-preview,.order-input-preview");if(el)action(el.classList.contains("order-input-preview")?"edit-order":"edit-markdown",el).catch(error=>toast(error.message,true));});
+document.addEventListener("focusout",event=>{
+  const el=event.target;
+  if(el.tagName!=="TEXTAREA"||!el.dataset?.global)return;
+  const key=`global:${el.dataset.field}`;
+  setTimeout(()=>{
+    if(!state.markdownEditing.has(key)||document.activeElement?.dataset?.global)return;
+    state.markdownEditing.delete(key);
+    flushSave().then(()=>renderAll()).catch(error=>toast(error.message,true));
+  },0);
+});
+document.addEventListener("dblclick",event=>{const el=event.target.closest(".global-preview,.markdown-preview,.order-input-preview");if(!el)return;const name=el.classList.contains("global-preview")?"edit-global":el.classList.contains("order-input-preview")?"edit-order":"edit-markdown";action(name,el).catch(error=>toast(error.message,true));});
 document.addEventListener("input",event=>{
   const el=event.target;
   if(!el.dataset.field || !state.doc)return;
