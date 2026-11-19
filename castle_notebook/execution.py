@@ -16,16 +16,13 @@ import sys
 import threading
 import time
 
-from .core import (Problem, apply_initialization, editable_document, embed_markdown_images,
+from .core import (Problem, apply_initialization, default_settings, editable_document, embed_markdown_images,
                    embed_output_images, now, imported_notebook, load_context_config, output_summary,
                    pack_context, project_changes, scan_project, short, snapshot_project,
                    strip_embedded_images, text_field, uid, validate_order_output)
 from .cell_operations import operation_cell, parse_cells, replace_cells, select_cells
 from .providers import create_providers
-from .providers.base import OUTPUT_LIMIT
 from .providers.custom import read_transcript
-
-INPUT_LIMIT = 32000
 
 LINUX_TERMINALS = (
     ("x-terminal-emulator", ("-e",)),
@@ -200,8 +197,9 @@ class Kernel:
 class Engine:
     def __init__(self, store, python=None, claude_command=None, code_timeout=60, agent_timeout=240,
                  claude_launch_mode="background", claude_permission_mode="auto",
-                 provider="claude", codex_command=None):
+                 provider="claude", codex_command=None, limits=None):
         self.store = store
+        self.limits = {**default_settings()["limits"], **(limits or {})}
         self.python = python or sys.executable
         self.providers = create_providers(claude_command, codex_command)
         if provider not in self.providers:
@@ -305,7 +303,7 @@ class Engine:
         if run["status"] != "succeeded" or run.get("derived"):
             return False
         try:
-            answer = output_summary(run["outputs"], OUTPUT_LIMIT + 100000)
+            answer = output_summary(run["outputs"], self.limits["output_characters"] + 100000)
             validate_order_output(answer, run["output_format"])
         except Problem as exc:
             checked_at = now()
@@ -363,7 +361,7 @@ class Engine:
             return doc | {"runtime": self.runtime(notebook_id)}
 
     def import_notebook(self, incoming, project):
-        doc = imported_notebook(incoming, project)
+        doc = imported_notebook(incoming, project, limits=self.limits)
         self.store.put(doc)
         for cell in doc["cells"]:
             if cell["type"] != "order":
@@ -371,24 +369,28 @@ class Engine:
             board = self.store.board_path(cell["id"])
             board.mkdir(parents=True, exist_ok=True)
             if cell["source"]:
-                (board / "input.md").write_text(cell["source"][:INPUT_LIMIT], encoding="utf-8")
+                (board / "input.md").write_text(cell["source"][:self.limits["input_characters"]], encoding="utf-8")
             text = next((o.get("text") for o in cell["outputs"] if isinstance(o.get("text"), str)), None)
             if text:
-                (board / "output.md").write_text(text[:OUTPUT_LIMIT], encoding="utf-8")
+                (board / "output.md").write_text(text[:self.limits["output_characters"]], encoding="utf-8")
         return self.document(doc["id"])
 
     def read_output_file(self, rid, project):
         """Read only the output belonging to a known run, with a bounded payload."""
-        return self._read_cell_file(self.store.run_path(rid), rid, project, "output.md", OUTPUT_LIMIT, "输出", "2 MB 显示上限")
+        limit = self.limits["output_characters"]
+        return self._read_cell_file(self.store.run_path(rid), rid, project, "output.md", limit, "输出", f"{limit} 字节显示上限")
 
     def read_input_file(self, rid, project):
-        return self._read_cell_file(self.store.run_path(rid), rid, project, "input.md", INPUT_LIMIT * 4, "需求输入", "32000 字符上限", INPUT_LIMIT)
+        limit = self.limits["input_characters"]
+        return self._read_cell_file(self.store.run_path(rid), rid, project, "input.md", limit * 4, "需求输入", f"{limit} 字符上限", limit)
 
     def read_board_file(self, cell_id, project, filename):
         board = self.store.board_path(cell_id)
         if filename == "input.md":
-            return self._read_cell_file(board, cell_id, project, filename, INPUT_LIMIT * 4, "需求输入", "32000 字符上限", INPUT_LIMIT)
-        return self._read_cell_file(board, cell_id, project, filename, OUTPUT_LIMIT, "输出", "2 MB 显示上限")
+            limit = self.limits["input_characters"]
+            return self._read_cell_file(board, cell_id, project, filename, limit * 4, "需求输入", f"{limit} 字符上限", limit)
+        limit = self.limits["output_characters"]
+        return self._read_cell_file(board, cell_id, project, filename, limit, "输出", f"{limit} 字节显示上限")
 
     def _current_input_file(self, cell, project):
         if cell["run_ids"]:
@@ -413,7 +415,8 @@ class Engine:
                 return info, None
             value = raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
             if filename == "output.md":
-                embedded = embed_output_images(value, project, excluded=(self.store.path,))
+                embedded = embed_output_images(value, project, excluded=(self.store.path,),
+                                               per_image=self.limits["embedded_image_bytes"])
                 if embedded != value:
                     # Persist the data URIs so the board file stays self-contained
                     # and later syncs do not re-embed on every load.
@@ -485,7 +488,7 @@ class Engine:
                 else:
                     info["cached"] = bool(outputs)
                     if outputs:
-                        info["cached_sha256"] = hashlib.sha256(output_summary(outputs, OUTPUT_LIMIT + 100000).encode()).hexdigest()
+                        info["cached_sha256"] = hashlib.sha256(output_summary(outputs, self.limits["output_characters"] + 100000).encode()).hexdigest()
                 if outputs != cell["outputs"]:
                     # An external conversation can change the evidence of later cells.
                     if value is not None:
@@ -566,7 +569,7 @@ class Engine:
             provider = self.provider_for(run)
             if provider.name != "custom":
                 raise Problem("只有 Custom 提供商的运行可以绑定外部对话。")
-            transcript = read_transcript(provider.sessions_dir, session_id)
+            transcript = read_transcript(provider.sessions_dir, session_id, limits=self.limits)
             # An active run keeps its own in-memory copy; update it so the
             # worker's later persistence does not drop the binding.
             control = self.runs.get(run["id"])
@@ -595,7 +598,9 @@ class Engine:
                     if stored and "attachments" not in item and stored.get("attachments"):
                         item["attachments"] = copy.deepcopy(stored["attachments"])
                 embed_markdown_images(incoming["cells"], current["project_path"],
-                                      excluded=(self.store.path,))
+                                      excluded=(self.store.path,),
+                                      per_image=self.limits["embedded_image_bytes"],
+                                      total=self.limits["notebook_image_bytes"])
                 for item in incoming["cells"]:
                     if not isinstance(item, dict):
                         continue
@@ -614,7 +619,7 @@ class Engine:
                         if info["state"] == "unavailable" or expected != info["sha256"]:
                             raise Problem("需求文件已更新或暂时不可读，请选择使用文件版本或保留编辑后再保存。", 409)
                         writes.append((cell, item.get("source", ""), info["sha256"]))
-            doc = editable_document(current, incoming)
+            doc = editable_document(current, incoming, limits=self.limits)
             editable_fields = ("title", "source", "expected_output", "context_note", "mode", "output_format")
             upstream = []
             if actives:
@@ -681,7 +686,7 @@ class Engine:
             incoming = {"revision": doc["revision"], "global": {
                 "goal": payload.get("goal", doc["global"]["goal"]),
                 "constraints": payload.get("constraints", doc["global"]["constraints"])}}
-            updated = editable_document(doc, incoming)
+            updated = editable_document(doc, incoming, limits=self.limits)
             if updated["global"]["revision"] != doc["global"]["revision"]:
                 self.store.put(updated)
             return self.document(notebook_id)
@@ -698,7 +703,14 @@ class Engine:
         with self.lock:
             doc = self.sync_output_files(notebook_id)
             key = (notebook_id, cell_id)
-            rid = self.pending_contexts.get(key) or self._next_run_id(doc, cell_id)
+            rid = self.pending_contexts.get(key)
+            if not rid:
+                cell = next((c for c in doc["cells"] if c["id"] == cell_id), None)
+                if cell and cell["type"] == "order" and cell["run_ids"]:
+                    # Keep pointing at the latest run until the user starts another,
+                    # so the preview never diverges from the displayed board/session.
+                    return self._context(doc, cell_id, cell["run_ids"][-1])
+                rid = self._next_run_id(doc, cell_id)
             context = self._context(doc, cell_id, rid)
             self.pending_contexts[key] = rid
             return context
@@ -713,7 +725,8 @@ class Engine:
                     "prompt_file": f".castle/prompts/input{rid}.md"}
         return pack_context(doc, cell_id, self.runtime(doc["id"])["variables"],
                             load_context_config(doc["project_path"]),
-                            scan_project(doc["project_path"], excluded=(self.store.path,)), run_info)
+                            scan_project(doc["project_path"], excluded=(self.store.path,),
+                                         max_files=self.limits["scan_files"], max_depth=self.limits["scan_depth"]), run_info)
 
     def transform_cells(self, notebook_id, cell_id, operation, payload):
         with self.lock:
@@ -729,7 +742,8 @@ class Engine:
                 raise Problem("Custom 提供商的对话在外部 AI 中进行，暂不支持合并与拆分。")
             if not provider.command:
                 raise Problem(f"合并和拆分需要 {provider.label} CLI，请安装并登录后重启服务。", 503)
-            cell = operation_cell(operation, sources, instructions, doc["project_path"])
+            cell = operation_cell(operation, sources, instructions, doc["project_path"],
+                              per_image=self.limits["embedded_image_bytes"])
             cell["provider"] = provider.name
             rid = uid()
             context = self._context(doc | {"cells": [cell]}, cell["id"], rid)
@@ -861,12 +875,14 @@ class Engine:
         run = control["run"]
         operation = run["operation"]
         sources = operation["sources"]
-        cells = parse_cells(output_summary(run["outputs"], OUTPUT_LIMIT + 100000), operation["kind"], sources)
+        cells = parse_cells(output_summary(run["outputs"], self.limits["output_characters"] + 100000),
+                            operation["kind"], sources, output_limit=self.limits["output_characters"],
+                            source_limit=self.limits["input_characters"])
         for cell in cells:
             cell["provider"] = run.get("provider", self.default_provider)
         output_path = Path(run["artifact"])
         if not output_path.exists():
-            output_path.write_text(output_summary(run["outputs"], OUTPUT_LIMIT + 100000), encoding="utf-8")
+            output_path.write_text(output_summary(run["outputs"], self.limits["output_characters"] + 100000), encoding="utf-8")
         with self.lock:
             doc = self._check_operation(run)
         candidate = replace_cells(doc, sources, cells)
@@ -888,7 +904,7 @@ class Engine:
                         f"此后每轮对话更新本单元的需求摘要文件：{context['run']['input_file']}\n"
                         f"此后每轮对话更新本单元的输出文件：{context['run']['output_file']}\n"
                         "历史中的其他输入/输出路径已失效，不得继续更新原单元或另一个拆分单元的文件。\n"
-                        f"当前已有结论（本轮保持不变）：\n{strip_embedded_images(output_summary(cell['outputs'], OUTPUT_LIMIT + 100000))}\n"
+                        f"当前已有结论（本轮保持不变）：\n{strip_embedded_images(output_summary(cell['outputs'], self.limits['output_characters'] + 100000))}\n"
                     )
                     context = self._replace_prompt(context, context["prompt"] + notice)
                 child = self._prepare_run(candidate, cell, rid, context)
@@ -904,7 +920,7 @@ class Engine:
                 run["staged_run_ids"] = [item["id"] for item in staged]
                 self.store.put_run(run)
                 output = copy.deepcopy(cell["outputs"])
-                output_text = output_summary(output, OUTPUT_LIMIT + 100000)
+                output_text = output_summary(output, self.limits["output_characters"] + 100000)
                 Path(child["artifact"]).write_text(output_text, encoding="utf-8")
                 began = time.monotonic()
                 if resume:
@@ -959,8 +975,8 @@ class Engine:
             size = len(json.dumps(data, ensure_ascii=False))
             control["output_characters"] += size
             control["stream_events"] += 1
-            if control["output_characters"] > OUTPUT_LIMIT or control["stream_events"] > 12000:
-                raise Problem("输出超过 2 MB 或 12000 个事件限制，执行已停止。")
+            if control["output_characters"] > self.limits["output_characters"] or control["stream_events"] > self.limits["stream_events"]:
+                raise Problem(f"输出超过 {self.limits['output_characters']} 字符或 {self.limits['stream_events']} 个事件限制，执行已停止。")
             outputs = control["run"]["outputs"]
             if outputs and data.get("kind") in {"stdout", "stderr"} and outputs[-1]["kind"] == data["kind"]:
                 outputs[-1]["text"] += data.get("text", "")
@@ -1036,7 +1052,7 @@ class Engine:
                 run["duration_ms"] = round((time.monotonic() - began) * 1000)
                 if reset:
                     self.kernels.pop(doc["id"], None)
-                output_text = output_summary(run["outputs"], OUTPUT_LIMIT + 100000)
+                output_text = output_summary(run["outputs"], self.limits["output_characters"] + 100000)
                 output_path = self.store.run_path(rid) / "output.md"
                 if cell["type"] == "order":
                     info, file_text = self.read_output_file(rid, doc["project_path"])
@@ -1150,7 +1166,7 @@ class Engine:
             source = next((cell for cell in current["cells"] if cell["id"] == run["cell_id"]), None)
             if source and source.get("file_output", {}).get("run_id") == rid:
                 run["outputs"] = copy.deepcopy(source["outputs"])
-            doc = apply_initialization(current, run)
+            doc = apply_initialization(current, run, limits=self.limits)
             self.store.put(doc)
             return self.document(notebook_id)
 

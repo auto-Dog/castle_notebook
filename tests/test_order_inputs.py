@@ -187,7 +187,7 @@ class OrderInputTests(unittest.TestCase):
         self.assertEqual(missing["file_input"]["state"], "missing")
         self.assertFalse(path.exists())
         path.write_text("大" * 33, encoding="utf-8")
-        with patch("castle_notebook.execution.INPUT_LIMIT", 32):
+        with patch.dict(self.engine.limits, {"input_characters": 32}):
             oversized = self.engine.document(self.doc["id"])["cells"][0]
         self.assertEqual(oversized["file_input"]["state"], "unavailable")
         self.assertEqual(oversized["source"], "最后可读的需求")
@@ -245,7 +245,9 @@ class OrderInputTests(unittest.TestCase):
         self.assertNotEqual(run["outputs"][0]["text"], "旧证据")
         self.assertEqual((board / "output.md").read_text(encoding="utf-8"), run["outputs"][0]["text"])
         rerun_preview = self.engine.context(self.doc["id"], cell["id"])
-        self.assertNotEqual(rerun_preview["run"]["run_id"], cell["id"])
+        self.assertEqual(rerun_preview["run"]["run_id"], cell["id"])
+        rerun = wait_run(self.engine, self.engine.start(self.doc["id"], cell["id"])["id"])
+        self.assertNotEqual(rerun["id"], cell["id"])
 
     def test_legacy_cells_board_migrates_into_runs_namespace(self):
         cell = self.add("迁移前的外部试跑需求")

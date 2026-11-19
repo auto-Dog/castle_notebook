@@ -311,7 +311,7 @@ function inputConflictHTML(cell) {
 
 function orderInputContentHTML(cell) {
   if(orderInputMode(cell)==="preview")return `<div class="order-input-preview markdown" data-id="${cell.id}" tabindex="0" title="双击编辑当前需求">${cell.source?markdown(cell.source, cell.attachments):'<p class="muted">需求文件为空。双击编辑。</p>'}</div>`;
-  return `<textarea id="source-${cell.id}" class="order-input" data-field="source" data-cell="${cell.id}" aria-label="AI 指令" rows="2" maxlength="32000" placeholder="本步 AI 指令…" ${cellLocked(cell.id)?"disabled":""}>${h(cell.source)}</textarea>`;
+  return `<textarea id="source-${cell.id}" class="order-input" data-field="source" data-cell="${cell.id}" aria-label="AI 指令" rows="2" maxlength="${state.boot?.settings?.limits?.input_characters||32000}" placeholder="本步 AI 指令…" ${cellLocked(cell.id)?"disabled":""}>${h(cell.source)}</textarea>`;
 }
 
 function orderInputHTML(cell) {
@@ -475,7 +475,7 @@ function tagHTML(cell) { const stale=cell.stale&&cell.status!=="running";return 
 function projectChangesHTML(changes) {
   if(!changes)return "";
   const labels={added:"新增",modified:"修改",deleted:"删除"};
-  return `<details class="project-changes" ${changes.files.length?"open":""}><summary>项目文件变更 · ${changes.files.length}${changes.complete?"":" · 部分核验"}</summary>${changes.files.length?`<ul>${changes.files.map(file=>`<li><span class="change-${h(file.change)}">${labels[file.change]||h(file.change)}</span><code>${h(file.path)}</code></li>`).join("")}</ul>`:'<p class="muted">已核验范围内未检测到文件变更。</p>'}${(changes.warnings||[]).map(warning=>`<p class="error-text">${h(warning)}</p>`).join("")}<p class="muted">${h(changes.policy)}</p></details>`;
+  return `<details class="project-changes"><summary>项目文件变更 · ${changes.files.length}${changes.complete?"":" · 部分核验"}</summary>${changes.files.length?`<ul>${changes.files.map(file=>`<li><span class="change-${h(file.change)}">${labels[file.change]||h(file.change)}</span><code>${h(file.path)}</code></li>`).join("")}</ul>`:'<p class="muted">已核验范围内未检测到文件变更。</p>'}${(changes.warnings||[]).map(warning=>`<p class="error-text">${h(warning)}</p>`).join("")}<p class="muted">${h(changes.policy)}</p></details>`;
 }
 
 function globalFieldHTML(field,label,placeholder) {
@@ -1149,7 +1149,8 @@ document.addEventListener("submit",async event=>{
     } else if(form.id==="import-form"){
       const file=form.elements.file.files[0];
       if(!file)throw new Error("请选择要导入的 Notebook JSON 文件。");
-      if(file.size>120000000)throw new Error("文件超过 120 MB 导入上限。");
+      const importLimit=(state.boot?.settings?.limits?.notebook_image_bytes||104857600)+20000000;
+      if(file.size>importLimit)throw new Error(`文件超过 ${Math.round(importLimit/1000000)} MB 导入上限。`);
       let notebook;
       try{notebook=JSON.parse(await file.text());}catch{throw new Error("文件不是有效的 JSON，请选择「下载 Notebook」导出的文件。");}
       const doc=await api("/api/notebooks/import","POST",{notebook,relative_path:form.dataset.relative});

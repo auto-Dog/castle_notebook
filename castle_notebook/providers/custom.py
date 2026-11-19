@@ -90,18 +90,21 @@ def session_title(messages):
     return ""
 
 
-def search_sessions(directory, keyword="", date_from=None, date_to=None, limit=50):
+def search_sessions(directory, keyword="", date_from=None, date_to=None, limit=50, limits=None):
     """Match sessions whose messages contain the keyword within the date range."""
     if not directory:
         raise Problem("尚未绑定对话目录。请先在弹窗中指定外部 AI 的会话文件夹。", 409)
     directory = Path(directory)
     if not directory.is_dir():
         raise Problem(f"对话目录不存在或不可读：{directory}", 409)
+    limits = limits or {}
+    file_limit = limits.get("custom_search_files", SEARCH_FILE_LIMIT)
+    file_bytes = limits.get("custom_search_file_bytes", SEARCH_FILE_BYTES)
     needle = keyword.casefold()
     results = []
-    for path in sorted(directory.glob("*.jsonl"))[:SEARCH_FILE_LIMIT]:
+    for path in sorted(directory.glob("*.jsonl"))[:file_limit]:
         try:
-            if path.stat().st_size > SEARCH_FILE_BYTES:
+            if path.stat().st_size > file_bytes:
                 continue
             messages = list(iter_messages(path))
         except OSError:
@@ -139,18 +142,22 @@ def search_sessions(directory, keyword="", date_from=None, date_to=None, limit=5
     return {"directory": str(directory), "sessions": results[:limit], "truncated": len(results) > limit}
 
 
-def read_transcript(directory, session_id):
+def read_transcript(directory, session_id, limits=None):
     path = session_file(directory, session_id)
+    limits = limits or {}
+    message_limit = limits.get("custom_transcript_messages", TRANSCRIPT_MESSAGE_LIMIT)
+    character_limit = limits.get("custom_transcript_characters", TRANSCRIPT_CHARACTER_LIMIT)
+    text_limit = limits.get("custom_transcript_text", TRANSCRIPT_TEXT_LIMIT)
     messages = []
     title = ""
     characters = 0
     truncated = False
     for role, text, stamp in iter_messages(path):
-        if len(messages) >= TRANSCRIPT_MESSAGE_LIMIT or characters >= TRANSCRIPT_CHARACTER_LIMIT:
+        if len(messages) >= message_limit or characters >= character_limit:
             truncated = True
             break
-        if len(text) > TRANSCRIPT_TEXT_LIMIT:
-            text = text[:TRANSCRIPT_TEXT_LIMIT] + "\n…（本条消息已截断）"
+        if len(text) > text_limit:
+            text = text[:text_limit] + "\n…（本条消息已截断）"
             truncated = True
         if not title and role == "user":
             title = short(text.strip().replace("\n", " "), 80)

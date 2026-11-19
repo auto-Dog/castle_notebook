@@ -4,8 +4,8 @@ from __future__ import annotations
 import copy
 import json
 
-from .core import (Problem, check_id, extract_embedded_images, new_cell, now, output_summary,
-                   parse_json_output, strip_embedded_images, text_field, validate_order_output)
+from .core import (Problem, MAX_EMBEDDED_IMAGE_BYTES, check_id, extract_embedded_images, new_cell, now,
+                   output_summary, parse_json_output, strip_embedded_images, text_field, validate_order_output)
 
 
 def select_cells(doc, cell_id, operation, other_cell_id=None):
@@ -28,14 +28,14 @@ def select_cells(doc, cell_id, operation, other_cell_id=None):
     return cells
 
 
-def operation_cell(operation, cells, instructions, project):
+def operation_cell(operation, cells, instructions, project, per_image=MAX_EMBEDDED_IMAGE_BYTES):
     count = 1 if operation == "merge" else 2
     verb = "合并" if operation == "merge" else "拆分"
     fields = ("id", "title", "source", "expected_output", "output_format", "context_note",
               "status", "stale", "outputs", "file_output")
 
     def scrub_text(value):
-        return strip_embedded_images(extract_embedded_images(value, project))
+        return strip_embedded_images(extract_embedded_images(value, project, per_image=per_image))
 
     def scrub(cell):
         data = {key: cell[key] for key in fields if key in cell}
@@ -70,7 +70,7 @@ def operation_cell(operation, cells, instructions, project):
     return cell
 
 
-def parse_cells(answer, operation, sources):
+def parse_cells(answer, operation, sources, output_limit=2000000, source_limit=32000):
     data = parse_json_output(answer)
     count = 1 if operation == "merge" else 2
     if not isinstance(data, dict) or set(data) != {"cells"} or not isinstance(data["cells"], list) or len(data["cells"]) != count:
@@ -81,7 +81,7 @@ def parse_cells(answer, operation, sources):
         if not isinstance(item, dict) or set(item) - allowed or not {"source", "expected_output", "output"} <= set(item):
             raise Problem("整理结果的单元字段不符合契约。")
         cell = new_cell("order", text_field(item.get("title", ""), "title", 200),
-                        text_field(item["source"], "source"),
+                        text_field(item["source"], "source", source_limit),
                         text_field(item["expected_output"], "expected_output", 8000))
         if not cell["source"].strip() or not cell["expected_output"].strip():
             raise Problem("整理后的指令和预期输出不能为空。")
@@ -89,9 +89,9 @@ def parse_cells(answer, operation, sources):
         cell["output_format"] = item.get("output_format", "markdown")
         if cell["output_format"] not in {"markdown", "json", "text"}:
             raise Problem("整理后的输出格式必须为 markdown、json 或 text。")
-        answer = text_field(item["output"], "output", 2000000)
-        if len(answer.encode("utf-8")) > 2000000:
-            raise Problem("整理后的单元输出超过 2 MB。")
+        answer = text_field(item["output"], "output", output_limit)
+        if len(answer.encode("utf-8")) > output_limit:
+            raise Problem(f"整理后的单元输出超过 {output_limit} 字符。")
         if answer.strip():
             if not any(output_summary(source["outputs"]).strip() for source in sources):
                 raise Problem("原单元没有输出，整理结果不能生成已有结论。")

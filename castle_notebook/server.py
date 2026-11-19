@@ -15,7 +15,7 @@ import time
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
-from .core import (Problem, Store, VERSION, ensure_context_config, ensure_settings,
+from .core import (Problem, Store, VERSION, default_settings, ensure_context_config, ensure_settings,
                    initialization_notebook, load_settings, new_notebook,
                    project_path, read_project_asset, read_project_file, scan_project,
                    settings_summary, text_field)
@@ -57,7 +57,7 @@ MATH_RETRY = 60.0
 
 class App:
     def __init__(self, project, data_dir=None, python=None, claude_command=None,
-                 seed=True, code_timeout=60, agent_timeout=240,
+                 seed=True, code_timeout=None, agent_timeout=None,
                  claude_launch_mode="background", claude_permission_mode="auto",
                  provider="claude", codex_command=None):
         self.project = Path(project).resolve()
@@ -67,9 +67,16 @@ class App:
         self.store = Store(data_dir or self.project / ".castle")
         self.context_config_path = ensure_context_config(self.project)
         self.settings_path = ensure_settings(self.project)
-        self.engine = Engine(self.store, python, claude_command, code_timeout, agent_timeout,
-                             claude_launch_mode, claude_permission_mode, provider, codex_command)
-        custom_dir = settings_summary(self.project)["custom_sessions_dir"]
+        try:
+            settings = load_settings(self.project)
+        except Problem:
+            settings = default_settings()
+        self.engine = Engine(self.store, python, claude_command,
+                             code_timeout if code_timeout is not None else settings["timeouts"]["code"],
+                             agent_timeout if agent_timeout is not None else settings["timeouts"]["agent"],
+                             claude_launch_mode, claude_permission_mode, provider, codex_command,
+                             limits=settings["limits"])
+        custom_dir = settings["custom_sessions_dir"]
         self.engine.providers["custom"].sessions_dir = Path(custom_dir) if custom_dir else None
         if seed and not self.store.list():
             self.store.put(new_notebook(self.project, template="quant"))
@@ -316,16 +323,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(self.app.engine.document(doc["id"]), 201)
         if parts == ["api", "notebooks", "import"] and method == "POST":
             # Exported notebooks carry embedded images, so the import payload
-            # may exceed the regular edit limit (100 MB of images plus JSON).
-            body = self.body(120000000)
+            # may exceed the regular edit limit (image budget plus JSON overhead).
+            body = self.body(self.app.engine.limits["notebook_image_bytes"] + 20000000)
             project = project_path(self.app.project, body.get("relative_path", "."))
             ensure_context_config(project)
             return self.json(self.app.engine.import_notebook(body.get("notebook"), project), 201)
         if parts == ["api", "project", "scan"] and method == "POST":
-            return self.json(scan_project(self.app.project, self.body().get("relative_path", "."), excluded=(self.app.store.path,)))
+            limits = self.app.engine.limits
+            return self.json(scan_project(self.app.project, self.body().get("relative_path", "."), excluded=(self.app.store.path,),
+                                          max_files=limits["scan_files"], max_depth=limits["scan_depth"]))
         if parts == ["api", "project", "initialize"] and method == "POST":
             body = self.body()
-            scan = scan_project(self.app.project, body.get("relative_path", "."), excluded=(self.app.store.path,))
+            limits = self.app.engine.limits
+            scan = scan_project(self.app.project, body.get("relative_path", "."), excluded=(self.app.store.path,),
+                                max_files=limits["scan_files"], max_depth=limits["scan_depth"])
             doc = initialization_notebook(scan)
             self.app.store.put(doc)
             return self.json({"notebook": self.app.engine.document(doc["id"])}, 201)
@@ -354,9 +365,10 @@ class Handler(BaseHTTPRequestHandler):
             if bounds[0] and bounds[1] and bounds[0] > bounds[1]:
                 raise Problem("开始日期不能晚于结束日期。")
             return self.json(search_sessions(self.app.engine.providers["custom"].sessions_dir,
-                                             keyword, bounds[0], bounds[1]))
+                                             keyword, bounds[0], bounds[1], limits=self.app.engine.limits))
         if len(parts) == 5 and parts[:3] == ["api", "custom", "sessions"] and parts[4] == "transcript" and method == "GET":
-            return self.json(read_transcript(self.app.engine.providers["custom"].sessions_dir, parts[3]))
+            return self.json(read_transcript(self.app.engine.providers["custom"].sessions_dir, parts[3],
+                                             limits=self.app.engine.limits))
         if len(parts) >= 3 and parts[:2] == ["api", "notebooks"]:
             nid = parts[2]
             if len(parts) == 3:
@@ -366,7 +378,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(self.app.engine.save(nid, self.body()))
             if parts[3:] == ["project"] and method == "GET":
                 doc = self.app.store.get(nid)
-                return self.json(scan_project(doc["project_path"], excluded=(self.app.store.path,)))
+                limits = self.app.engine.limits
+                return self.json(scan_project(doc["project_path"], excluded=(self.app.store.path,),
+                                              max_files=limits["scan_files"], max_depth=limits["scan_depth"]))
             if parts[3:] == ["project", "file"] and method == "GET":
                 doc = self.app.store.get(nid)
                 return self.json(read_project_file(doc["project_path"], query.get("path", [""])[0],
@@ -374,7 +388,8 @@ class Handler(BaseHTTPRequestHandler):
             if parts[3:] == ["asset"] and method == "GET":
                 doc = self.app.store.get(nid)
                 data, content_type = read_project_asset(doc["project_path"], query.get("path", [""])[0],
-                                                        excluded=(self.app.store.path,))
+                                                        excluded=(self.app.store.path,),
+                                                        max_bytes=self.app.engine.limits["asset_bytes"])
                 return self.send_bytes(data, content_type)
             if len(parts) == 4 and parts[3] == "export" and method == "GET":
                 doc = self.app.engine.sync_output_files(nid)
@@ -505,11 +520,14 @@ def main():
                         choices=("bypassPermissions", "auto", "acceptEdits", "default", "plan", "dontAsk"),
                         help="AI 权限模式，默认 auto 自动审批；Codex 映射为沙箱策略（default/plan 只读，bypassPermissions 跳过沙箱）")
     parser.add_argument("--empty", action="store_true", help="不创建首次启动示例")
-    parser.add_argument("--code-timeout", type=int, default=60)
-    parser.add_argument("--agent-timeout", type=int, default=240, help="Claude print 模式与 Codex 执行秒数上限；Claude 原生后台会话不设执行期限")
+    parser.add_argument("--code-timeout", type=int, default=None, help="Python 执行秒数上限；缺省读取 settings.json 的 timeouts.code（默认 60）")
+    parser.add_argument("--agent-timeout", type=int, default=None, help="Claude print 模式与 Codex 执行秒数上限；缺省读取 settings.json 的 timeouts.agent（默认 240）；Claude 原生后台会话不设执行期限")
     args = parser.parse_args()
-    if not 1 <= args.port <= 65535 or not 1 <= args.code_timeout <= 3600 or not 1 <= args.agent_timeout <= 3600:
-        parser.error("端口必须为 1–65535，超时必须为 1–3600 秒。")
+    if not 1 <= args.port <= 65535:
+        parser.error("端口必须为 1–65535。")
+    for name, value in (("--code-timeout", args.code_timeout), ("--agent-timeout", args.agent_timeout)):
+        if value is not None and not 1 <= value <= 3600:
+            parser.error(f"{name} 必须为 1–3600 秒。")
     if args.claude and not resolve_claude(args.claude):
         parser.error("无法解析 Claude 可执行文件；请直接指定 .exe、Unix executable 或 cli.js。")
     if args.codex and not resolve_codex(args.codex):

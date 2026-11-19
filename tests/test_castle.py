@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from castle_notebook.core import (MAX_CONTEXT, MAX_EMBEDDED_IMAGE_BYTES, Problem, Store,
-                                 default_context_config, editable_document,
+                                 default_context_config, default_settings, editable_document,
                                  embed_markdown_images, ensure_context_config, ensure_settings,
                                  extract_embedded_images, embed_output_images, strip_embedded_images,
                                  load_context_config, load_settings, normalize_context_config,
@@ -329,12 +329,21 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = ensure_settings(folder)
             self.assertEqual(path, Path(folder).resolve() / ".castle" / "settings.json")
-            self.assertEqual(load_settings(folder), {"version": 1, "confirm_order_run": True, "custom_sessions_dir": ""})
+            self.assertEqual(load_settings(folder), default_settings())
             path.write_text('{"confirm_order_run": false}', encoding="utf-8")
             self.assertFalse(load_settings(folder)["confirm_order_run"])
+            self.assertEqual(load_settings(folder)["limits"], default_settings()["limits"])
+            # Legacy files are upgraded in place so every tunable is editable.
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")),
+                             {**default_settings(), "confirm_order_run": False})
             overview = settings_summary(folder)
             self.assertFalse(overview["confirm_order_run"])
             self.assertIsNone(overview["error"])
+            path.write_text('{"limits": {"output_characters": 5000000}, "timeouts": {"code": 120}}', encoding="utf-8")
+            self.assertEqual(load_settings(folder)["limits"], {**default_settings()["limits"], "output_characters": 5000000})
+            self.assertEqual(load_settings(folder)["timeouts"], {**default_settings()["timeouts"], "code": 120})
+            self.assertEqual(settings_summary(folder)["limits"], {**default_settings()["limits"], "output_characters": 5000000})
+            self.assertEqual(settings_summary(folder)["timeouts"], {**default_settings()["timeouts"], "code": 120})
             path.write_text('{"confirm_order_run": "false"}', encoding="utf-8")
             with self.assertRaisesRegex(Problem, "settings.json"):
                 load_settings(folder)
@@ -345,7 +354,11 @@ class CoreTests(unittest.TestCase):
 
     def test_settings_reject_unknown_options_and_versions(self):
         for invalid in ([], {"unknown": True}, {"version": 2}, {"version": True},
-                        {"confirm_order_run": 1}):
+                        {"confirm_order_run": 1}, {"limits": []}, {"limits": {"unknown": 1}},
+                        {"limits": {"output_characters": "big"}}, {"limits": {"output_characters": True}},
+                        {"limits": {"output_characters": 99}}, {"limits": {"input_characters": 0}},
+                        {"timeouts": []}, {"timeouts": {"unknown": 1}}, {"timeouts": {"code": 0}},
+                        {"timeouts": {"agent": 3601}}, {"timeouts": {"agent": "long"}}):
             with self.subTest(invalid=invalid), self.assertRaises(Problem):
                 normalize_settings(invalid)
 
@@ -861,11 +874,30 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(data["cells"][0]["file_output"]["run_id"], latest["id"])
         self.assertNotIn("historical file changed", data["cells"][0]["outputs"][0]["text"])
         Path(latest["artifact"]).write_text("x" * 100, encoding="utf-8")
-        with patch("castle_notebook.execution.OUTPUT_LIMIT", 32):
+        with patch.dict(self.engine.limits, {"output_characters": 32}):
             oversized = self.engine.order_outputs(self.doc["id"])
         self.assertEqual(oversized["cells"][0]["file_output"]["state"], "unavailable")
         self.assertIn("上限", oversized["cells"][0]["file_output"]["error"])
         self.assertEqual(oversized["cells"][0]["outputs"], data["cells"][0]["outputs"])
+
+    def test_startup_limits_bound_display_and_default_without_settings(self):
+        self.assertEqual(self.engine.limits, default_settings()["limits"])
+        cell = self.add("order", "Inspect evidence")
+        board = self.store.board_path(cell["id"])
+        board.mkdir(parents=True, exist_ok=True)
+        (board / "output.md").write_text("x" * 100, encoding="utf-8")
+        limited = Engine(self.store, claude_command=FAKE, claude_launch_mode="print",
+                         limits={"output_characters": 64})
+        try:
+            info, value = limited.read_board_file(cell["id"], self.doc["project_path"], "output.md")
+            self.assertEqual(info["state"], "unavailable")
+            self.assertIn("64", info["error"])
+            self.assertIsNone(value)
+            info, value = self.engine.read_board_file(cell["id"], self.doc["project_path"], "output.md")
+            self.assertEqual(info["state"], "ready")
+            self.assertEqual(value, "x" * 100)
+        finally:
+            limited.close()
 
     def test_external_output_changes_invalidate_downstream_and_refresh_context(self):
         upstream = self.execute(self.add("order", "Inspect evidence"))
@@ -943,8 +975,13 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn(run["output_file"], run["invocation_prompt"])
         self.assertEqual(run["command"][run["command"].index("-p") + 1], run["invocation_prompt"])
         next_preview = self.engine.context(self.doc["id"], cell["id"])
-        self.assertNotEqual(next_preview["run"]["run_id"], run["id"])
-        self.assertNotEqual(next_preview["run"]["output_file"], run["output_file"])
+        self.assertEqual(next_preview["run"]["run_id"], run["id"])
+        self.assertEqual(next_preview["run"]["output_file"], run["output_file"])
+        rerun = wait_run(self.engine, self.engine.start(self.doc["id"], cell["id"])["id"])
+        self.assertEqual(rerun["status"], "succeeded")
+        self.assertNotEqual(rerun["id"], run["id"])
+        self.assertNotEqual(rerun["output_file"], run["output_file"])
+        self.assertEqual(self.engine.context(self.doc["id"], cell["id"])["run"]["run_id"], rerun["id"])
 
     def test_custom_output_path_placeholders_use_custom_data_directory(self):
         self.engine.close()
@@ -1518,13 +1555,51 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(payload["token"], self.app.token)
         self.assertEqual(payload["context_config_path"], str(self.app.context_config_path))
         self.assertEqual(payload["settings"], {"path": str(self.app.settings_path),
-                                               "confirm_order_run": True, "custom_sessions_dir": "", "error": None})
+                                               "confirm_order_run": True, "custom_sessions_dir": "",
+                                               "limits": default_settings()["limits"],
+                                               "timeouts": default_settings()["timeouts"],
+                                               "error": None})
         status, headers, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn(b"app.js", body)
         self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
         self.assertIn("img-src 'self' data: https: http:", headers["Content-Security-Policy"])
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+
+    def test_app_loads_limits_from_settings_at_startup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            (project / ".castle").mkdir()
+            settings = project / ".castle" / "settings.json"
+            settings.write_text(json.dumps({"limits": {"output_characters": 5000000},
+                                            "timeouts": {"agent": 600}}), encoding="utf-8")
+            app = App(folder, claude_command=FAKE, seed=False, claude_launch_mode="print")
+            try:
+                self.assertEqual(app.engine.limits, {**default_settings()["limits"], "output_characters": 5000000})
+                self.assertEqual(app.engine.agent_timeout, 600)
+                self.assertEqual(app.engine.code_timeout, 60)
+            finally:
+                app.close()
+            app = App(folder, claude_command=FAKE, seed=False, claude_launch_mode="print", code_timeout=5)
+            try:
+                self.assertEqual(app.engine.code_timeout, 5)
+            finally:
+                app.close()
+            settings.write_text("{broken", encoding="utf-8")
+            app = App(folder, claude_command=FAKE, seed=False, claude_launch_mode="print")
+            try:
+                self.assertEqual(app.engine.limits, default_settings()["limits"])
+                self.assertEqual(app.engine.agent_timeout, 240)
+            finally:
+                app.close()
+            legacy = project / "legacy"
+            legacy.mkdir()
+            app = App(legacy, claude_command=FAKE, seed=False, claude_launch_mode="print")
+            try:
+                self.assertEqual(app.engine.limits, default_settings()["limits"])
+                self.assertEqual(app.engine.code_timeout, 60)
+            finally:
+                app.close()
 
     def test_markdown_images_are_served_from_the_notebook_project(self):
         doc = new_notebook(self.temp.name)

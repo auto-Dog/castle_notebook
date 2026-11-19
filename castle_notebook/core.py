@@ -20,6 +20,18 @@ CELL_TYPES = {"code", "markdown", "order"}
 AI_PROVIDERS = ("claude", "codex", "custom")
 ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
 MAX_CONTEXT = 48000
+IMAGE_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                     ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
+                     ".bmp": "image/bmp", ".svg": "image/svg+xml"}
+MAX_ASSET_BYTES = 20 * 1024 * 1024
+# Embedded images follow the Jupyter attachment format. They live inside the
+# notebook JSON, so saves never resend image bytes; the limits below bound each
+# image and each notebook.
+ATTACHMENT_MEDIA_TYPES = set(IMAGE_MEDIA_TYPES.values()) - {"image/svg+xml"}
+MAX_EMBEDDED_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_NOTEBOOK_IMAGE_BYTES = 100 * 1024 * 1024
+ATTACHMENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+IMAGE_REFERENCE = re.compile(r"!\[([^\]\n]*)\]\(([^\s)]+)\)")
 
 
 class Problem(Exception):
@@ -92,7 +104,7 @@ def new_notebook(project, title="未命名 Notebook", template="blank"):
     return doc
 
 
-def imported_notebook(incoming, project):
+def imported_notebook(incoming, project, limits=None):
     """A local copy of an exported notebook: new ids, bound to this project.
 
     Content and prior outputs are carried across for reference, but run/session
@@ -119,15 +131,18 @@ def imported_notebook(incoming, project):
                "global": {"goal": incoming["global"].get("goal", ""),
                           "constraints": incoming["global"].get("constraints", "")},
                "cells": cells}
-    result = editable_document(doc, payload)
+    result = editable_document(doc, payload, limits=limits)
     for cell, item in zip(result["cells"], incoming["cells"]):
         if isinstance(item.get("outputs"), list):
             cell["outputs"] = copy.deepcopy([o for o in item["outputs"] if isinstance(o, dict)])
     return result
 
 
-def editable_document(doc, incoming):
+def editable_document(doc, incoming, limits=None):
     """Only accept editable fields; execution evidence is server-owned."""
+    limits = limits or {}
+    per_image = limits.get("embedded_image_bytes", MAX_EMBEDDED_IMAGE_BYTES)
+    notebook_total = limits.get("notebook_image_bytes", MAX_NOTEBOOK_IMAGE_BYTES)
     if not isinstance(incoming, dict):
         raise Problem("文档必须为 JSON 对象。")
     if incoming.get("revision") != doc["revision"]:
@@ -153,7 +168,7 @@ def editable_document(doc, incoming):
     result["cells"] = []
     earliest = 0 if global_changed else len(cells)
     seen = set()
-    fields = {"title": 200, "source": 32000, "expected_output": 8000, "context_note": 3000}
+    fields = {"title": 200, "source": limits.get("input_characters", 32000), "expected_output": 8000, "context_note": 3000}
     for i, item in enumerate(cells):
         if not isinstance(item, dict):
             raise Problem("单元格式无效。")
@@ -182,7 +197,7 @@ def editable_document(doc, incoming):
             cell[key] = value
         # Attachments are presentation-only and never invalidate downstream results.
         if kind == "markdown":
-            attachments = validate_attachments(item.get("attachments", cell.get("attachments", {})))
+            attachments = validate_attachments(item.get("attachments", cell.get("attachments", {})), per_image=per_image)
             if attachments:
                 cell["attachments"] = attachments
             else:
@@ -198,8 +213,8 @@ def editable_document(doc, incoming):
         if i >= earliest and cell["run_ids"]:
             cell["stale"] = True
         result["cells"].append(cell)
-    if notebook_image_bytes(result["cells"]) > MAX_NOTEBOOK_IMAGE_BYTES:
-        raise Problem(f"Notebook 内嵌图片合计不能超过 {MAX_NOTEBOOK_IMAGE_BYTES // 1024 // 1024} MB。")
+    if notebook_image_bytes(result["cells"]) > notebook_total:
+        raise Problem(f"Notebook 内嵌图片合计不能超过 {notebook_total // 1024 // 1024} MB。")
     # A removed last cell cannot affect anything before it.
     result["revision"] += 1
     result["updated_at"] = now()
@@ -220,7 +235,7 @@ IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gi
                     "image/webp": ".webp", "image/avif": ".avif", "image/bmp": ".bmp"}
 
 
-def extract_embedded_images(text, project):
+def extract_embedded_images(text, project, per_image=MAX_EMBEDDED_IMAGE_BYTES):
     """Save data-URI images as project files so restructuring keeps them visible.
 
     Content-hash names deduplicate across cells; the asset endpoint serves the
@@ -236,7 +251,7 @@ def extract_embedded_images(text, project):
             data = base64.b64decode(payload, validate=True)
         except (ValueError, TypeError):
             return None
-        if not data or len(data) > MAX_EMBEDDED_IMAGE_BYTES or mime not in IMAGE_EXTENSIONS:
+        if not data or len(data) > per_image or mime not in IMAGE_EXTENSIONS:
             return None
         name = f"image-{hashlib.sha256(data).hexdigest()[:16]}{IMAGE_EXTENSIONS[mime]}"
         folder.mkdir(exist_ok=True)
@@ -343,13 +358,45 @@ def load_context_config(project):
         raise Problem(f"无法加载上下文配置 {path}：{exc}") from exc
 
 
+LIMIT_SPEC = {
+    "output_characters": (2000000, 100, 100000000),
+    "input_characters": (32000, 100, 100000000),
+    "stream_events": (12000, 100, 1000000),
+    "asset_bytes": (20 * 1024 * 1024, 1024, 2 * 1024 * 1024 * 1024),
+    "embedded_image_bytes": (5 * 1024 * 1024, 1024, 2 * 1024 * 1024 * 1024),
+    "notebook_image_bytes": (100 * 1024 * 1024, 1024, 2 * 1024 * 1024 * 1024),
+    "scan_files": (200, 1, 10000),
+    "scan_depth": (4, 1, 20),
+    "custom_search_files": (1000, 1, 10000),
+    "custom_search_file_bytes": (32 * 1024 * 1024, 1024, 2 * 1024 * 1024 * 1024),
+    "custom_transcript_messages": (2000, 1, 100000),
+    "custom_transcript_characters": (400000, 1000, 10000000),
+    "custom_transcript_text": (20000, 100, 1000000),
+}
+TIMEOUT_SPEC = {"code": (60, 1, 3600), "agent": (240, 1, 3600)}
+
+
 def default_settings():
-    return {"version": 1, "confirm_order_run": True, "custom_sessions_dir": ""}
+    return {"version": 1, "confirm_order_run": True, "custom_sessions_dir": "",
+            "limits": {name: spec[0] for name, spec in LIMIT_SPEC.items()},
+            "timeouts": {name: spec[0] for name, spec in TIMEOUT_SPEC.items()}}
+
+
+def _normalize_bounded(value, spec, label):
+    if not isinstance(value, dict) or set(value) - set(spec):
+        raise Problem(f"运行设置 {label} 必须为 JSON 对象，只支持 {'、'.join(spec)}。")
+    result = {}
+    for name, (default, low, high) in spec.items():
+        item = value.get(name, default)
+        if type(item) is not int or not low <= item <= high:
+            raise Problem(f"运行设置 {label}.{name} 必须为 {low} 到 {high} 之间的整数。")
+        result[name] = item
+    return result
 
 
 def normalize_settings(value):
-    if not isinstance(value, dict) or set(value) - {"version", "confirm_order_run", "custom_sessions_dir"}:
-        raise Problem("运行设置必须为 JSON 对象，只支持 version、confirm_order_run 与 custom_sessions_dir。")
+    if not isinstance(value, dict) or set(value) - {"version", "confirm_order_run", "custom_sessions_dir", "limits", "timeouts"}:
+        raise Problem("运行设置必须为 JSON 对象，只支持 version、confirm_order_run、custom_sessions_dir、limits 与 timeouts。")
     version = value.get("version", 1)
     if type(version) is not int or version != 1:
         raise Problem("运行设置 version 必须为 1。")
@@ -359,7 +406,9 @@ def normalize_settings(value):
     sessions_dir = value.get("custom_sessions_dir", "")
     if not isinstance(sessions_dir, str) or len(sessions_dir) > 4000:
         raise Problem("运行设置 custom_sessions_dir 必须为不超过 4000 字符的路径字符串。")
-    return {"version": 1, "confirm_order_run": confirm, "custom_sessions_dir": sessions_dir}
+    return {"version": 1, "confirm_order_run": confirm, "custom_sessions_dir": sessions_dir,
+            "limits": _normalize_bounded(value.get("limits", {}), LIMIT_SPEC, "limits"),
+            "timeouts": _normalize_bounded(value.get("timeouts", {}), TIMEOUT_SPEC, "timeouts")}
 
 
 def ensure_settings(project):
@@ -379,9 +428,20 @@ def load_settings(project):
     try:
         if path.stat().st_size > 64000:
             raise Problem("运行设置文件超过 64 KB。")
-        return normalize_settings(json.loads(path.read_text(encoding="utf-8-sig")))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        settings = normalize_settings(raw)
     except (OSError, ValueError, Problem) as exc:
         raise Problem(f"无法加载运行设置 {path}：{exc}") from exc
+    if raw != settings:
+        # Legacy files lack newer keys; persist the filled defaults so every
+        # tunable stays visible and editable in settings.json.
+        temporary = path.with_suffix(".tmp")
+        try:
+            temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError:
+            pass
+    return settings
 
 
 def settings_summary(project):
@@ -390,10 +450,13 @@ def settings_summary(project):
     try:
         settings = load_settings(project)
         return {"path": str(path), "confirm_order_run": settings["confirm_order_run"],
-                "custom_sessions_dir": settings["custom_sessions_dir"], "error": None}
+                "custom_sessions_dir": settings["custom_sessions_dir"], "limits": settings["limits"],
+                "timeouts": settings["timeouts"], "error": None}
     except Problem as exc:
         # Fail safe: an invalid file keeps the confirmation prompt enabled.
-        return {"path": str(path), "confirm_order_run": True, "custom_sessions_dir": "", "error": str(exc)}
+        defaults = default_settings()
+        return {"path": str(path), "confirm_order_run": True, "custom_sessions_dir": "",
+                "limits": defaults["limits"], "timeouts": defaults["timeouts"], "error": str(exc)}
 
 
 def pack_context(doc, cell_id, variables=None, config=None, project_scan=None, run_info=None):
@@ -734,20 +797,6 @@ def read_project_file(project, relative, excluded=()):
     return {"path": path.relative_to(root).as_posix(), "source": source}
 
 
-IMAGE_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                     ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
-                     ".bmp": "image/bmp", ".svg": "image/svg+xml"}
-MAX_ASSET_BYTES = 20 * 1024 * 1024
-# Embedded images follow the Jupyter attachment format. They live inside the
-# notebook JSON, so saves never resend image bytes; the limits below bound each
-# image and each notebook.
-ATTACHMENT_MEDIA_TYPES = set(IMAGE_MEDIA_TYPES.values()) - {"image/svg+xml"}
-MAX_EMBEDDED_IMAGE_BYTES = 5 * 1024 * 1024
-MAX_NOTEBOOK_IMAGE_BYTES = 100 * 1024 * 1024
-ATTACHMENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
-IMAGE_REFERENCE = re.compile(r"!\[([^\]\n]*)\]\(([^\s)]+)\)")
-
-
 def read_project_asset(project, relative, excluded=(), max_bytes=MAX_ASSET_BYTES):
     root = Path(project).resolve()
     text_field(relative, "图片路径", 2000)
@@ -770,7 +819,7 @@ def attachment_size(entry):
     return sum(max(0, len(value) * 3 // 4 - value.count("=")) for value in entry.values())
 
 
-def validate_attachments(value):
+def validate_attachments(value, per_image=MAX_EMBEDDED_IMAGE_BYTES):
     """Accept only the Jupyter-style {name: {image mime: base64}} shape."""
     if not isinstance(value, dict) or len(value) > 20:
         raise Problem("图片附件格式无效。")
@@ -784,8 +833,8 @@ def validate_attachments(value):
             if (not isinstance(data, str) or not data or len(data) % 4
                     or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", data)):
                 raise Problem("图片附件内容无效。")
-            if attachment_size(entry) > MAX_EMBEDDED_IMAGE_BYTES:
-                raise Problem(f"单张内嵌图片不能超过 {MAX_EMBEDDED_IMAGE_BYTES // 1024 // 1024} MB。")
+            if attachment_size(entry) > per_image:
+                raise Problem(f"单张内嵌图片不能超过 {per_image // 1024 // 1024} MB。")
         result[name] = entry
     return result
 
@@ -892,10 +941,10 @@ def embed_output_images(text, project, excluded=(), per_image=MAX_EMBEDDED_IMAGE
     return _rewrite_markdown_images(text, replace)
 
 
-def scan_project(root, relative=".", excluded=()):
+def scan_project(root, relative=".", excluded=(), max_files=200, max_depth=4):
     project = project_path(root, relative)
     files, manifests = [], []
-    paths, complete, warnings = _project_inventory(project, excluded=excluded)
+    paths, complete, warnings = _project_inventory(project, limit=max_files, depth_limit=max_depth, excluded=excluded)
     for path in paths:
         files.append(path.relative_to(project).as_posix())
         if path.name.lower() in SAFE_MANIFESTS and len(manifests) < 8:
@@ -906,7 +955,7 @@ def scan_project(root, relative=".", excluded=()):
                 warnings.append(f"无法读取 {files[-1]}。")
     return {"project_path": str(project), "files": files, "truncated": not complete, "warnings": warnings,
             "manifest_excerpt": "\n\n".join(manifests),
-            "policy": "最多 200 个文件、4 层目录；跳过隐藏目录、凭据扩展名及符号链接。Agent 按指令读取其余项目文件。"}
+            "policy": f"最多 {max_files} 个文件、{max_depth} 层目录；跳过隐藏目录、凭据扩展名及符号链接。Agent 按指令读取其余项目文件。"}
 
 
 def initialization_notebook(scan):
@@ -922,13 +971,14 @@ def initialization_notebook(scan):
     return doc
 
 
-def apply_initialization(doc, run):
+def apply_initialization(doc, run, limits=None):
+    limits = limits or {}
     if run["status"] != "succeeded" or not run.get("initializer"):
         raise Problem("需要一个成功的项目初始化结果。")
     source = next((c for c in doc["cells"] if c["id"] == run["cell_id"]), None)
     if not source or source["stale"] or source.get("applied_run_id") == run["id"]:
         raise Problem("初始化结果已失效或已采用，请重新分析。", 409)
-    data = parse_json_output(output_summary(run["outputs"], 2000000))
+    data = parse_json_output(output_summary(run["outputs"], limits.get("output_characters", 2000000)))
     if not isinstance(data, dict) or not isinstance(data.get("cells"), list) or not 1 <= len(data["cells"]) <= 20:
         raise Problem("初始化 JSON 必须包含 1–20 个 cells。")
     cells = []
@@ -936,7 +986,7 @@ def apply_initialization(doc, run):
         if not isinstance(item, dict) or item.get("type") not in CELL_TYPES:
             raise Problem("初始化结果包含不支持的单元类型。")
         cells.append(new_cell(item["type"], text_field(item.get("title", ""), "title", 200),
-                              text_field(item.get("source", ""), "source"),
+                              text_field(item.get("source", ""), "source", limits.get("input_characters", 32000)),
                               text_field(item.get("expected_output", ""), "expected_output", 8000)))
     if len(doc["cells"]) + len(cells) > 100:
         raise Problem("采用后会超过 100 个单元。")

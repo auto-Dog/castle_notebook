@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from ..core import Problem, short, validate_order_output
 
-OUTPUT_LIMIT = 2000000
-
 
 class Provider:
     name = ""
@@ -64,8 +62,8 @@ def finalize(engine, control, cell, doc, emit, final, exit_code, stderr,
         answer = file_text
     elif file_info.get("state") == "unavailable":
         raise Problem(file_info["error"])
-    if len(answer) > OUTPUT_LIMIT:
-        raise Problem(f"{label} 最终输出超过 2 MB 限制。")
+    if len(answer) > engine.limits["output_characters"]:
+        raise Problem(f"{label} 最终输出超过 {engine.limits['output_characters']} 字符限制。")
     # Preserve the provider's actual result, including rejected final output.
     if answer.strip():
         run["outputs"] = [{"kind": cell["output_format"], "text": answer}]

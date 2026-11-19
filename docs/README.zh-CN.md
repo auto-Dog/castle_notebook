@@ -70,6 +70,52 @@ Order 是覆盖式 AI 重跑，因此每次运行前都会弹窗确认：列出�
 
 设置缺失或文件格式错误时默认保持开启，避免误操作；可在“本地运行环境”中查看当前状态和文件路径。开启时，运行全部也会在每个 Order 执行前询问。
 
+同一文件还可配置各类上限与超时，服务启动时加载一次，修改后重启服务生效；缺省字段自动补默认值并写回文件，旧项目没有该文件也能正常运行（自动生成完整默认配置）：
+
+```json
+{
+  "limits": {
+    "output_characters": 2000000,
+    "input_characters": 32000,
+    "stream_events": 12000,
+    "asset_bytes": 20971520,
+    "embedded_image_bytes": 5242880,
+    "notebook_image_bytes": 104857600,
+    "scan_files": 200,
+    "scan_depth": 4,
+    "custom_search_files": 1000,
+    "custom_search_file_bytes": 33554432,
+    "custom_transcript_messages": 2000,
+    "custom_transcript_characters": 400000,
+    "custom_transcript_text": 20000
+  },
+  "timeouts": {
+    "code": 60,
+    "agent": 240
+  }
+}
+```
+
+| 键 | 含义 | 取值范围 |
+| --- | --- | --- |
+| `output_characters` | `output.md` 实时读取的字节数、最终回答长度与流式输出总量 | 100–100000000 |
+| `input_characters` | `input.md` 的字符数与 Order 指令长度（文件字节上限为其 4 倍） | 100–100000000 |
+| `stream_events` | 单次运行输出流式事件条数上限，超出即停止执行 | 100–1000000 |
+| `asset_bytes` | 项目图片等资产预览的单文件字节上限 | 1024–2147483648 |
+| `embedded_image_bytes` | 单张内嵌图片的字节上限 | 1024–2147483648 |
+| `notebook_image_bytes` | 单个 Notebook 内嵌图片总字节上限（同时决定导入文件大小上限） | 1024–2147483648 |
+| `scan_files` | 项目扫描最多列出的文件数 | 1–10000 |
+| `scan_depth` | 项目扫描的最大目录层数 | 1–20 |
+| `custom_search_files` | 自定义会话搜索最多读取的文件数 | 1–10000 |
+| `custom_search_file_bytes` | 会话搜索单文件字节上限 | 1024–2147483648 |
+| `custom_transcript_messages` | 会话转录最多保留的消息条数 | 1–100000 |
+| `custom_transcript_characters` | 会话转录总字符上限 | 1000–10000000 |
+| `custom_transcript_text` | 会话转录单条消息字符上限 | 100–1000000 |
+| `timeouts.code` | Python 单元执行超时（秒） | 1–3600 |
+| `timeouts.agent` | print 模式 AI 运行超时（秒），原生后台不受限 | 1–3600 |
+
+超过上限的文件不会被截断显示，而是标记为不可读并保留上一次缓存。命令行 `--code-timeout` / `--agent-timeout` 显式传入时优先于 settings.json。上下文打包的字符预算（`max_characters` 等）仍在 `.castle/context.json` 中配置。
+
 例如，在项目中已有 `model.py` 时，Order 可以要求“修复 `model.py` 的边界处理，并运行相关测试”；下一 Python 单元用 `from model import predict` 调用实际实现。Output 收集最终回答及执行期间真实新增、修改、删除的项目文件，不将回答中的代码片段视为已落盘的开发成果。失败或停止执行后，已发生的文件修改也会保留并收集。
 
 每次 AI 输入都包含项目目录、有限文件概览与项目工作要求；现有 `.castle/context.json` 的自定义模板也会补入该说明。开发步骤应报告修改路径、已执行验证和未完成事项；只读分析及初始化仍遵循其只读要求。项目文件内容作为数据读取，不替代 Global 和当前任务。
@@ -107,7 +153,7 @@ Notebook 只负责触发与收集，不占有会话。`claude agents` 可查看�
 每次运行的 `claude-settings.json` 只附加记录事件的命令 Hook，将工具活动、实际权限模式和最终回答保存到运行目录。后台状态来自 `claude agents --json --all`，可见进度来自 `claude logs`；不解析 Claude 私有状态或 transcript。完整输入与 `context.md` 内容及 SHA-256 指纹一致，命令行只传文件路径和固定读取指令。
 
 旧版 CLI 或无原生后台能力的环境可显式使用 `--claude-launch-mode print`，此时调用 `claude -p ... --permission-mode auto --output-format stream-json --verbose --include-partial-messages`。`--background` 与 `-p` 不能混用；print 会话不出现在原生后台列表，执行完成后按 UUID 恢复。出现工具权限拒绝时，保留原始回答并标记执行失败。
-`templates.instructions` 通过 `{input_file}`、`{run_dir}`、`{output_file}` 告知 Claude 当前需求和输出的位置，默认展开为 `.castle/runs/<运行ID>/input.md`、`.castle/runs/<运行ID>` 和 `.castle/runs/<运行ID>/output.md`，相对于项目工作目录。预览与执行复用同一运行 ID，输入文件和上下文快照中的路径一致。`templates.invocation` 也支持这些变量，启动指令不自动追加路径。
+`templates.instructions` 通过 `{input_file}`、`{run_dir}`、`{output_file}` 告知 Claude 当前需求和输出的位置，默认展开为 `.castle/runs/<运行ID>/input.md`、`.castle/runs/<运行ID>` 和 `.castle/runs/<运行ID>/output.md`，相对于项目工作目录。首次运行前预览与执行复用同一运行 ID，输入文件和上下文快照中的路径一致；执行后预览继续指向最近一次运行目录，再次点击“运行”才分配新 ID。`templates.invocation` 也支持这些变量，启动指令不自动追加路径。
 
 Windows 和 Linux 下，Order 单元底部显示 **Session Name**、**Background ID** 和实际权限模式。原生后台会话启动后，“打开对话”立即可用，通过 `claude attach <id>` 在新终端进入同一实时对话，执行中也能处理问题；历史 print 会话使用 `claude --resume <session-id> --permission-mode <配置值>`。Linux 优先使用 `TERMINAL`，再自动查找常用终端；无桌面的服务器可直接在自己的终端运行 `claude attach`。未执行或未生成会话时按钮禁用。续聊对 `input.md`、`output.md` 的更新继续同步到对应单元。
 Order 的 Out Cell 以最近一次运行的 `output.md` 为来源，在页面可见时约每秒检查一次变化，实时渲染文件；执行中以及执行完成后的续聊、外部编辑、文件替换都会同步。CLI 进度保留在运行日志中。模型已写出 `output.md` 时，后台直接采用文件，执行结束不会用 CLI 的确认消息覆盖它；模型未写文件时，后台用最终回答创建该文件。
@@ -136,7 +182,7 @@ Notebook 文档和运行证据默认位于启动项目的 `.castle/`，已加入
 ```text
 .castle/
   context.json              # 上下文功能开关、harness 模板与字符预算
-  settings.json             # 运行确认等界面安全开关
+  settings.json             # 运行确认开关、各类上限与超时（启动时加载）
   prompts/input<run-id>.md   # Claude 自行读取的完整输入
   notebooks/<notebook-id>.json
   runs/<run-id>/
