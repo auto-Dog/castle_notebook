@@ -242,6 +242,6 @@ node --test tests/test_app.js
 
 Tests cover real Python subprocesses, project module imports, agents writing actual project files, change collection, shared variables, cancel/timeout, invalidation propagation, context compaction, real HTTP/SSE communication, output contracts, and initialization. Claude tests use subprocess protocol fixtures and incur no model cost; this differs from real Claude cloud-call validation.
 
-The service binds only to `127.0.0.1`, restricts Host / Origin, and protects write operations with a page-session token. Python has the current user's file access; Claude defaults to auto-approval, adjustable via launch flags. 0.9 provides no OS-level sandbox or multi-user authentication and is not suitable for exposure as a remote public service.
+The service binds only to `127.0.0.1`, restricts Host / Origin, and protects write operations with a page-session token. Python has the current user's file access; Claude defaults to auto-approval, adjustable via launch flags. 1.0.0 provides no OS-level sandbox or multi-user authentication and is not suitable for exposure as a remote public service.
 
 For detailed scope and design, see the [0.9 development plan](docs/0.9-plan.md) (Chinese).

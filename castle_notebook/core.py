@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 import uuid
 
-VERSION = "0.9.6"
+VERSION = "1.0.0"
 CELL_TYPES = {"code", "markdown", "order"}
 AI_PROVIDERS = ("claude", "codex", "custom")
 ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")

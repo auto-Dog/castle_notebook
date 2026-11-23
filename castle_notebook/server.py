@@ -199,7 +199,7 @@ class MathAssets:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "CastleNotebook/0.9"
+    server_version = "CastleNotebook/1.0.0"
 
     @property
     def app(self):
@@ -511,7 +511,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CastleNotebook 0.9 · 本地 AI 辅助实时调试工作台")
+    parser = argparse.ArgumentParser(description="CastleNotebook 1.0.0 · 本地 AI 辅助实时调试工作台")
     parser.add_argument("--project", default=".", help="项目根目录，也是执行代码与 Agent 的工作目录")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--data-dir", help="Notebook 与运行证据的存储目录，默认 <project>/.castle")
